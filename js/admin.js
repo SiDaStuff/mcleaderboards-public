@@ -1,0 +1,4557 @@
+// MC Leaderboards - Admin Panel
+
+let currentTab = 'management';
+const adminUiState = {
+  blacklist: {
+    page: 1,
+    limit: 25,
+    q: '',
+    includeExpired: false,
+    totalPages: 1
+  },
+  unifiedSearch: {
+    page: 1,
+    limit: 25,
+    totalPages: 1,
+    lastTerm: ''
+  }
+};
+
+/**
+ * Initialize admin panel
+ */
+async function initAdmin() {
+  // Authentication and admin status are already verified by auth-guard.js
+  // Just verify it's still authenticated and admin
+  if (!AppState.isAuthenticated() || !AppState.isAdmin()) {
+    return; // Will be handled by auth guard
+  }
+
+  // Update loading status
+  if (window.mclbLoadingOverlay) {
+    window.mclbLoadingOverlay.updateStatus('Loading admin panel...', 85);
+  }
+
+  switchTab('management');
+  
+  // Signal that all initial loading is complete
+  if (window.mclbLoadingOverlay) {
+    window.mclbLoadingOverlay.updateStatus('Admin panel ready!', 100);
+  }
+}
+
+/**
+ * Switch tab
+ */
+function switchTab(tab) {
+  currentTab = tab;
+  
+  // Update tab buttons
+  document.querySelectorAll('#adminTabs button').forEach(btn => {
+    btn.classList.remove('btn-primary');
+    btn.classList.add('btn-secondary');
+  });
+  const tabBtn = document.getElementById(`tab-${tab}`);
+  if (tabBtn) {
+    tabBtn.classList.remove('btn-secondary');
+    tabBtn.classList.add('btn-primary');
+  }
+  
+  // Show/hide tab content
+  document.querySelectorAll('.tab-content').forEach(content => {
+    content.classList.add('d-none');
+  });
+  const tabContent = document.getElementById(`${tab}Tab`);
+  if (!tabContent) {
+    console.warn(`Tab content not found for '${tab}' (expected #${tab}Tab)`);
+    return;
+  }
+  tabContent.classList.remove('d-none');
+  
+  // Load tab data
+  if (tab === 'management') {
+    // Combined Users + Players
+    // Unified search handles everything - no need to preload
+    // The unifiedSearchResults div will be populated when user searches
+    loadPlusCodesAdminPanel();
+  } else if (tab === 'moderation') {
+    // Combined Tier Tester Apps + Blacklist
+    loadTierTesterApplications();
+    loadBlacklist(); // safe no-op if not implemented yet
+  } else if (tab === 'reported') {
+    switchReportsTab('alt'); // Default to alt reports
+    loadReportedAccounts();
+  } else if (tab === 'judgment') {
+    loadJudgmentDayAccounts();
+    loadWhitelist();
+  } else if (tab === 'banned') {
+    loadBannedAccounts();
+  } else if (tab === 'testing') {
+    loadSystemStatus();
+  } else if (tab === 'ratings') {
+    loadGamemodeOptions();
+  } else if (tab === 'audit') {
+    // Load only when user clicks filter; don't spam.
+  } else if (tab === 'servers') {
+    loadWhitelistedServers();
+  } else if (tab === 'matches') {
+    loadMatches();
+  } else if (tab === 'security-scores') {
+    loadSecurityScores();
+  } else if (tab === 'support') {
+    loadSupportTickets();
+  }
+
+}
+
+function sanitizePlusCodeInput(value) {
+  return String(value || '').replace(/\D/g, '').slice(0, 6);
+}
+
+async function loadPlusCodesAdminPanel() {
+  const listEl = document.getElementById('plusCodesAdminList');
+  if (!listEl) return;
+
+  listEl.innerHTML = '<div class="spinner"></div>';
+  try {
+    const response = await apiService.adminListPlusCodes(false);
+    const codes = Array.isArray(response?.codes) ? response.codes : [];
+
+    if (codes.length === 0) {
+      listEl.innerHTML = '<div class="empty-state"><p class="text-muted">No active Plus codes.</p></div>';
+      return;
+    }
+
+    listEl.innerHTML = `
+      <div style="display:grid; gap:0.5rem;">
+        ${codes.slice(0, 100).map((entry) => `
+          <div class="card" style="border:1px solid var(--border-color);">
+            <div class="card-body" style="padding:0.75rem; display:flex; justify-content:space-between; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+              <div>
+                <div style="font-weight:800; letter-spacing:0.12em;">${escapeHtml(entry.code || '')}</div>
+                <div class="text-muted" style="font-size:0.85rem;">
+                  Years: ${Number(entry.years || 1)} | Source: ${escapeHtml(entry.source || 'admin')} | Used: ${entry.used === true ? 'Yes' : 'No'}
+                </div>
+                <div class="text-muted" style="font-size:0.8rem;">
+                  ${entry.assignedUserId ? `Assigned: ${escapeHtml(entry.assignedUserId)}` : 'Assigned: any user'}
+                </div>
+              </div>
+              <button class="btn btn-danger btn-sm" onclick="removePlusCodeAdmin('${escapeHtml(entry.code || '')}')" ${entry.used === true ? 'disabled' : ''}>
+                <i class="fas fa-trash"></i> Remove
+              </button>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } catch (error) {
+    listEl.innerHTML = `<div class="alert alert-danger">Failed to load Plus codes: ${escapeHtml(error.message || 'Unknown error')}</div>`;
+  }
+}
+
+window.handleCreatePlusCode = async function handleCreatePlusCode(event) {
+  event.preventDefault();
+
+  const codeInput = document.getElementById('plusCodeValue');
+  const yearsInput = document.getElementById('plusCodeYears');
+  const uidInput = document.getElementById('plusCodeAssignedUserId');
+  const noteInput = document.getElementById('plusCodeNote');
+
+  const code = sanitizePlusCodeInput(codeInput?.value || '');
+  if (codeInput) codeInput.value = code;
+
+  if (code && !/^\d{6}$/.test(code)) {
+    Swal.fire({ icon: 'error', title: 'Invalid code', text: 'Code must be exactly 6 digits.' });
+    return;
+  }
+
+  const years = Math.max(1, Math.min(5, parseInt(yearsInput?.value || '1', 10) || 1));
+  if (yearsInput) yearsInput.value = String(years);
+
+  try {
+    const response = await apiService.adminCreatePlusCode({
+      code: code || null,
+      years,
+      assignedUserId: (uidInput?.value || '').trim() || null,
+      note: (noteInput?.value || '').trim()
+    });
+
+    Swal.fire({
+      icon: 'success',
+      title: 'Code created',
+      html: `New code: <strong style="letter-spacing:0.12em;">${escapeHtml(response?.code?.code || '')}</strong>`
+    });
+
+    if (codeInput) codeInput.value = '';
+    if (uidInput) uidInput.value = '';
+    if (noteInput) noteInput.value = '';
+    await loadPlusCodesAdminPanel();
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Create failed', text: error.message || 'Failed to create code.' });
+  }
+};
+
+window.removePlusCodeAdmin = async function removePlusCodeAdmin(code) {
+  const normalized = sanitizePlusCodeInput(code);
+  if (!/^\d{6}$/.test(normalized)) return;
+
+  const confirmation = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove this code?',
+    text: `Code ${normalized} will be disabled and can no longer be redeemed.`,
+    showCancelButton: true,
+    confirmButtonText: 'Remove',
+    cancelButtonText: 'Cancel'
+  });
+  if (!confirmation.isConfirmed) return;
+
+  try {
+    await apiService.adminRemovePlusCode(normalized);
+    await loadPlusCodesAdminPanel();
+    Swal.fire({ icon: 'success', title: 'Removed', text: 'Code removed successfully.' });
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Remove failed', text: error.message || 'Unable to remove code.' });
+  }
+};
+
+/**
+ * Load applications
+ */
+async function loadApplications() {
+  const listDiv = document.getElementById('applicationsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+  
+  try {
+    const response = await apiService.getApplications();
+    
+    if (!response || !response.applications) {
+      throw new Error('Invalid response from server');
+    }
+    
+    const applications = (response.applications || []).filter(app => app.status === 'pending');
+    
+    if (applications.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No pending applications</p></div>';
+      return;
+    }
+    
+    listDiv.innerHTML = applications.map(app => `
+      <div class="card mb-3">
+        <div class="card-body">
+          <h4>${escapeHtml(app.username || 'Unknown')}</h4>
+          <p class="text-muted">${escapeHtml(app.email || 'No email')}</p>
+          <p>${escapeHtml(app.reason || 'No reason provided')}</p>
+          <div class="mt-3">
+            <button class="btn btn-success btn-sm" onclick="approveApplication('${app.id}')">
+              <i class="fas fa-check"></i> Approve
+            </button>
+            <button class="btn btn-danger btn-sm" onclick="denyApplication('${app.id}')">
+              <i class="fas fa-times"></i> Deny
+            </button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error loading applications:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading applications: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Approve application
+ */
+async function approveApplication(applicationId) {
+  try {
+    await apiService.approveApplication(applicationId);
+    Swal.fire({
+      icon: 'success',
+      title: 'Approved!',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    loadApplications();
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Deny application
+ */
+async function denyApplication(applicationId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Deny Application?',
+    text: 'Are you sure you want to deny this application?',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Deny',
+    cancelButtonText: 'Cancel'
+  });
+  
+  if (result.isConfirmed) {
+    try {
+      await apiService.denyApplication(applicationId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Denied',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadApplications();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Load blacklist
+ */
+async function loadBlacklist() {
+  const listDiv = document.getElementById('blacklistList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+  
+  try {
+    const searchInput = document.getElementById('blacklistSearchInput');
+    const includeExpiredInput = document.getElementById('blacklistIncludeExpired');
+    const pageSizeInput = document.getElementById('blacklistPageSize');
+
+    if (searchInput) adminUiState.blacklist.q = searchInput.value.trim();
+    if (includeExpiredInput) adminUiState.blacklist.includeExpired = includeExpiredInput.value === 'true';
+    if (pageSizeInput) adminUiState.blacklist.limit = parseInt(pageSizeInput.value, 10) || 25;
+
+    const response = await apiService.getBlacklist({
+      page: adminUiState.blacklist.page,
+      limit: adminUiState.blacklist.limit,
+      q: adminUiState.blacklist.q,
+      includeExpired: adminUiState.blacklist.includeExpired
+    });
+    
+    if (!response || !response.blacklist) {
+      throw new Error('Invalid response from server');
+    }
+    
+    const blacklist = response.blacklist || [];
+    adminUiState.blacklist.totalPages = response?.pagination?.totalPages || 1;
+    
+    if (blacklist.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No blacklisted players</p></div>';
+      return;
+    }
+    
+    listDiv.innerHTML = blacklist.map(entry => {
+      const expiresAt = entry.expiresAt ? new Date(entry.expiresAt) : null;
+      const isExpired = expiresAt ? expiresAt.getTime() <= Date.now() : false;
+      const disabledFunctions = Object.entries(entry.disabledFunctions || {})
+        .filter(([, enabled]) => enabled === true)
+        .map(([k]) => k)
+        .join(', ');
+
+      return `
+      <div class="card mb-3">
+        <div class="card-body">
+          <h4>${escapeHtml(entry.username)}</h4>
+          <p class="text-muted">${escapeHtml(entry.reason || 'No reason provided')}</p>
+          <small class="text-muted">Added: ${new Date(entry.addedAt).toLocaleDateString()}</small>
+          <br>
+          <small class="text-muted">Type: ${entry.temporary ? 'Temporary' : 'Permanent'}${expiresAt ? ` | Expires: ${expiresAt.toLocaleString()}` : ''}${isExpired ? ' (expired)' : ''}</small>
+          ${disabledFunctions ? `<br><small class="text-muted">Disabled: ${escapeHtml(disabledFunctions)}</small>` : ''}
+          <div class="mt-3">
+            <button class="btn btn-danger btn-sm" onclick="removeFromBlacklist('${entry.id}')">
+              <i class="fas fa-trash"></i> Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    }).join('');
+
+    renderBlacklistPagination(response?.pagination || null);
+  } catch (error) {
+    console.error('Error loading blacklist:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading blacklist: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderBlacklistPagination(pagination) {
+  const wrapper = document.getElementById('blacklistPagination');
+  const info = document.getElementById('blacklistPageInfo');
+  const prevBtn = document.getElementById('blacklistPrevBtn');
+  const nextBtn = document.getElementById('blacklistNextBtn');
+  if (!wrapper || !info || !prevBtn || !nextBtn) return;
+
+  const page = pagination?.page || adminUiState.blacklist.page;
+  const totalPages = pagination?.totalPages || adminUiState.blacklist.totalPages || 1;
+  const total = pagination?.total || 0;
+
+  wrapper.style.display = totalPages > 1 ? 'flex' : 'none';
+  info.textContent = `Page ${page} / ${totalPages} (${total} total)`;
+  prevBtn.disabled = page <= 1;
+  nextBtn.disabled = page >= totalPages;
+}
+
+function applyBlacklistFilters() {
+  adminUiState.blacklist.page = 1;
+  loadBlacklist();
+}
+
+function changeBlacklistPage(delta) {
+  const next = adminUiState.blacklist.page + delta;
+  if (next < 1 || next > (adminUiState.blacklist.totalPages || 1)) return;
+  adminUiState.blacklist.page = next;
+  loadBlacklist();
+}
+
+/**
+ * Handle add to blacklist
+ */
+async function handleAddBlacklist(event) {
+  event.preventDefault();
+  
+  const username = document.getElementById('blacklistUsername').value.trim();
+  const userId = document.getElementById('blacklistUserId')?.value.trim() || '';
+  const reason = document.getElementById('blacklistReason').value.trim();
+  const durationHours = parseInt(document.getElementById('blacklistDurationHours')?.value || '0', 10) || 0;
+  const disabledFunctions = {
+    chat: document.getElementById('blDisableChat')?.checked === true,
+    queue: document.getElementById('blDisableQueue')?.checked === true,
+    reports: document.getElementById('blDisableReports')?.checked === true,
+    account_changes: document.getElementById('blDisableAccountChanges')?.checked === true,
+    applications: document.getElementById('blDisableApplications')?.checked === true,
+    support_messages: document.getElementById('blDisableSupportMessages')?.checked === true
+  };
+  
+  try {
+    await apiService.addToBlacklist({ username, userId, reason, durationHours, disabledFunctions });
+    Swal.fire({
+      icon: 'success',
+      title: 'Added!',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    document.getElementById('blacklistForm').reset();
+    loadBlacklist();
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Remove from blacklist
+ */
+async function removeFromBlacklist(blacklistId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove from Blacklist?',
+    text: 'Are you sure you want to remove this player from the blacklist?',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Remove',
+    cancelButtonText: 'Cancel'
+  });
+  
+  if (result.isConfirmed) {
+    try {
+      await apiService.removeFromBlacklist(blacklistId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Removed',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadBlacklist();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Load users
+ */
+async function loadUsers() {
+  const listDiv = document.getElementById('usersList');
+  
+  // Check if element exists (it was removed when we unified the search)
+  if (!listDiv) {
+    console.warn('loadUsers called but usersList element does not exist. Use unified search instead.');
+    return;
+  }
+  
+  listDiv.innerHTML = '<div class="spinner"></div>';
+  
+  try {
+    const response = await apiService.getUsers();
+    
+    if (!response || !response.users) {
+      throw new Error('Invalid response from server');
+    }
+    
+    const users = response.users || [];
+    
+    if (users.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No users found</p></div>';
+      return;
+    }
+    
+    listDiv.innerHTML = `
+      <div class="table-responsive">
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 2px solid var(--border-color);">
+              <th style="padding: 1rem; text-align: left;">Email</th>
+              <th style="padding: 1rem; text-align: left;">Minecraft Username</th>
+              <th style="padding: 1rem; text-align: left;">Status</th>
+              <th style="padding: 1rem; text-align: left;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${users.map(user => `
+              <tr style="border-bottom: 1px solid var(--border-color);">
+                <td style="padding: 1rem;">${escapeHtml(user.email || 'N/A')}</td>
+                <td style="padding: 1rem;">${escapeHtml(user.minecraftUsername || 'Not linked')}</td>
+                <td style="padding: 1rem;">
+                  ${user.admin ? '<span class="badge badge-primary">Admin</span>' : ''}
+                  ${user.tester ? '<span class="badge badge-success">Tier Tester</span>' : ''}
+                  ${!user.admin && !user.tester ? '<span class="badge badge-secondary">User</span>' : ''}
+                </td>
+                <td style="padding: 1rem;">
+                  <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                    <button class="btn btn-sm ${user.tester ? 'btn-danger' : 'btn-success'}"
+                            onclick="toggleTierTester('${user.id}', ${!user.tester})">
+                      ${user.tester ? 'Remove Tester' : 'Make Tester'}
+                    </button>
+                    <button class="btn btn-sm ${user.admin ? 'btn-warning' : 'btn-primary'}" 
+                            onclick="toggleAdmin('${user.id}', ${!user.admin})">
+                      ${user.admin ? 'Remove Admin' : 'Make Admin'}
+                    </button>
+                    <button class="btn btn-sm btn-secondary"
+                            onclick="openManagementScreen('user', '${user.id}', '${escapeHtml(user.email || 'N/A')}', '${escapeHtml(user.minecraftUsername || '')}')">
+                      Manage
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error loading users:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading users: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Toggle admin status
+ */
+async function toggleAdmin(userId, status) {
+  try {
+    await apiService.setAdminStatus(userId, status);
+    Swal.fire({
+      icon: 'success',
+      title: status ? 'Made Admin' : 'Removed Admin',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    // Refresh unified search if it has results
+    const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+    if (searchTerm) {
+      await handleUnifiedSearch({ preventDefault: () => {} });
+    }
+
+    // Clear cached players so leaderboard/admin views pick up new role badges quickly
+    if (typeof apiService.clearCache === 'function') {
+      apiService.clearCache('/players');
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Toggle tier tester status
+ */
+async function toggleTierTester(userId, status) {
+  try {
+    await apiService.setTesterStatus(userId, status);
+    Swal.fire({
+      icon: 'success',
+      title: status ? 'Made Tier Tester' : 'Removed Tier Tester',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    // Refresh unified search if it has results
+    const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+    if (searchTerm) {
+      await handleUnifiedSearch({ preventDefault: () => {} });
+    }
+
+    // Clear cached players so leaderboard/admin views pick up new role badges quickly
+    if (typeof apiService.clearCache === 'function') {
+      apiService.clearCache('/players');
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Handle add player
+ */
+async function handleAddPlayer(event) {
+  event.preventDefault();
+
+  const username = document.getElementById('playerUsername').value.trim();
+  const region = document.getElementById('playerRegion').value || null;
+
+  try {
+    await apiService.createPlayer(username, region);
+    Swal.fire({
+      icon: 'success',
+      title: 'Player Added!',
+      text: `${username} has been added to the leaderboard.`,
+      timer: 1500,
+      showConfirmButton: false
+    });
+    document.getElementById('addPlayerForm').reset();
+    // Refresh unified search if it has results
+    const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+    if (searchTerm) {
+      await handleUnifiedSearch({ preventDefault: () => {} });
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Add Player',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Open player management window (10 actions)
+ */
+/**
+ * Open management screen for player or user
+ * @param {string} type - 'player' or 'user'
+ * @param {string} id - Player ID or User ID
+ * @param {string} name - Display name (username or email)
+ * @param {string} username - Minecraft username (if available)
+ * @param {string} userId - Firebase UID (if available)
+ * @param {string} playerId - Player ID (if available)
+ */
+function openManagementScreen(type, id, name, username = '', userId = '', playerId = '') {
+  const section = document.getElementById('managementSection');
+  const titleEl = document.getElementById('managementSectionTitle');
+  const actionGrid = document.getElementById('managementActionGrid');
+  const formContainer = document.getElementById('managementFormContainer');
+  
+  // Set title with UID info
+  let titleText = `Manage ${type === 'player' ? 'Player' : 'User'}: ${escapeHtml(name)}`;
+  if (type === 'player' && id) {
+    titleText += ` (Player ID: ${escapeHtml(id)})`;
+  } else if (type === 'user' && id) {
+    titleText += ` (User ID: ${escapeHtml(id)})`;
+  }
+  titleEl.textContent = titleText;
+  
+  // Store current context
+  window.currentManagementContext = {
+    type,
+    id,
+    name,
+    username,
+    userId,
+    playerId
+  };
+  
+  // Define available actions - ALL actions shown for both users and players
+  const actions = [
+    { id: 'force_auth', title: 'Force Auth', icon: 'fa-link', desc: 'Link username to account', requires: ['userId', 'username'] },
+    { id: 'force_auth_unlink', title: 'Force Auth Unlink', icon: 'fa-unlink', desc: 'Unlink username, keep ratings', requires: ['userId'] },
+    { id: 'force_test', title: 'Force Test', icon: 'fa-vial', desc: 'Create match offline', requires: ['userId', 'testerId', 'gamemode'] },
+    { id: 'rating_transfer', title: 'Rating Transfer', icon: 'fa-exchange-alt', desc: 'Transfer ratings to another player', requires: ['destinationPlayerId'] },
+    { id: 'rating_wipe', title: 'Rating Wipe', icon: 'fa-eraser', desc: 'Remove all ratings', requires: [] },
+    { id: 'set_region', title: 'Set Region', icon: 'fa-globe', desc: 'Set player region', requires: ['region'] },
+    { id: 'set_note', title: 'Set Note', icon: 'fa-sticky-note', desc: 'Set admin note', requires: ['note'] },
+    { id: 'wipe_player_data', title: 'Wipe All Data', icon: 'fa-trash-alt', desc: 'Delete player record', requires: [] },
+    { id: 'verify_username', title: 'Manually Verify Username', icon: 'fa-check-circle', desc: 'Bypass verification', requires: [] },
+    { id: 'reset_onboarding', title: 'Reset Onboarding', icon: 'fa-redo', desc: 'Allow user to redo onboarding', requires: [] },
+    { id: 'ban_user', title: 'Ban User', icon: 'fa-ban', desc: 'Ban user account', requires: ['banReason'] },
+    { id: 'unban_user', title: 'Unban User', icon: 'fa-unlock', desc: 'Unban user account', requires: [] },
+    { id: 'set_restrictions', title: 'Set Restrictions', icon: 'fa-sliders-h', desc: 'Disable selected user functions', requires: ['userId'] },
+    { id: 'view_moderation_history', title: 'Moderation History', icon: 'fa-scroll', desc: 'Warnings, blacklist, restrictions, audit', requires: ['userId'] },
+    { id: 'reset_password', title: 'Reset Password', icon: 'fa-key', desc: 'Send password reset email', requires: [] },
+    { id: 'delete_account', title: 'Delete Account', icon: 'fa-user-times', desc: 'Permanently delete account', requires: [] },
+    { id: 'view_notes', title: 'View Note History', icon: 'fa-history', desc: 'View all admin notes', requires: [] },
+    { id: 'plus_subscription', title: 'Plus Subscription', icon: 'fa-crown', desc: 'Grant/cancel/block Plus membership', requires: ['userId'] }
+  ];
+  
+  // Render action cards
+  actionGrid.innerHTML = actions.map(action => `
+    <div class="action-card" data-action="${action.id}" onclick="selectManagementAction('${action.id}')">
+      <div class="action-card-icon"><i class="fas ${action.icon}"></i></div>
+      <div class="action-card-title">${action.title}</div>
+      <div class="action-card-desc">${action.desc}</div>
+    </div>
+  `).join('');
+  
+  // Hide form initially
+  formContainer.style.display = 'none';
+  
+  // Show section and scroll to it
+  section.classList.remove('d-none');
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/**
+ * Select management action
+ */
+function selectManagementAction(actionId) {
+  // Update selected state
+  document.querySelectorAll('.action-card').forEach(card => {
+    card.classList.remove('selected');
+  });
+  document.querySelector(`.action-card[data-action="${actionId}"]`).classList.add('selected');
+  
+  // Show form
+  const formContainer = document.getElementById('managementFormContainer');
+  const formTitle = document.getElementById('managementFormTitle');
+  const form = document.getElementById('managementForm');
+  
+  const context = window.currentManagementContext;
+  // All actions available regardless of type
+  const actions = [
+    { id: 'force_auth', title: 'Force Auth', fields: ['userId', 'username'] },
+    { id: 'force_auth_unlink', title: 'Force Auth Unlink', fields: ['userId'] },
+    { id: 'force_test', title: 'Force Test', fields: ['userId', 'testerId', 'gamemode', 'region', 'serverIP'] },
+    { id: 'rating_transfer', title: 'Rating Transfer', fields: ['destinationPlayerId'] },
+    { id: 'rating_wipe', title: 'Rating Wipe', fields: [] },
+    { id: 'set_region', title: 'Set Region', fields: ['region'] },
+    { id: 'set_note', title: 'Set Note', fields: ['note'] },
+    { id: 'wipe_player_data', title: 'Wipe All Data', fields: [] },
+    { id: 'verify_username', title: 'Manually Verify Username', fields: [] },
+    { id: 'reset_onboarding', title: 'Reset Onboarding', fields: [] },
+    { id: 'ban_user', title: 'Ban User', fields: ['banReason'] },
+    { id: 'unban_user', title: 'Unban User', fields: [] },
+    { id: 'set_restrictions', title: 'Set Restrictions', fields: ['userId', 'restrictionFlags', 'restrictionDurationHours', 'restrictionReason'] },
+    { id: 'view_moderation_history', title: 'Moderation History', fields: ['userId'] },
+    { id: 'reset_password', title: 'Reset Password', fields: [] },
+    { id: 'delete_account', title: 'Delete Account', fields: [] },
+    { id: 'view_notes', title: 'View Note History', fields: [] },
+    { id: 'plus_subscription', title: 'Plus Subscription', fields: ['userId', 'plusAction', 'plusYears', 'plusBlockReason'] }
+  ];
+  
+  const action = actions.find(a => a.id === actionId);
+  if (!action) return;
+  
+  formTitle.textContent = action.title;
+  
+  // Build form fields
+  let formHTML = '';
+  
+  if (action.fields.includes('userId')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Firebase UID</label>
+        <input type="text" id="mgmtUserId" class="form-input" value="${escapeHtml(context.userId || '')}" placeholder="Enter Firebase UID">
+        <div class="form-help">User's Firebase UID</div>
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('username')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Minecraft Username</label>
+        <input type="text" id="mgmtUsername" class="form-input" value="${escapeHtml(context.username || '')}" placeholder="Enter Minecraft username">
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('testerId')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Tester Firebase UID</label>
+        <input type="text" id="mgmtTesterId" class="form-input" placeholder="Enter tester's Firebase UID">
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('gamemode')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Gamemode</label>
+        <select id="mgmtGamemode" class="form-select">
+          <option value="">Select gamemode...</option>
+          <option value="vanilla">Vanilla</option>
+          <option value="uhc">UHC</option>
+          <option value="pot">Pot</option>
+          <option value="nethop">NethOP</option>
+          <option value="smp">SMP</option>
+          <option value="sword">Sword</option>
+          <option value="axe">Axe</option>
+          <option value="mace">Mace</option>
+        </select>
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('region')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Region</label>
+        <select id="mgmtRegion" class="form-select">
+          <option value="">Select region...</option>
+          <option value="NA">NA</option>
+          <option value="EU">EU</option>
+          <option value="AS">AS</option>
+          <option value="SA">SA</option>
+          <option value="AU">AU</option>
+        </select>
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('serverIP')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Server IP</label>
+        <input type="text" id="mgmtServerIP" class="form-input" placeholder="Enter server IP">
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('destinationPlayerId')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Destination Player ID</label>
+        <input type="text" id="mgmtDestinationPlayerId" class="form-input" placeholder="Enter destination player ID">
+        <div class="form-help">Transfer ratings FROM ${escapeHtml(context.username || context.name)} (ID: ${context.id}) TO this player ID</div>
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('note')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Admin Note</label>
+        <textarea id="mgmtNote" class="form-input" rows="3" placeholder="Internal note (optional)"></textarea>
+      </div>
+    `;
+  }
+  
+  if (action.fields.includes('banReason')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Ban Reason</label>
+        <textarea id="mgmtBanReason" class="form-input" rows="3" placeholder="Reason for ban" required></textarea>
+        <div class="form-help">This will be shown to the user</div>
+      </div>
+    `;
+  }
+
+  if (action.fields.includes('restrictionFlags')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Restricted Features</label>
+        <div class="row">
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionChat"> Chat</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionQueue"> Queue</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionReports"> Reports</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionAccountChanges"> Account Changes</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionApplications"> Applications</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionSupportMessages"> Support Messages</label></div>
+        </div>
+      </div>
+    `;
+  }
+
+  if (action.fields.includes('restrictionDurationHours')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Duration (hours)</label>
+        <input type="number" id="mgmtRestrictionDurationHours" class="form-input" min="0" step="1" value="0" placeholder="0 = no expiry">
+      </div>
+    `;
+  }
+
+  if (action.fields.includes('restrictionReason')) {
+    formHTML += `
+      <div class="form-group">
+        <label class="form-label">Reason</label>
+        <input type="text" id="mgmtRestrictionReason" class="form-input" placeholder="Reason shown in standing section">
+      </div>
+    `;
+  }
+  
+  if (formHTML === '') {
+    formHTML = '<p class="text-muted">No additional information required. Click Execute to proceed.</p>';
+  }
+
+  if (actionId === 'plus_subscription') {
+    formHTML = `
+      <div class="form-group">
+        <label class="form-label">Firebase UID</label>
+        <input type="text" id="mgmtUserId" class="form-input" value="${escapeHtml(context.userId || context.id || '')}" placeholder="Enter Firebase UID">
+        <div class="form-help">Grant/cancel/block Plus for this user</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Action</label>
+        <select id="mgmtPlusAction" class="form-select">
+          <option value="grant">Grant (add 1+ year)</option>
+          <option value="cancel">Cancel (remove perks)</option>
+          <option value="block">Block (prevent Plus + remove perks)</option>
+          <option value="unblock">Unblock</option>
+        </select>
+      </div>
+      <div class="form-group" id="mgmtPlusYearsGroup">
+        <label class="form-label">Years</label>
+        <input type="number" id="mgmtPlusYears" class="form-input" min="1" max="5" value="1">
+        <div class="form-help">Maximum 5 years at a time</div>
+      </div>
+      <div class="form-group" id="mgmtPlusReasonGroup" style="display:none;">
+        <label class="form-label">Block Reason (optional)</label>
+        <input type="text" id="mgmtPlusBlockReason" class="form-input" placeholder="Reason for blocking Plus">
+      </div>
+    `;
+  }
+  
+  form.innerHTML = formHTML;
+  formContainer.style.display = 'block';
+  
+  // Wire dynamic toggles for Plus form (scripts injected via innerHTML are unreliable)
+  if (actionId === 'plus_subscription') {
+    const sel = document.getElementById('mgmtPlusAction');
+    const years = document.getElementById('mgmtPlusYearsGroup');
+    const reason = document.getElementById('mgmtPlusReasonGroup');
+    const update = () => {
+      const v = sel?.value || 'grant';
+      if (years) years.style.display = (v === 'grant') ? 'block' : 'none';
+      if (reason) reason.style.display = (v === 'block') ? 'block' : 'none';
+    };
+    if (sel) sel.addEventListener('change', update);
+    update();
+  }
+  
+  // Store selected action
+  window.currentManagementAction = actionId;
+}
+
+/**
+ * Close management screen
+ */
+function closeManagementScreen() {
+  const section = document.getElementById('managementSection');
+  section.classList.add('d-none');
+  window.currentManagementContext = null;
+  window.currentManagementAction = null;
+  
+  // Reset form
+  const formContainer = document.getElementById('managementFormContainer');
+  const form = document.getElementById('managementForm');
+  if (formContainer) formContainer.style.display = 'none';
+  if (form) form.reset();
+  
+  // Clear selected action cards
+  document.querySelectorAll('.action-card.selected').forEach(card => {
+    card.classList.remove('selected');
+  });
+}
+
+/**
+ * Reset management form
+ */
+function resetManagementForm() {
+  const form = document.getElementById('managementForm');
+  form.reset();
+}
+
+/**
+ * Execute management action
+ */
+async function executeManagementAction() {
+  const context = window.currentManagementContext;
+  const action = window.currentManagementAction;
+  
+  if (!context || !action) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Error',
+      text: 'No action selected'
+    });
+    return;
+  }
+  
+  try {
+    // Collect form data
+    const formData = {
+      userId: document.getElementById('mgmtUserId')?.value?.trim() || context.userId || '',
+      username: document.getElementById('mgmtUsername')?.value?.trim() || context.username || '',
+      testerId: document.getElementById('mgmtTesterId')?.value?.trim() || '',
+      gamemode: document.getElementById('mgmtGamemode')?.value || '',
+      region: document.getElementById('mgmtRegion')?.value || '',
+      serverIP: document.getElementById('mgmtServerIP')?.value?.trim() || '',
+      destinationPlayerId: document.getElementById('mgmtDestinationPlayerId')?.value?.trim() || '',
+      note: document.getElementById('mgmtNote')?.value?.trim() || '',
+      banReason: document.getElementById('mgmtBanReason')?.value?.trim() || '',
+      restrictionDurationHours: parseInt(document.getElementById('mgmtRestrictionDurationHours')?.value || '0', 10) || 0,
+      restrictionReason: document.getElementById('mgmtRestrictionReason')?.value?.trim() || '',
+      plusAction: document.getElementById('mgmtPlusAction')?.value || '',
+      plusYears: parseInt(document.getElementById('mgmtPlusYears')?.value || '1'),
+      plusBlockReason: document.getElementById('mgmtPlusBlockReason')?.value?.trim() || ''
+    };
+
+    formData.restrictions = {
+      chat: document.getElementById('mgmtRestrictionChat')?.checked === true,
+      queue: document.getElementById('mgmtRestrictionQueue')?.checked === true,
+      reports: document.getElementById('mgmtRestrictionReports')?.checked === true,
+      account_changes: document.getElementById('mgmtRestrictionAccountChanges')?.checked === true,
+      applications: document.getElementById('mgmtRestrictionApplications')?.checked === true,
+      support_messages: document.getElementById('mgmtRestrictionSupportMessages')?.checked === true
+    };
+    
+    // Validate required fields
+    if (action === 'force_auth') {
+      if (!formData.userId || !formData.username) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Validation Error',
+          text: 'Firebase UID and Minecraft username are required'
+        });
+        return;
+      }
+    }
+    
+    if (action === 'force_auth_unlink') {
+      if (!formData.userId && context.type === 'user') {
+        formData.userId = context.id;
+      }
+      if (!formData.userId) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Validation Error',
+          text: 'Firebase UID is required'
+        });
+        return;
+      }
+    }
+    
+    if (action === 'force_test') {
+      if (!formData.userId || !formData.testerId || !formData.gamemode || !formData.region || !formData.serverIP) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Validation Error',
+          text: 'All fields are required for force test'
+        });
+        return;
+      }
+    }
+    
+    if (action === 'rating_transfer') {
+      if (!formData.destinationPlayerId) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Validation Error',
+          text: 'Destination player ID is required'
+        });
+        return;
+      }
+    }
+    
+    // Execute action
+    if (action === 'plus_subscription') {
+      if (!formData.userId) {
+        Swal.fire({ icon: 'error', title: 'Validation Error', text: 'Firebase UID is required' });
+        return;
+      }
+      if (formData.plusAction === 'grant') {
+        await apiService.adminGrantPlus(formData.userId, formData.plusYears || 1);
+      } else if (formData.plusAction === 'cancel') {
+        await apiService.adminCancelPlus(formData.userId);
+      } else if (formData.plusAction === 'block') {
+        await apiService.adminSetPlusBlocked(formData.userId, true, formData.plusBlockReason || '');
+      } else if (formData.plusAction === 'unblock') {
+        await apiService.adminSetPlusBlocked(formData.userId, false, '');
+      } else {
+        throw new Error('Invalid Plus action');
+      }
+    } else if (action === 'force_auth') {
+      await apiService.forceAuth(formData.userId, formData.username);
+    } else if (action === 'force_auth_unlink') {
+      await apiService.forceAuthUnlink(formData.userId);
+    } else if (action === 'force_test') {
+      // forceTest expects: testerUserId, playerUserId, gamemode, region, serverIP
+      await apiService.forceTest(formData.testerId, formData.userId, formData.gamemode, formData.region, formData.serverIP);
+    } else if (action === 'rating_transfer') {
+      // ratingTransfer expects: fromPlayerId, toPlayerId
+      const fromPlayerId = context.type === 'player' ? context.id : null;
+      if (!fromPlayerId) {
+        throw new Error('Source player ID is required for rating transfer');
+      }
+      // For destination, we need to find player by username first
+      // For now, require destination to be a player ID or we need to look it up
+      // Since the form asks for username, we'll need to find the player ID
+      // For simplicity, let's change the form to ask for destination player ID
+      if (!formData.destinationPlayerId) {
+        throw new Error('Destination player ID is required for rating transfer');
+      }
+      await apiService.ratingTransfer(fromPlayerId, formData.destinationPlayerId);
+    } else if (action === 'rating_wipe') {
+      // Try to get player ID from context
+      const playerId = context.type === 'player' ? context.id : context.playerId;
+      if (!playerId) {
+        throw new Error('Player ID is required for rating wipe. This user may not have a linked Minecraft account.');
+      }
+      await apiService.ratingWipe(playerId);
+    } else if (action === 'set_region') {
+      // Try to get player ID from context
+      const playerId = context.type === 'player' ? context.id : context.playerId;
+      if (!playerId) {
+        throw new Error('Player ID is required for set region. This user may not have a linked Minecraft account.');
+      }
+      await apiService.adminManagePlayer(playerId, 'set_region', { region: formData.region });
+    } else if (action === 'set_note') {
+      // Set note works for both players and users
+      if (context.type === 'player') {
+        await apiService.adminManagePlayer(context.id, 'set_note', { note: formData.note });
+      } else {
+        await apiService.adminManageUser(context.id, 'set_note', { note: formData.note });
+      }
+    } else if (action === 'wipe_player_data') {
+      // Try to get player ID from context
+      const playerId = context.type === 'player' ? context.id : context.playerId;
+      if (!playerId) {
+        throw new Error('Player ID is required for wipe player data. This user may not have a linked Minecraft account.');
+      }
+      await apiService.adminManagePlayer(playerId, 'wipe_player_data', {});
+    } else if (action === 'verify_username') {
+      // Manually verify username for a player's linked user
+      if (!formData.userId) {
+        formData.userId = context.userId || context.id;
+      }
+      await apiService.adminManageUser(formData.userId, 'verify_username', {});
+    } else if (action === 'reset_onboarding') {
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required for reset onboarding');
+      }
+      await apiService.adminManageUser(targetUserId, 'reset_onboarding', {});
+    } else if (action === 'ban_user') {
+      if (!formData.banReason) {
+        throw new Error('Ban reason is required');
+      }
+      // Try to get user ID from context
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required for ban. This player may not have a linked user account.');
+      }
+      await apiService.adminManageUser(targetUserId, 'ban_user', { reason: formData.banReason });
+    } else if (action === 'unban_user') {
+      // Try to get user ID from context
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required for unban. This player may not have a linked user account.');
+      }
+      await apiService.adminManageUser(targetUserId, 'unban_user', {});
+    } else if (action === 'set_restrictions') {
+      const targetUserId = formData.userId || (context.type === 'user' ? context.id : context.userId);
+      if (!targetUserId) {
+        throw new Error('User ID is required for restrictions');
+      }
+      await apiService.adminSetUserRestrictions(
+        targetUserId,
+        formData.restrictions,
+        formData.restrictionDurationHours,
+        formData.restrictionReason
+      );
+    } else if (action === 'view_moderation_history') {
+      const targetUserId = formData.userId || (context.type === 'user' ? context.id : context.userId);
+      if (!targetUserId) {
+        throw new Error('User ID is required to view moderation history');
+      }
+
+      const history = await apiService.adminGetUserModerationHistory(targetUserId);
+      const warnings = Array.isArray(history.warnings) ? history.warnings : [];
+      const blacklistEntries = Array.isArray(history.blacklistEntries) ? history.blacklistEntries : [];
+      const auditLogs = Array.isArray(history.auditLogs) ? history.auditLogs : [];
+
+      const html = `
+        <div style="text-align:left; max-height: 520px; overflow-y:auto;">
+          <h4>Warnings (${warnings.length})</h4>
+          <div>${warnings.slice(0, 10).map(w => `<div style="padding:6px 0; border-bottom:1px solid #333;">${escapeHtml(w.reason || 'No reason')}<br><small>${w.warnedAt ? new Date(w.warnedAt).toLocaleString() : 'Unknown date'}</small></div>`).join('') || '<div class="text-muted">No warnings.</div>'}</div>
+          <h4 style="margin-top:1rem;">Blacklist (${blacklistEntries.length})</h4>
+          <div>${blacklistEntries.slice(0, 10).map(b => `<div style="padding:6px 0; border-bottom:1px solid #333;">${escapeHtml(b.reason || 'No reason')}<br><small>${b.addedAt ? new Date(b.addedAt).toLocaleString() : 'Unknown date'}${b.expiresAt ? ` | Expires ${new Date(b.expiresAt).toLocaleString()}` : ''}</small></div>`).join('') || '<div class="text-muted">No blacklist entries.</div>'}</div>
+          <h4 style="margin-top:1rem;">Audit (${auditLogs.length})</h4>
+          <div>${auditLogs.slice(0, 20).map(a => `<div style="padding:6px 0; border-bottom:1px solid #333;"><strong>${escapeHtml(a.action || 'ACTION')}</strong><br><small>${a.timestamp ? new Date(a.timestamp).toLocaleString() : 'Unknown date'}</small></div>`).join('') || '<div class="text-muted">No audit history.</div>'}</div>
+        </div>
+      `;
+
+      Swal.fire({
+        icon: 'info',
+        title: 'Moderation History',
+        html,
+        width: 720
+      });
+      return;
+    } else if (action === 'reset_password') {
+      // Try to get user ID from context
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required for password reset. This player may not have a linked user account.');
+      }
+      await apiService.adminManageUser(targetUserId, 'reset_password', {});
+    } else if (action === 'delete_account') {
+      // Try to get user ID from context
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required for account deletion. This player may not have a linked user account.');
+      }
+      
+      // Confirm deletion
+      const confirmResult = await Swal.fire({
+        icon: 'warning',
+        title: 'Confirm Account Deletion',
+        text: 'This action is PERMANENT and cannot be undone. All user data will be deleted.',
+        showCancelButton: true,
+        confirmButtonText: 'Yes, Delete',
+        confirmButtonColor: '#d33',
+        cancelButtonText: 'Cancel'
+      });
+      
+      if (!confirmResult.isConfirmed) {
+        return;
+      }
+      
+      await apiService.adminManageUser(targetUserId, 'delete_account', {});
+    } else if (action === 'view_notes') {
+      // Try to get user ID from context - view notes works for users primarily
+      const targetUserId = context.type === 'user' ? context.id : context.userId;
+      if (!targetUserId) {
+        throw new Error('User ID is required to view notes. This player may not have a linked user account.');
+      }
+      const notesResult = await apiService.adminManageUser(targetUserId, 'view_notes', {});
+      
+      let notesHtml = '<div style="text-align: left; max-height: 400px; overflow-y: auto;">';
+      if (notesResult.notes && notesResult.notes.length > 0) {
+        notesResult.notes.forEach(note => {
+          notesHtml += `
+            <div style="border-bottom: 1px solid #ddd; padding: 10px 0;">
+              <p><strong>${escapeHtml(note.adminEmail || 'Unknown Admin')}</strong></p>
+              <p style="color: #666; font-size: 0.9em;">${new Date(note.timestamp).toLocaleString()}</p>
+              <p style="margin-top: 5px;">${escapeHtml(note.note)}</p>
+            </div>
+          `;
+        });
+      } else {
+        notesHtml += '<p class="text-muted">No admin notes found for this user.</p>';
+      }
+      notesHtml += '</div>';
+      
+      Swal.fire({
+        icon: 'info',
+        title: 'Admin Note History',
+        html: notesHtml,
+        width: '600px'
+      });
+      return; // Don't close the management screen or show success message
+    }
+    
+    Swal.fire({
+      icon: 'success',
+      title: 'Success',
+      text: 'Action completed successfully',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    
+    closeManagementScreen();
+    
+    // Refresh unified search if it has results
+    const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+    if (searchTerm) {
+      await handleUnifiedSearch({ preventDefault: () => {} });
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Error',
+      text: error.message || 'An error occurred'
+    });
+  }
+}
+
+// Legacy function for backwards compatibility
+async function openPlayerManagementModal(playerId, username, userId) {
+  openManagementScreen('player', playerId, username, username, userId, playerId);
+}
+
+/**
+ * Open set rating modal
+ */
+function openSetRatingModal(playerId, username) {
+  Swal.fire({
+    title: `Set Rating for ${escapeHtml(username)}`,
+    html: `
+      <div class="form-group">
+        <label>Gamemode</label>
+        <select id="ratingGamemode" class="form-select">
+          <option value="">Select gamemode...</option>
+          ${CONFIG.GAMEMODES.filter(gm => gm.id !== 'overall').map(gm => 
+            `<option value="${gm.id}">${gm.name}</option>`
+          ).join('')}
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Elo Rating</label>
+        <input type="number" id="ratingInput" class="form-input" placeholder="Enter Elo rating (300-3000)" min="300" max="3000" step="25">
+      </div>
+    `,
+    showCancelButton: true,
+    confirmButtonText: 'Set Rating',
+    preConfirm: () => {
+      const gamemode = document.getElementById('ratingGamemode').value;
+      const rating = parseInt(document.getElementById('ratingInput').value);
+      if (!gamemode) {
+        Swal.showValidationMessage('Please select a gamemode');
+        return false;
+      }
+      if (!rating || rating < 300 || rating > 3000) {
+        Swal.showValidationMessage('Please enter a valid Elo rating (300-3000)');
+        return false;
+      }
+      return { gamemode, rating };
+    }
+  }).then(async (result) => {
+    if (result.isConfirmed) {
+      try {
+        await apiService.setPlayerRating(playerId, result.value.gamemode, result.value.rating);
+        Swal.fire({
+          icon: 'success',
+          title: 'Rating Set!',
+          text: `Set ${result.value.gamemode} rating to ${result.value.rating} Elo`,
+          timer: 1500,
+          showConfirmButton: false
+        });
+        // Refresh unified search if it has results
+        const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+        if (searchTerm) {
+          await handleUnifiedSearch({ preventDefault: () => {} });
+        }
+      } catch (error) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Failed',
+          text: error.message
+        });
+      }
+    }
+  });
+}
+
+/**
+ * Escape HTML
+ */
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+/**
+ * Handle ban account
+ */
+async function handleBanAccount(event) {
+  event.preventDefault();
+
+  const identifier = document.getElementById('banIdentifier').value.trim();
+  const duration = document.getElementById('banDuration').value;
+  const reason = document.getElementById('banReason').value.trim();
+
+  try {
+    await apiService.banAccount(identifier, duration, reason);
+    Swal.fire({
+      icon: 'success',
+      title: 'Account Banned!',
+      text: 'The account has been banned successfully.',
+      timer: 2000,
+      showConfirmButton: false
+    });
+    document.getElementById('banAccountForm').reset();
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Ban Account',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Handle search banned accounts
+ */
+async function handleSearchBanned(event) {
+  event.preventDefault();
+
+  const searchTerm = document.getElementById('bannedSearch').value.trim();
+  const listDiv = document.getElementById('bannedAccountsList');
+
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.searchBannedAccounts(searchTerm);
+
+    if (!response || !response.bannedAccounts) {
+      throw new Error('Invalid response from server');
+    }
+
+    const bannedAccounts = response.bannedAccounts || [];
+
+    if (bannedAccounts.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No banned accounts found matching your search</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = `
+      <div class="table-responsive">
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 2px solid var(--border-color);">
+              <th style="padding: 1rem; text-align: left;">Email</th>
+              <th style="padding: 1rem; text-align: left;">Firebase UID</th>
+              <th style="padding: 1rem; text-align: left;">Banned At</th>
+              <th style="padding: 1rem; text-align: left;">Expires</th>
+              <th style="padding: 1rem; text-align: left;">Reason</th>
+              <th style="padding: 1rem; text-align: left;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${bannedAccounts.map(account => `
+              <tr style="border-bottom: 1px solid var(--border-color);">
+                <td style="padding: 1rem;">${escapeHtml(account.email || 'N/A')}</td>
+                <td style="padding: 1rem;">${escapeHtml(account.firebaseUid || 'N/A')}</td>
+                <td style="padding: 1rem;">${account.bannedAt ? new Date(account.bannedAt).toLocaleDateString() : 'N/A'}</td>
+                <td style="padding: 1rem;">${account.banExpires ? (account.banExpires === 'permanent' ? 'Permanent' : new Date(account.banExpires).toLocaleDateString()) : 'N/A'}</td>
+                <td style="padding: 1rem;">${escapeHtml(account.banReason || 'No reason provided')}</td>
+                <td style="padding: 1rem;">
+                  <button class="btn btn-sm btn-success" onclick="handleUnbanAccount('${account.firebaseUid}')">
+                    <i class="fas fa-unlock"></i> Unban
+                  </button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error searching banned accounts:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error searching banned accounts: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Handle unban account
+ */
+async function handleUnbanAccount(firebaseUid) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Unban Account?',
+    text: 'Are you sure you want to unban this account?',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Unban',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.unbanAccount(firebaseUid);
+      Swal.fire({
+        icon: 'success',
+        title: 'Account Unbanned',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      // Refresh search results
+      document.getElementById('searchBannedForm').dispatchEvent(new Event('submit'));
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed to Unban',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Handle search blacklist
+ */
+async function handleSearchBlacklist(event) {
+  event.preventDefault();
+
+  const searchTerm = document.getElementById('blacklistSearch').value.trim();
+  const listDiv = document.getElementById('blacklistList');
+
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.searchBlacklist(searchTerm);
+
+    if (!response || !response.blacklist) {
+      throw new Error('Invalid response from server');
+    }
+
+    const blacklist = response.blacklist || [];
+
+    if (blacklist.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No blacklisted players found matching your search</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = blacklist.map(entry => `
+      <div class="card mb-3">
+        <div class="card-body">
+          <h4>${escapeHtml(entry.username)}</h4>
+          <p class="text-muted">${escapeHtml(entry.reason || 'No reason provided')}</p>
+          <small class="text-muted">Added: ${new Date(entry.addedAt).toLocaleDateString()}</small>
+          <div class="mt-3">
+            <button class="btn btn-danger btn-sm" onclick="removeFromBlacklist('${entry.id}')">
+              <i class="fas fa-trash"></i> Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error searching blacklist:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error searching blacklist: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Handle unified search (users and players)
+ */
+async function handleUnifiedSearch(event) {
+  if (event && typeof event.preventDefault === 'function') event.preventDefault();
+
+  const searchTerm = document.getElementById('unifiedSearch').value.trim();
+  const resultsDiv = document.getElementById('unifiedSearchResults');
+
+  if (!searchTerm) {
+    resultsDiv.innerHTML = '<div class="empty-state"><p class="text-muted">Please enter a search term</p></div>';
+    return;
+  }
+
+  if (searchTerm !== adminUiState.unifiedSearch.lastTerm) {
+    adminUiState.unifiedSearch.page = 1;
+    adminUiState.unifiedSearch.lastTerm = searchTerm;
+  }
+
+  resultsDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    // Search both users and players in parallel
+    const [usersResponse, playersResponse] = await Promise.all([
+      apiService.searchUsers(searchTerm, {
+        page: adminUiState.unifiedSearch.page,
+        limit: adminUiState.unifiedSearch.limit
+      }).catch(err => {
+        console.warn('Error searching users:', err);
+        return { users: [] };
+      }),
+      apiService.searchPlayers(searchTerm, {
+        page: adminUiState.unifiedSearch.page,
+        limit: adminUiState.unifiedSearch.limit
+      }).catch(err => {
+        console.warn('Error searching players:', err);
+        return { players: [] };
+      })
+    ]);
+
+    const users = usersResponse?.users || [];
+    const players = playersResponse?.players || [];
+    adminUiState.unifiedSearch.totalPages = Math.max(
+      usersResponse?.pagination?.totalPages || 1,
+      playersResponse?.pagination?.totalPages || 1
+    );
+
+    // Combine and deduplicate results
+    // If a user has a linked player, merge the data
+    const combinedResults = [];
+    const processedPlayerIds = new Set();
+
+    // Process users first
+    for (const user of users) {
+      const result = {
+        type: 'user',
+        id: user.id,
+        email: user.email,
+        minecraftUsername: user.minecraftUsername,
+        admin: user.admin || false,
+        tierTester: user.tierTester || false,
+        banned: user.banned || false,
+        userId: user.id,
+        playerId: null,
+        playerData: null
+      };
+
+      // Check if this user has a linked player
+      if (user.minecraftUsername) {
+        const linkedPlayer = players.find(p => 
+          p.username?.toLowerCase() === user.minecraftUsername.toLowerCase()
+        );
+        if (linkedPlayer) {
+          result.playerId = linkedPlayer.id;
+          result.playerData = linkedPlayer;
+          processedPlayerIds.add(linkedPlayer.id);
+        }
+      }
+
+      combinedResults.push(result);
+    }
+
+    // Add players that aren't linked to any user
+    for (const player of players) {
+      if (!processedPlayerIds.has(player.id)) {
+        combinedResults.push({
+          type: 'player',
+          id: player.id,
+          email: null,
+          minecraftUsername: player.username,
+          admin: false,
+          tierTester: false,
+          banned: false,
+          userId: null,
+          playerId: player.id,
+          playerData: player
+        });
+      }
+    }
+
+    if (combinedResults.length === 0) {
+      resultsDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No users or players found matching your search</p></div>';
+      return;
+    }
+
+    // Render results
+    resultsDiv.innerHTML = `
+      <div class="table-responsive">
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 2px solid var(--border-color);">
+              <th style="padding: 1rem; text-align: left;">Email</th>
+              <th style="padding: 1rem; text-align: left;">UIDs</th>
+              <th style="padding: 1rem; text-align: left;">Minecraft Username</th>
+              <th style="padding: 1rem; text-align: left;">Status</th>
+              <th style="padding: 1rem; text-align: left;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${combinedResults.map(result => {
+              const hasPlayer = result.playerId !== null;
+              const hasUser = result.userId !== null;
+              const canSetRating = hasPlayer;
+              const canMakeTester = hasUser;
+              const canMakeAdmin = hasUser;
+
+              return `
+              <tr style="border-bottom: 1px solid var(--border-color);">
+                <td style="padding: 1rem;">${escapeHtml(result.email || 'N/A')}</td>
+                <td style="padding: 1rem; font-size: 0.85em;">
+                  ${result.userId ? `<div><strong>User:</strong> <code style="font-size: 0.9em;">${escapeHtml(result.userId)}</code></div>` : ''}
+                  ${result.playerId ? `<div><strong>Player:</strong> <code style="font-size: 0.9em;">${escapeHtml(result.playerId)}</code></div>` : ''}
+                  ${!result.userId && !result.playerId ? 'N/A' : ''}
+                </td>
+                <td style="padding: 1rem;">
+                  ${escapeHtml(result.minecraftUsername || 'Not linked')}
+                  ${result.playerData?.blacklisted ? '<span class="badge badge-danger ml-2">Blacklisted</span>' : ''}
+                </td>
+                <td style="padding: 1rem;">
+                  ${result.admin ? '<span class="badge badge-primary">Admin</span>' : ''}
+                  ${result.tierTester ? '<span class="badge badge-success">Tester</span>' : ''}
+                  ${result.banned ? '<span class="badge badge-danger">Banned</span>' : ''}
+                  ${!result.admin && !result.tierTester && !result.banned ? '<span class="badge badge-secondary">User</span>' : ''}
+                </td>
+                <td style="padding: 1rem;">
+                  <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                    <button class="btn btn-sm btn-primary"
+                            onclick="handleManageResult('${result.type}', '${result.id}', '${escapeHtml(result.email || result.minecraftUsername || 'Unknown')}', '${escapeHtml(result.minecraftUsername || '')}', '${result.userId || ''}', '${result.playerId || ''}')">
+                      <i class="fas fa-cog"></i> Manage
+                    </button>
+                    ${canSetRating ? `
+                      <button class="btn btn-sm btn-info"
+                              onclick="openSetRatingModal('${result.playerId}', '${escapeHtml(result.minecraftUsername || 'Unknown')}')">
+                        <i class="fas fa-star"></i> Set Rating
+                      </button>
+                    ` : ''}
+                    ${result.minecraftUsername ? `
+                      <button class="btn btn-sm btn-warning"
+                              onclick="handleResetCooldown('${escapeHtml(result.minecraftUsername)}')">
+                        <i class="fas fa-clock"></i> Reset Cooldown
+                      </button>
+                    ` : ''}
+                    ${canMakeTester ? `
+                      <button class="btn btn-sm ${result.tierTester ? 'btn-danger' : 'btn-success'}"
+                              onclick="handleToggleTester('${result.userId}', ${!result.tierTester})">
+                        ${result.tierTester ? '<i class="fas fa-times"></i> Remove Tester' : '<i class="fas fa-check"></i> Make Tester'}
+                      </button>
+                    ` : ''}
+                    ${canMakeAdmin ? `
+                      <button class="btn btn-sm ${result.admin ? 'btn-warning' : 'btn-primary'}"
+                              onclick="handleToggleAdmin('${result.userId}', ${!result.admin})">
+                        ${result.admin ? '<i class="fas fa-times"></i> Remove Admin' : '<i class="fas fa-crown"></i> Make Admin'}
+                      </button>
+                    ` : ''}
+                  </div>
+                </td>
+              </tr>
+            `;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="d-flex justify-content-between align-items-center mt-3">
+        <button class="btn btn-secondary btn-sm" type="button" ${adminUiState.unifiedSearch.page <= 1 ? 'disabled' : ''} onclick="changeUnifiedSearchPage(-1)">Previous</button>
+        <span class="text-muted">Page ${adminUiState.unifiedSearch.page} / ${adminUiState.unifiedSearch.totalPages}</span>
+        <button class="btn btn-secondary btn-sm" type="button" ${adminUiState.unifiedSearch.page >= adminUiState.unifiedSearch.totalPages ? 'disabled' : ''} onclick="changeUnifiedSearchPage(1)">Next</button>
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error in unified search:', error);
+    resultsDiv.innerHTML = `<div class="alert alert-error">Error searching: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function changeUnifiedSearchPage(delta) {
+  const next = adminUiState.unifiedSearch.page + delta;
+  if (next < 1 || next > (adminUiState.unifiedSearch.totalPages || 1)) return;
+  adminUiState.unifiedSearch.page = next;
+  await handleUnifiedSearch({ preventDefault: () => {} });
+}
+
+/**
+ * Handle manage result button click
+ */
+function handleManageResult(type, id, name, username, userId, playerId) {
+  if (type === 'player') {
+    openManagementScreen('player', id, name, username, userId || '', playerId || id);
+  } else {
+    openManagementScreen('user', id, name, username, userId, playerId || '');
+  }
+}
+
+/**
+ * Handle toggle tester with refresh
+ */
+async function handleToggleTester(userId, status) {
+  try {
+    await toggleTierTester(userId, status);
+    // Refresh search results after a short delay to ensure backend has updated
+    setTimeout(async () => {
+      const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+      if (searchTerm) {
+        const event = { preventDefault: () => {} };
+        await handleUnifiedSearch(event);
+      }
+    }, 500);
+  } catch (error) {
+    console.error('Error toggling tester:', error);
+  }
+}
+
+/**
+ * Handle toggle admin with refresh
+ */
+async function handleToggleAdmin(userId, status) {
+  try {
+    await toggleAdmin(userId, status);
+    // Refresh search results after a short delay to ensure backend has updated
+    setTimeout(async () => {
+      const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+      if (searchTerm) {
+        const event = { preventDefault: () => {} };
+        await handleUnifiedSearch(event);
+      }
+    }, 500);
+  } catch (error) {
+    console.error('Error toggling admin:', error);
+  }
+}
+
+
+/**
+ * Load banned accounts (shows search instruction)
+ */
+async function loadBannedAccounts() {
+  const listDiv = document.getElementById('bannedAccountsList');
+  listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">Use the search above to find banned accounts</p></div>';
+}
+
+/**
+ * Handle search reported accounts
+ */
+async function handleSearchReported(event) {
+  event.preventDefault();
+
+  const searchTerm = document.getElementById('reportedSearch').value.trim();
+  const listDiv = document.getElementById('reportedAccountsList');
+
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.searchReportedAccounts(searchTerm);
+
+    if (!response || !response.reportedAccounts) {
+      throw new Error('Invalid response from server');
+    }
+
+    const reportedAccounts = response.reportedAccounts || [];
+
+    if (reportedAccounts.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No reported alt groups found matching your search</p></div>';
+      return;
+    }
+
+    displayReportedAccounts(reportedAccounts);
+  } catch (error) {
+    console.error('Error searching reported accounts:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error searching reported accounts: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Load reported accounts (shows all)
+ */
+async function loadReportedAccounts() {
+  const listDiv = document.getElementById('reportedAccountsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.getReportedAccounts();
+
+    if (!response || !response.reportedAccounts) {
+      throw new Error('Invalid response from server');
+    }
+
+    const reportedAccounts = response.reportedAccounts || [];
+
+    if (reportedAccounts.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No reported alt groups</p></div>';
+      return;
+    }
+
+    displayReportedAccounts(reportedAccounts);
+  } catch (error) {
+    console.error('Error loading reported accounts:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading reported accounts: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Display reported accounts
+ */
+function displayReportedAccounts(reportedAccounts) {
+  const listDiv = document.getElementById('reportedAccountsList');
+
+  if (!reportedAccounts || reportedAccounts.length === 0) {
+    listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No reported alt groups</p></div>';
+    return;
+  }
+
+  listDiv.innerHTML = reportedAccounts.map(account => {
+    const suspiciousAccounts = account.suspiciousAccounts || [];
+    const groupId = account.groupId || '';
+    const accountCount = groupId.split('_').length;
+
+    return `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <h4>Alt Group: ${accountCount} Accounts</h4>
+              <div class="mb-2">
+                <span class="badge badge-warning">Flagged ${account.flagCount || 1} times</span>
+                <span class="badge badge-info">${account.type || 'Unknown'}</span>
+              </div>
+              <p><strong>Primary Account:</strong> ${escapeHtml(account.primaryAccount || 'Unknown')}</p>
+              <p><strong>Detection Reason:</strong> ${escapeHtml(account.detectionReason || 'N/A')}</p>
+              ${account.lastDetectionReason && account.lastDetectionReason !== account.detectionReason ? `<p><strong>Last Reason:</strong> ${escapeHtml(account.lastDetectionReason)}</p>` : ''}
+              <p><strong>Related Accounts:</strong></p>
+              <ul class="mb-2">
+                ${suspiciousAccounts.length > 0 ? suspiciousAccounts.map(acc => `
+                  <li>${escapeHtml(acc.email || acc.uid || 'Unknown')} ${acc.minecraftUsername ? `(${escapeHtml(acc.minecraftUsername)})` : ''} - ${acc.confidence || 'N/A'} confidence</li>
+                `).join('') : '<li>No accounts listed</li>'}
+              </ul>
+              <p class="text-muted">First reported: ${account.reportedAt ? new Date(account.reportedAt).toLocaleString() : 'Unknown'}</p>
+              <p class="text-muted">Last flagged: ${account.lastFlaggedAt || account.reportedAt ? new Date(account.lastFlaggedAt || account.reportedAt).toLocaleString() : 'Unknown'}</p>
+              <p class="text-muted">Last IP: ${account.lastClientIP || account.clientIP || 'Unknown'}</p>
+            </div>
+            <div class="col-md-4">
+              <div class="d-flex flex-column gap-2">
+                <button class="btn btn-warning btn-sm" onclick="moveToJudgmentDay('${account.id}')">
+                  <i class="fas fa-gavel"></i> To Judgment Day
+                </button>
+                <button class="btn btn-info btn-sm" onclick="resistAltReport('${account.id}', '${account.detectionReason || 'unknown'}')">
+                  <i class="fas fa-shield-alt"></i> Resist Report
+                </button>
+                <button class="btn btn-danger btn-sm" onclick="removeAltReport('${account.id}')">
+                  <i class="fas fa-trash"></i> Remove Report
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+/**
+ * Move report to judgment day
+ */
+async function moveToJudgmentDay(reportId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Move to Judgment Day?',
+    text: 'This will add the account to the judgment day list for mass banning.',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Move',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.moveToJudgmentDay(reportId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Moved to Judgment Day',
+        text: 'Report has been removed from the reported list',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadReportedAccounts();
+      if (currentTab === 'judgment') {
+        loadJudgmentDayAccounts();
+      }
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Remove alt report
+ */
+async function removeAltReport(reportId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove Report?',
+    text: 'This will remove the alt report from the system.',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Remove',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.removeAltReport(reportId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Report Removed',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadReportedAccounts();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Resist alt report (whitelist specific detection type)
+ */
+async function resistAltReport(reportId, detectionReason) {
+  // Determine detection type from reason
+  let detectionType = 'unknown';
+  if (detectionReason.toLowerCase().includes('vpn')) {
+    detectionType = 'vpn';
+  } else if (detectionReason.toLowerCase().includes('ip') || detectionReason.toLowerCase().includes('subnet')) {
+    detectionType = 'ip';
+  } else if (detectionReason.toLowerCase().includes('username')) {
+    detectionType = 'username';
+  } else if (detectionReason.toLowerCase().includes('email')) {
+    detectionType = 'email';
+  }
+
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Resist Report?',
+    text: `This will whitelist the user for ${detectionType} detection. They won't be flagged for this type again.`,
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Resist',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      // Get all reports to find this one
+      const allReports = await apiService.getReportedAccounts();
+      const report = allReports.find(r => r.id === reportId);
+      if (!report) throw new Error('Report not found');
+
+      // Primary account is the identifier
+      const primaryAccount = report.primaryAccount || report.email;
+      if (!primaryAccount) throw new Error('Could not determine user from report');
+
+      // Add to whitelist for this detection type
+      await apiService.addToAltWhitelist(primaryAccount, detectionType);
+      
+      // Remove the report after whitelisting
+      await apiService.removeAltReport(reportId);
+      
+      Swal.fire({
+        icon: 'success',
+        title: 'Report Resisted',
+        text: `User whitelisted for ${detectionType} detection`,
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadReportedAccounts();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Switch between alt reports and security logs tabs
+ */
+function switchReportsTab(tab) {
+  const altTab = document.getElementById('reportsTabAlt');
+  const securityTab = document.getElementById('reportsTabSecurity');
+  const noshowTab = document.getElementById('reportsTabNoShow');
+  const userTab = document.getElementById('reportsTabUser');
+  const messagesTab = document.getElementById('reportsTabMessages');
+  
+  const altSection = document.getElementById('altReportsSection');
+  const securitySection = document.getElementById('securityLogsSection');
+  const noshowSection = document.getElementById('noshowReportsSection');
+  const userSection = document.getElementById('userReportsSection');
+  const messageSection = document.getElementById('messageReportsSection');
+  
+  // Reset all tabs
+  [altTab, securityTab, noshowTab, userTab, messagesTab].forEach(btn => {
+    if (btn) {
+      btn.classList.remove('btn-primary');
+      btn.classList.add('btn-secondary');
+    }
+  });
+  
+  [altSection, securitySection, noshowSection, userSection, messageSection].forEach(section => {
+    if (section) section.classList.add('d-none');
+  });
+  
+  // Activate selected tab
+  if (tab === 'alt') {
+    if (altTab) {
+      altTab.classList.remove('btn-secondary');
+      altTab.classList.add('btn-primary');
+    }
+    if (altSection) altSection.classList.remove('d-none');
+  } else if (tab === 'security') {
+    if (securityTab) {
+      securityTab.classList.remove('btn-secondary');
+      securityTab.classList.add('btn-primary');
+    }
+    if (securitySection) {
+      securitySection.classList.remove('d-none');
+      loadSecurityLogs();
+      loadSecurityWhitelist();
+    }
+  } else if (tab === 'noshow') {
+    if (noshowTab) {
+      noshowTab.classList.remove('btn-secondary');
+      noshowTab.classList.add('btn-primary');
+    }
+    if (noshowSection) {
+      noshowSection.classList.remove('d-none');
+      loadNoshowReports();
+    }
+  } else if (tab === 'user') {
+    if (userTab) {
+      userTab.classList.remove('btn-secondary');
+      userTab.classList.add('btn-primary');
+    }
+    if (userSection) {
+      userSection.classList.remove('d-none');
+      loadUserReports();
+    }
+  } else if (tab === 'messages') {
+    if (messagesTab) {
+      messagesTab.classList.remove('btn-secondary');
+      messagesTab.classList.add('btn-primary');
+    }
+    if (messageSection) {
+      messageSection.classList.remove('d-none');
+      loadMessageReports();
+    }
+  }
+}
+
+function switchModerationTab(tab) {
+  const testerTab = document.getElementById('modTabTester');
+  const blacklistTab = document.getElementById('modTabBlacklist');
+  
+  const testerSection = document.getElementById('testerModSection');
+  const blacklistSection = document.getElementById('blacklistModSection');
+  
+  // Reset all tabs
+  [testerTab, blacklistTab].forEach(btn => {
+    if (btn) {
+      btn.classList.remove('btn-primary');
+      btn.classList.add('btn-secondary');
+    }
+  });
+  
+  [testerSection, blacklistSection].forEach(section => {
+    if (section) section.classList.add('d-none');
+  });
+  
+  // Activate selected tab
+  if (tab === 'tester') {
+    if (testerTab) {
+      testerTab.classList.remove('btn-secondary');
+      testerTab.classList.add('btn-primary');
+    }
+    if (testerSection) {
+      testerSection.classList.remove('d-none');
+      loadTierTesterApplications();
+    }
+  } else if (tab === 'blacklist') {
+    if (blacklistTab) {
+      blacklistTab.classList.remove('btn-secondary');
+      blacklistTab.classList.add('btn-primary');
+    }
+    if (blacklistSection) {
+      blacklistSection.classList.remove('d-none');
+    }
+  }
+}
+
+/**
+ * Old switchReportsTab function kept for backwards compatibility - now handles all 4 tabs (replaced above)
+
+/**
+ * Load security logs
+ */
+async function loadSecurityLogs() {
+  const listDiv = document.getElementById('securityLogsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const severity = document.getElementById('securitySeverityFilter')?.value || null;
+    const type = document.getElementById('securityTypeFilter')?.value || null;
+    const userId = document.getElementById('securityUserIdFilter')?.value?.trim() || null;
+    
+    const response = await apiService.getSecurityLogs(100, severity, type, userId);
+
+    if (!response || !response.logs) {
+      throw new Error('Invalid response from server');
+    }
+
+    const logs = response.logs || [];
+
+    if (logs.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No security logs found</p></div>';
+      return;
+    }
+
+    displaySecurityLogs(logs);
+  } catch (error) {
+    console.error('Error loading security logs:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading security logs: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Display security logs
+ */
+function displaySecurityLogs(logs) {
+  const listDiv = document.getElementById('securityLogsList');
+
+  if (logs.length === 0) {
+    listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No security logs found</p></div>';
+    return;
+  }
+
+  listDiv.innerHTML = logs.map(log => {
+    const severityColor = log.severity === 'high' ? 'danger' : log.severity === 'medium' ? 'warning' : 'info';
+    const typeLabel = log.type ? log.type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : 'Unknown';
+    
+    return `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <div class="mb-2">
+                <span class="badge badge-${severityColor}">${log.severity || 'unknown'}</span>
+                <span class="badge badge-info">${typeLabel}</span>
+              </div>
+              ${log.userId ? `<p><strong>User ID:</strong> <code>${escapeHtml(log.userId)}</code></p>` : ''}
+              ${log.gamemode ? `<p><strong>Gamemode:</strong> ${escapeHtml(log.gamemode)}</p>` : ''}
+              ${log.matchId ? `<p><strong>Match ID:</strong> <code>${escapeHtml(log.matchId)}</code></p>` : ''}
+              ${log.username ? `<p><strong>Username:</strong> ${escapeHtml(log.username)}</p>` : ''}
+              ${log.patterns && log.patterns.length > 0 ? `
+                <p><strong>Detected Patterns:</strong></p>
+                <ul class="mb-2">
+                  ${log.patterns.map(pattern => `
+                    <li>${escapeHtml(pattern.description || pattern.type || 'Unknown pattern')} (${pattern.severity || 'unknown'})</li>
+                  `).join('')}
+                </ul>
+              ` : ''}
+              ${log.anomalies && log.anomalies.length > 0 ? `
+                <p><strong>Anomalies:</strong></p>
+                <ul class="mb-2">
+                  ${log.anomalies.map(anomaly => `
+                    <li>${escapeHtml(anomaly.description || anomaly.type || 'Unknown anomaly')} (${anomaly.severity || 'unknown'})</li>
+                  `).join('')}
+                </ul>
+              ` : ''}
+              ${log.action ? `<p><strong>Action:</strong> ${escapeHtml(log.action)}</p>` : ''}
+              ${log.message ? `<p><strong>Message:</strong> ${escapeHtml(log.message)}</p>` : ''}
+              <p class="text-muted">Detected: ${new Date(log.detectedAt).toLocaleString()}</p>
+            </div>
+            <div class="col-md-4 text-end">
+              <div class="d-flex flex-column gap-2">
+                <button class="btn btn-danger btn-sm" onclick="removeSecurityLog('${log.id}')">
+                  <i class="fas fa-trash"></i> Remove Log
+                </button>
+                <small class="text-muted">
+                  <i class="fas fa-clock"></i> ${new Date(log.detectedAt).toLocaleString()}
+                </small>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+/**
+ * Remove security log
+ */
+async function removeSecurityLog(logId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove Security Log?',
+    text: 'This will remove the security log entry from the system.',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Remove',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.removeSecurityLog(logId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Log Removed',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadSecurityLogs();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Load judgment day accounts
+ */
+async function loadJudgmentDayAccounts() {
+  const listDiv = document.getElementById('judgmentDayList');
+  const actionsDiv = document.getElementById('judgmentDayActions');
+
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.getJudgmentDayAccounts();
+
+    if (!response || !response.judgmentDayAccounts) {
+      throw new Error('Invalid response from server');
+    }
+
+    const judgmentDayAccounts = response.judgmentDayAccounts || [];
+
+    if (judgmentDayAccounts.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No accounts in judgment day</p></div>';
+      actionsDiv.style.display = 'none';
+      return;
+    }
+
+    actionsDiv.style.display = 'block';
+
+    listDiv.innerHTML = `
+      <div class="alert alert-danger mb-4">
+        <strong>${judgmentDayAccounts.length}</strong> alt group(s) awaiting final judgment
+        <br><small>⚠️ These reports have been removed from the reported list and will be permanently executed</small>
+      </div>
+      ${judgmentDayAccounts.map(account => `
+        <div class="card mb-3">
+          <div class="card-body">
+            <div class="row">
+              <div class="col-md-8">
+                <h5>Alt Group: ${account.groupId.split('_').length} Accounts</h5>
+                <div class="mb-2">
+                  <span class="badge badge-danger">Flagged ${account.flagCount || 1} times</span>
+                  <span class="badge badge-info">${account.type}</span>
+                </div>
+                <p><strong>Primary Account:</strong> ${escapeHtml(account.primaryAccount || 'Unknown')}</p>
+                <p><strong>All Accounts in Group:</strong></p>
+                <ul class="mb-2">
+                  <li><strong>${escapeHtml(account.primaryAccount || 'Unknown')}</strong> (Primary)</li>
+                  ${account.suspiciousAccounts.map(acc => `
+                    <li>${escapeHtml(acc.email || acc.uid)} ${acc.minecraftUsername ? `(${escapeHtml(acc.minecraftUsername)})` : ''}</li>
+                  `).join('')}
+                </ul>
+                <p><strong>Latest Detection:</strong> ${escapeHtml(account.lastDetectionReason || account.detectionReason)}</p>
+                <p class="text-muted">First reported: ${new Date(account.reportedAt).toLocaleString()}</p>
+                <p class="text-muted">Last flagged: ${new Date(account.lastFlaggedAt || account.reportedAt).toLocaleString()}</p>
+              </div>
+              <div class="col-md-4">
+                <div class="alert alert-danger">
+                  <strong>Judgment Action:</strong><br>
+                  All ${account.groupId.split('_').length} accounts will be banned<br>
+                  All Minecraft usernames will be blacklisted
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `).join('')}
+    `;
+  } catch (error) {
+    console.error('Error loading judgment day accounts:', error);
+    const errorMessage = error.message || 'Unknown error occurred';
+    if (errorMessage.includes('403') || errorMessage.includes('permission') || errorMessage.includes('admin')) {
+      listDiv.innerHTML = `<div class="alert alert-error">Access denied: Admin privileges required to view judgment day accounts.</div>`;
+    } else {
+      listDiv.innerHTML = `<div class="alert alert-error">Error loading judgment day accounts: ${escapeHtml(errorMessage)}</div>`;
+    }
+    actionsDiv.style.display = 'none';
+  }
+}
+
+/**
+ * Execute judgment day
+ */
+async function executeJudgmentDay() {
+    const result = await Swal.fire({
+      icon: 'warning',
+      title: 'Execute FINAL Judgment?',
+      html: 'This will <strong>permanently ban ALL accounts</strong> in these alt groups and <strong>blacklist ALL Minecraft usernames</strong>.<br><br>These reports have already been <strong>removed from the reported list</strong>.<br><br>This action <strong>CANNOT BE UNDONE</strong> and will permanently execute these accounts.',
+      showCancelButton: true,
+      confirmButtonText: 'Execute FINAL Judgment',
+      cancelButtonText: 'Cancel',
+      confirmButtonColor: '#dc3545'
+    });
+
+  if (result.isConfirmed) {
+    try {
+      const response = await apiService.executeJudgmentDay();
+
+      Swal.fire({
+        icon: 'success',
+        title: 'Judgment Executed!',
+        html: `
+          <div style="text-align: left;">
+            <p><strong>Results:</strong></p>
+            <ul style="text-align: left;">
+              <li>${response.stats.bannedCount} accounts banned</li>
+              <li>${response.stats.blacklistedCount} usernames blacklisted</li>
+              <li>${response.stats.processedCount} alt groups processed</li>
+            </ul>
+            <p><strong>Executed Groups:</strong></p>
+            <ul style="text-align: left; max-height: 200px; overflow-y: auto;">
+              ${response.results.map(result => `
+                <li><strong>${result.groupId}:</strong> ${result.accountsProcessed || 0} accounts (${result.flagCount || 1} flags)</li>
+              `).join('')}
+            </ul>
+          </div>
+        `,
+        confirmButtonText: 'OK'
+      });
+
+      // Refresh all relevant tabs (judgment day entries are removed after execution)
+      loadJudgmentDayAccounts();
+      if (currentTab === 'reported') {
+        loadReportedAccounts();
+      }
+      if (currentTab === 'banned') {
+        // Refresh banned search if it was loaded
+        const bannedForm = document.getElementById('searchBannedForm');
+        if (bannedForm) {
+          bannedForm.dispatchEvent(new Event('submit'));
+        }
+      }
+
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Judgment Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Handle add to whitelist
+ */
+async function handleAddToWhitelist(event) {
+  event.preventDefault();
+
+  const identifier = document.getElementById('whitelistIdentifier').value.trim();
+
+  try {
+    await apiService.addToAltWhitelist(identifier);
+    Swal.fire({
+      icon: 'success',
+      title: 'Added to Whitelist',
+      text: 'Account added to alt detection whitelist',
+      timer: 1500,
+      showConfirmButton: false
+    });
+    document.getElementById('whitelistForm').reset();
+    loadWhitelist();
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Load whitelist
+ */
+async function loadWhitelist() {
+  const listDiv = document.getElementById('whitelistList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.getAltWhitelist();
+
+    if (!response || !response.whitelistedAccounts) {
+      throw new Error('Invalid response from server');
+    }
+
+    const whitelistedAccounts = response.whitelistedAccounts || [];
+
+    if (whitelistedAccounts.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No whitelisted accounts</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = whitelistedAccounts.map(account => `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row align-items-center">
+            <div class="col-md-8">
+              <h5>${escapeHtml(account.email || 'Unknown')}</h5>
+              <p class="text-muted">Firebase UID: ${account.firebaseUid}</p>
+              <p class="text-muted">Whitelisted: ${new Date(account.whitelistedAt).toLocaleString()}</p>
+            </div>
+            <div class="col-md-4">
+              <button class="btn btn-danger btn-sm" onclick="handleRemoveFromWhitelist('${account.firebaseUid}')">
+                <i class="fas fa-trash"></i> Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error loading whitelist:', error);
+    const errorMessage = error.message || 'Unknown error occurred';
+    if (errorMessage.includes('403') || errorMessage.includes('permission') || errorMessage.includes('admin')) {
+      listDiv.innerHTML = `<div class="alert alert-error">Access denied: Admin privileges required to manage whitelist.</div>`;
+    } else {
+      listDiv.innerHTML = `<div class="alert alert-error">Error loading whitelist: ${escapeHtml(errorMessage)}</div>`;
+    }
+  }
+}
+
+/**
+ * Remove from whitelist
+ */
+async function removeFromWhitelist(firebaseUid) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove from Whitelist?',
+    text: 'This account will be subject to alt detection again.',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Remove',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.removeFromAltWhitelist(firebaseUid);
+      Swal.fire({
+        icon: 'success',
+        title: 'Removed from Whitelist',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadWhitelist();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Handle remove from whitelist (wrapper for onclick handlers)
+ */
+async function handleRemoveFromWhitelist(firebaseUid) {
+  await removeFromWhitelist(firebaseUid);
+}
+
+/**
+ * Load gamemode options for manual rating updates
+ */
+async function loadGamemodeOptions(retryCount = 0) {
+  try {
+    const gamemodeSelect = document.getElementById('gamemode');
+    gamemodeSelect.innerHTML = '<option value="">Loading gamemodes...</option>';
+
+    // Ensure CONFIG is available
+    if (!CONFIG || !CONFIG.GAMEMODES) {
+      if (retryCount < 10) { // Retry up to 10 times
+        console.log(`CONFIG not available, retrying in 200ms... (attempt ${retryCount + 1}/10)`);
+        setTimeout(() => loadGamemodeOptions(retryCount + 1), 200);
+        return;
+      } else {
+        gamemodeSelect.innerHTML = '<option value="">Error loading gamemodes</option>';
+        console.error('Failed to load CONFIG after 10 retries');
+        return;
+      }
+    }
+
+    gamemodeSelect.innerHTML = '<option value="">Select Gamemode...</option>';
+
+    // Add all individual gamemodes (exclude 'overall' since it's calculated)
+    CONFIG.GAMEMODES.forEach(gamemode => {
+      if (gamemode.id !== 'overall') { // Skip overall since ratings are per-gamemode
+        const option = document.createElement('option');
+        option.value = gamemode.id;
+        option.textContent = gamemode.name;
+        gamemodeSelect.appendChild(option);
+      }
+    });
+
+    console.log(`Loaded ${CONFIG.GAMEMODES.length - 1} gamemode options`);
+  } catch (error) {
+    console.error('Error loading gamemode options:', error);
+    const gamemodeSelect = document.getElementById('gamemode');
+    gamemodeSelect.innerHTML = '<option value="">Error loading gamemodes</option>';
+  }
+}
+
+/**
+ * Handle manual rating update form submission
+ */
+document.getElementById('manualRatingForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const player1Username = document.getElementById('player1Username').value.trim();
+  const player1Score = parseInt(document.getElementById('player1Score').value);
+  const player2Username = document.getElementById('player2Username').value.trim();
+  const player2Score = parseInt(document.getElementById('player2Score').value);
+  const gamemode = document.getElementById('gamemode').value;
+
+  if (!player1Username || !player2Username || isNaN(player1Score) || isNaN(player2Score) || !gamemode) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Validation Error',
+      text: 'Please fill in all fields correctly.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+    return;
+  }
+
+  if (player1Score < 0 || player2Score < 0) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Validation Error',
+      text: 'Scores cannot be negative.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+    return;
+  }
+
+  try {
+    const response = await apiService.post('/admin/manual-rating-update', {
+      player1Username,
+      player2Username,
+      player1Score,
+      player2Score,
+      gamemode
+    });
+
+    if (response.success) {
+      // Display results
+      const resultDiv = document.getElementById('ratingUpdateResult');
+      const contentDiv = document.getElementById('ratingUpdateContent');
+
+      contentDiv.innerHTML = `
+        <div class="alert alert-success">
+          <h5>Ratings Updated Successfully!</h5>
+          <p><strong>Gamemode:</strong> ${CONFIG.GAMEMODES.find(g => g.id === gamemode)?.name || gamemode}</p>
+          <p><strong>Score:</strong> ${player1Score} - ${player2Score}</p>
+          <div class="row mt-3">
+            <div class="col-md-6">
+              <div class="card">
+                <div class="card-body">
+                  <h6>${response.results.player1.username}</h6>
+                  <p class="mb-1">Old Rating: ${response.results.player1.oldRating}</p>
+                  <p class="mb-1">New Rating: ${response.results.player1.newRating}</p>
+                  <p class="mb-0"><strong>Change: ${response.results.player1.ratingChange > 0 ? '+' : ''}${response.results.player1.ratingChange}</strong></p>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="card">
+                <div class="card-body">
+                  <h6>${response.results.player2.username}</h6>
+                  <p class="mb-1">Old Rating: ${response.results.player2.oldRating}</p>
+                  <p class="mb-1">New Rating: ${response.results.player2.newRating}</p>
+                  <p class="mb-0"><strong>Change: ${response.results.player2.ratingChange > 0 ? '+' : ''}${response.results.player2.ratingChange}</strong></p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      resultDiv.style.display = 'block';
+
+      // Clear form
+      document.getElementById('manualRatingForm').reset();
+
+      Swal.fire({
+        icon: 'success',
+        title: 'Success!',
+        text: 'Player ratings updated successfully!',
+        timer: 2000,
+        showConfirmButton: false
+      });
+    } else {
+      Swal.fire({
+        icon: 'error',
+        title: 'Error',
+        text: response.message || 'Failed to update ratings.',
+        timer: 3000,
+        showConfirmButton: false
+      });
+    }
+  } catch (error) {
+    console.error('Error updating ratings:', error);
+    Swal.fire({
+      icon: 'error',
+      title: 'Error',
+      text: 'Error updating ratings. Please try again.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+  }
+});
+
+/**
+ * Load system status for testing tab
+ */
+async function loadSystemStatus() {
+  try {
+    const statusDiv = document.getElementById('systemStatus');
+
+    // Get system stats
+    const response = await apiService.get('/admin/stats');
+
+    if (response.success && response.stats) {
+      const stats = response.stats;
+
+      statusDiv.innerHTML = `
+        <div class="row">
+          <div class="col-md-6">
+            <div class="card">
+              <div class="card-body">
+                <h6>Active Matches</h6>
+                <p class="mb-2">${stats.activeMatches || 0}/${stats.matchCapacity || 100}</p>
+                <div class="progress">
+                  <div class="progress-bar" style="width: ${stats.matchUtilizationPercent || 0}%"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="card">
+              <div class="card-body">
+                <h6>Players in Queue</h6>
+                <p class="mb-2">${stats.queuedPlayers || 0}</p>
+                <h6>Total Players</h6>
+                <p class="mb-0">${stats.totalPlayers || 0}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      statusDiv.innerHTML = '<div class="alert alert-warning">Unable to load system statistics</div>';
+    }
+  } catch (error) {
+    console.error('Error loading system status:', error);
+    document.getElementById('systemStatus').innerHTML = '<div class="alert alert-danger">Error loading system status. Please try refreshing the page.</div>';
+  }
+}
+
+/**
+ * Test rank-up animation
+ */
+async function testRankUpAnimation() {
+  const titleSelect = document.getElementById('testTitleSelect');
+  const selectedTitle = titleSelect.value;
+
+  if (!selectedTitle) {
+    Swal.fire({
+      icon: 'warning',
+      title: 'Selection Required',
+      text: 'Please select a title to test.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+    return;
+  }
+
+  // Ensure CONFIG is available
+  if (!CONFIG || !CONFIG.COMBAT_TITLES) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Configuration Error',
+      text: 'Configuration not loaded. Please refresh the page.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+    return;
+  }
+
+  // Find the title data from CONFIG
+  const titleData = CONFIG.COMBAT_TITLES.find(t => t.title === selectedTitle);
+
+  if (!titleData) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Configuration Error',
+      text: 'Title not found in configuration.',
+      timer: 3000,
+      showConfirmButton: false
+    });
+    return;
+  }
+
+  // Create a mock rank-up event
+  const mockTitleChange = {
+    oldTitle: { title: 'Previous Title', icon: 'assets/badgeicons/rookie.svg' },
+    newTitle: titleData
+  };
+
+  // Show the rank-up animation (reuse the logic from testing.js)
+  showRankUpAnimation(mockTitleChange);
+
+  Swal.fire({
+    icon: 'info',
+    title: 'Testing Animation',
+    text: `Testing rank-up animation for: ${selectedTitle}`,
+    timer: 2000,
+    showConfirmButton: false
+  });
+}
+
+// Make functions globally available
+window.testRankUpAnimation = testRankUpAnimation;
+
+/**
+ * Warn a player
+ */
+async function warnPlayer() {
+  // Defensive check to ensure apiService is available
+  if (typeof apiService === 'undefined' || !apiService.warnUser) {
+    alert('API service not available. Please refresh the page.');
+    return;
+  }
+
+  const userId = document.getElementById('warnUserId').value.trim();
+  const reason = document.getElementById('warnReason').value.trim();
+
+  if (!userId || !reason) {
+    alert('Please fill in all fields');
+    return;
+  }
+
+  try {
+    const result = await apiService.warnUser(userId, reason);
+
+    if (result.success) {
+      alert('Warning issued successfully');
+      document.getElementById('warnUserId').value = '';
+      document.getElementById('warnReason').value = '';
+    } else {
+      alert('Failed to issue warning: ' + (result.message || 'Unknown error'));
+    }
+  } catch (error) {
+    console.error('Error issuing warning:', error);
+    alert('Error issuing warning: ' + error.message);
+  }
+}
+
+/**
+ * Load audit log with filters
+ */
+async function loadAuditLog(loadMore = false) {
+  try {
+    const action = document.getElementById('auditActionFilter').value;
+    const adminUid = document.getElementById('auditAdminFilter').value.trim();
+    const targetUserId = document.getElementById('auditTargetFilter').value.trim();
+    const startDate = document.getElementById('auditStartDate').value;
+    const endDate = document.getElementById('auditEndDate').value;
+
+    const params = new URLSearchParams();
+    if (action) params.append('action', action);
+    if (adminUid) params.append('adminUid', adminUid);
+    if (targetUserId) params.append('targetUserId', targetUserId);
+    if (startDate) params.append('startDate', startDate);
+    if (endDate) params.append('endDate', endDate);
+
+    if (loadMore && window.auditLogOffset) {
+      params.append('offset', window.auditLogOffset);
+    }
+
+    const response = await apiService.get(`/admin/audit-log?${params}`);
+
+    if (response.success) {
+      displayAuditLog(response.logs, loadMore);
+      window.auditLogOffset = (window.auditLogOffset || 0) + response.logs.length;
+
+      const loadMoreBtn = document.getElementById('auditLoadMore');
+      loadMoreBtn.style.display = response.hasMore ? 'block' : 'none';
+    } else {
+      throw new Error(response.message || 'Failed to load audit log');
+    }
+  } catch (error) {
+    console.error('Error loading audit log:', error);
+    document.getElementById('auditLogResults').innerHTML = `
+      <div class="alert alert-danger">
+        <i class="fas fa-exclamation-triangle"></i> Error loading audit log: ${error.message}
+      </div>
+    `;
+  }
+}
+
+/**
+ * Display audit log entries
+ */
+function displayAuditLog(logs, append = false) {
+  const container = document.getElementById('auditLogResults');
+
+  if (!append) {
+    container.innerHTML = '';
+    window.auditLogOffset = 0;
+  }
+
+  if (logs.length === 0) {
+    if (!append) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <p class="text-muted">No audit log entries found</p>
+        </div>
+      `;
+    }
+    return;
+  }
+
+  const logHtml = logs.map(log => {
+    const timestamp = new Date(log.timestamp).toLocaleString();
+    const actionIcon = getActionIcon(log.action);
+    const actionColor = getActionColor(log.action);
+
+    return `
+      <div class="audit-log-entry card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <div class="d-flex align-items-center mb-2">
+                <span class="badge ${actionColor} me-2">${actionIcon} ${log.action.replace('_', ' ')}</span>
+                <small class="text-muted">${timestamp}</small>
+              </div>
+              <div class="mb-1">
+                <strong>Admin:</strong> <code>${log.adminUid}</code>
+              </div>
+              ${log.targetUserId ? `<div class="mb-1"><strong>Target:</strong> <code>${log.targetUserId}</code></div>` : ''}
+              <div class="mb-1">
+                <strong>IP:</strong> <code>${log.ipAddress}</code>
+              </div>
+              ${log.details && Object.keys(log.details).length > 0 ? `
+                <div class="mt-2">
+                  <strong>Details:</strong>
+                  <pre class="bg-light p-2 rounded small mt-1">${JSON.stringify(log.details, null, 2)}</pre>
+                </div>
+              ` : ''}
+            </div>
+            <div class="col-md-4 text-end">
+              <small class="text-muted">
+                <i class="fas fa-clock"></i> ${new Date(log.timestamp).toLocaleString()}
+              </small>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  if (append) {
+    container.innerHTML += logHtml;
+  } else {
+    container.innerHTML = logHtml;
+  }
+}
+
+/**
+ * Get icon for action type
+ */
+function getActionIcon(action) {
+  const icons = {
+    'BAN_USER': 'fas fa-ban',
+    'UNBAN_USER': 'fas fa-check-circle',
+    'WARN_USER': 'fas fa-exclamation-triangle',
+    'UPDATE_RATING': 'fas fa-chart-line',
+    'UPDATE_ROLES': 'fas fa-user-shield',
+    'SET_ADMIN_STATUS': 'fas fa-crown',
+    'SET_TESTER_STATUS': 'fas fa-vial'
+  };
+  return icons[action] || 'fas fa-cog';
+}
+
+/**
+ * Get color class for action type
+ */
+function getActionColor(action) {
+  const colors = {
+    'BAN_USER': 'bg-danger',
+    'UNBAN_USER': 'bg-success',
+    'WARN_USER': 'bg-warning text-dark',
+    'UPDATE_RATING': 'bg-info',
+    'UPDATE_ROLES': 'bg-primary',
+    'SET_ADMIN_STATUS': 'bg-dark',
+    'SET_TESTER_STATUS': 'bg-secondary'
+  };
+  return colors[action] || 'bg-secondary';
+}
+
+/**
+ * Load more audit log entries
+ */
+function loadMoreAuditLog() {
+  loadAuditLog(true);
+}
+
+/**
+ * Clear audit log filters
+ */
+function clearAuditFilters() {
+  document.getElementById('auditActionFilter').value = '';
+  document.getElementById('auditAdminFilter').value = '';
+  document.getElementById('auditTargetFilter').value = '';
+  document.getElementById('auditStartDate').value = '';
+  document.getElementById('auditEndDate').value = '';
+
+  document.getElementById('auditLogResults').innerHTML = `
+    <div class="empty-state">
+      <p class="text-muted">Filters cleared. Use the filters above to load audit log entries</p>
+    </div>
+  `;
+
+  const loadMoreBtn = document.getElementById('auditLoadMore');
+  loadMoreBtn.style.display = 'none';
+}
+
+/**
+ * Load and display matches for admin management
+ */
+async function loadMatches() {
+  const listDiv = document.getElementById('matchesList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const status = document.getElementById('matchStatusFilter')?.value || null;
+    const gamemode = document.getElementById('matchGamemodeFilter')?.value || null;
+    const search = document.getElementById('matchSearchInput')?.value?.trim() || null;
+    
+    const response = await apiService.getAdminMatches(status, gamemode, search, 100);
+
+    if (!response || !response.matches) {
+      throw new Error('Invalid response from server');
+    }
+
+    const matches = response.matches || [];
+
+    if (matches.length === 0) {
+      listDiv.innerHTML = '<div class="alert alert-info">No matches found matching your filters</div>';
+      return;
+    }
+
+    displayMatches(matches);
+  } catch (error) {
+    console.error('Error loading matches:', error);
+    listDiv.innerHTML = `<div class="alert alert-danger">Error loading matches: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Display matches in admin interface
+ */
+function displayMatches(matches) {
+  const listDiv = document.getElementById('matchesList');
+
+  if (matches.length === 0) {
+    listDiv.innerHTML = '<div class="alert alert-info">No matches found</div>';
+    return;
+  }
+
+  listDiv.innerHTML = matches.map(match => {
+    const isFinalized = match.finalized;
+    const isActive = match.status === 'active';
+    const createdTime = new Date(match.createdAt).toLocaleString();
+    const finalizedTime = match.finalizedAt ? new Date(match.finalizedAt).toLocaleString() : '-';
+    const ratingChange = match.finalizationData?.ratingChanges?.playerRatingChange;
+    const ratingChangeDisplay = ratingChange !== undefined ? (ratingChange >= 0 ? `+${ratingChange}` : ratingChange) : '-';
+
+    return `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <div class="mb-2">
+                <span class="badge badge-primary">${match.gamemode.toUpperCase()}</span>
+                <span class="badge ${match.finalized ? 'badge-success' : isActive ? 'badge-warning' : 'badge-secondary'}">${match.status.toUpperCase()}</span>
+                ${isFinalized ? `<span class="badge badge-info">Finalized</span>` : ''}
+              </div>
+              <p><strong>Player:</strong> ${escapeHtml(match.playerUsername)} (${escapeHtml(match.playerId?.substring(0, 8))})</p>
+              <p><strong>Tester:</strong> ${escapeHtml(match.testerUsername)} (${escapeHtml(match.testerId?.substring(0, 8))})</p>
+              
+              ${match.finalizationData ? `
+                <p><strong>Score:</strong> ${match.finalizationData.playerScore} - ${match.finalizationData.testerScore}</p>
+                <p><strong>Rating Change:</strong> <span class="badge ${ratingChange >= 0 ? 'badge-success' : 'badge-danger'}">${ratingChangeDisplay}</span></p>
+              ` : '<p><strong>Score:</strong> Not finalized</p>'}
+              
+              <p class="text-muted small">Created: ${createdTime}</p>
+              ${isFinalized ? `<p class="text-muted small">Finalized: ${finalizedTime}</p>` : ''}
+            </div>
+            <div class="col-md-4 text-end">
+              <div class="d-flex flex-column gap-2">
+                ${!isFinalized && !isActive ? `
+                  <button class="btn btn-info btn-sm" onclick="openFinalizeDialog('${match.id}', '${escapeHtml(match.playerUsername)}', '${escapeHtml(match.testerUsername)}')">
+                    <i class="fas fa-check"></i> Finalize
+                  </button>
+                ` : ''}
+                ${isFinalized && match.finalizationData?.type !== 'draw_vote' ? `
+                  <button class="btn btn-warning btn-sm" onclick="revertAdminMatch('${match.id}', '${escapeHtml(match.playerUsername)}')">
+                    <i class="fas fa-undo"></i> Revert
+                  </button>
+                ` : ''}
+                <button class="btn btn-danger btn-sm" onclick="deleteAdminMatch('${match.id}', '${escapeHtml(match.playerUsername)}')">
+                  <i class="fas fa-trash"></i> Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+/**
+ * Open dialog to finalize a match
+ */
+function openFinalizeDialog(matchId, playerUsername, testerUsername) {
+  const { value: scores } = Swal.fire({
+    title: 'Finalize Match',
+    html: `
+      <p>Finalize match between ${playerUsername} and ${testerUsername}</p>
+      <div class="mb-3">
+        <label class="form-label">Player Score</label>
+        <input type="number" id="playerScore" class="form-control" min="0" value="1">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Tester Score</label>
+        <input type="number" id="testerScore" class="form-control" min="0" value="0">
+      </div>
+    `,
+    showCancelButton: true,
+    confirmButtonText: 'Finalize',
+    cancelButtonText: 'Cancel',
+    didOpen: () => {
+      document.getElementById('playerScore').focus();
+    }
+  }).then(async (result) => {
+    if (result.isConfirmed) {
+      const playerScore = parseInt(document.getElementById('playerScore').value);
+      const testerScore = parseInt(document.getElementById('testerScore').value);
+
+      if (isNaN(playerScore) || isNaN(testerScore) || playerScore < 0 || testerScore < 0) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Invalid Score',
+          text: 'Scores must be non-negative numbers'
+        });
+        return;
+      }
+
+      try {
+        await apiService.adminFinalizeMatch(matchId, playerScore, testerScore);
+        Swal.fire({
+          icon: 'success',
+          title: 'Match Finalized',
+          text: 'Match has been finalized successfully',
+          timer: 1500,
+          showConfirmButton: false
+        });
+        loadMatches();
+      } catch (error) {
+        Swal.fire({
+          icon: 'error',
+          title: 'Failed',
+          text: error.message
+        });
+      }
+    }
+  });
+}
+
+/**
+ * Revert rating changes for a finalized match
+ */
+async function revertAdminMatch(matchId, playerUsername) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Revert Match Ratings?',
+    html: `This will undo the rating changes from <strong>${escapeHtml(playerUsername)}</strong>'s match and mark it as reverted. This cannot be undone.`,
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Revert',
+    confirmButtonColor: '#f59e0b',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.revertAdminMatch(matchId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Reverted',
+        text: 'Rating changes have been reversed.',
+        timer: 1800,
+        showConfirmButton: false
+      });
+      loadMatches();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Delete an admin match
+ */
+async function deleteAdminMatch(matchId, playerUsername) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Delete Match?',
+    text: `This will delete the match for ${playerUsername}. This action cannot be undone.`,
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Delete',
+    confirmButtonColor: '#dc3545',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (result.isConfirmed) {
+    try {
+      await apiService.deleteAdminMatch(matchId);
+      Swal.fire({
+        icon: 'success',
+        title: 'Deleted',
+        text: 'Match has been deleted',
+        timer: 1500,
+        showConfirmButton: false
+      });
+      loadMatches();
+    } catch (error) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Failed',
+        text: error.message
+      });
+    }
+  }
+}
+
+// Make functions globally available
+if (typeof window !== 'undefined') {
+  window.warnPlayer = warnPlayer;
+  window.loadAuditLog = loadAuditLog;
+  window.loadMoreAuditLog = loadMoreAuditLog;
+  window.clearAuditFilters = clearAuditFilters;
+
+  // Core navigation / entrypoints used by admin.html onclick handlers
+  window.initAdmin = initAdmin;
+  window.switchTab = switchTab;
+  window.handleAddPlayer = handleAddPlayer;
+
+  // Common actions used in admin.html inline onclicks
+  window.approveApplication = approveApplication;
+  window.denyApplication = denyApplication;
+  window.removeFromBlacklist = removeFromBlacklist;
+  window.toggleTierTester = toggleTierTester;
+  // Backwards compat: older HTML/inline handlers used toggleTester()
+  window.toggleTester = toggleTierTester;
+  window.toggleAdmin = toggleAdmin;
+  window.loadUsers = loadUsers;
+  window.openPlayerManagementModal = openPlayerManagementModal; // Legacy compatibility
+  window.openManagementScreen = openManagementScreen;
+  window.closeManagementScreen = closeManagementScreen;
+  window.selectManagementAction = selectManagementAction;
+  window.resetManagementForm = resetManagementForm;
+  window.executeManagementAction = executeManagementAction;
+  window.loadBlacklist = loadBlacklist;
+  window.loadApplications = loadApplications;
+
+  // Search / misc handlers referenced by forms in admin.html
+  window.handleSearchBanned = handleSearchBanned;
+  window.handleSearchBlacklist = handleSearchBlacklist;
+  window.applyBlacklistFilters = applyBlacklistFilters;
+  window.changeBlacklistPage = changeBlacklistPage;
+  window.handleUnifiedSearch = handleUnifiedSearch;
+  window.changeUnifiedSearchPage = changeUnifiedSearchPage;
+  window.handleManageResult = handleManageResult;
+  window.handleToggleTester = handleToggleTester;
+  window.handleToggleAdmin = handleToggleAdmin;
+  window.handleAddBlacklist = handleAddBlacklist;
+  window.executeJudgmentDay = executeJudgmentDay;
+  window.handleAddToWhitelist = handleAddToWhitelist;
+  window.handleRemoveFromWhitelist = handleRemoveFromWhitelist;
+  window.switchReportsTab = switchReportsTab;
+  window.loadSecurityLogs = loadSecurityLogs;
+  window.saveTierTesterAppsOpenSetting = saveTierTesterAppsOpenSetting;
+  window.loadMatches = loadMatches;
+  window.deleteAdminMatch = deleteAdminMatch;
+  window.revertAdminMatch = revertAdminMatch;
+  window.openFinalizeDialog = openFinalizeDialog;
+}
+
+// NOTE: The global export block above must be closed before defining additional functions.
+
+/**
+ * Load tier tester applications
+ */
+async function loadTierTesterApplications() {
+  const listDiv = document.getElementById('tierTesterApplicationsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    // Load current applications-open setting into the toggle (if present)
+    try {
+      const toggle = document.getElementById('tierTesterAppsOpenToggle');
+      if (toggle) {
+        const setting = await apiService.adminGetTierTesterApplicationsOpen();
+        toggle.checked = setting && setting.open === true;
+      }
+    } catch (_) {
+      // ignore setting load failures
+    }
+
+    // Get filter and sort values
+    const statusFilter = document.getElementById('testerAppStatusFilter')?.value || 'pending';
+    const sortFilter = document.getElementById('testerAppSortFilter')?.value || 'newest';
+
+    // Build query parameters
+    const query = new URLSearchParams();
+    if (statusFilter !== 'all') {
+      query.append('status', statusFilter);
+    }
+    query.append('sort', sortFilter);
+
+    const response = await apiService.get(`/admin/tier-tester-applications?${query.toString()}`);
+
+    if (!response || !response.applications) {
+      throw new Error('Invalid response from server');
+    }
+
+    const applications = response.applications || [];
+
+    if (applications.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No tier tester applications found</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = applications.map(app => `
+      <div class="card mb-3 ${app.status === 'pending' ? 'border-warning' : app.status === 'approved' ? 'border-success' : app.status === 'denied' ? 'border-danger' : 'border-secondary'}">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-start mb-2">
+            <h5 class="card-title mb-1">${escapeHtml(app.name || 'Unknown')}</h5>
+            <span class="badge ${app.status === 'pending' ? 'bg-warning' : app.status === 'approved' ? 'bg-success' : app.status === 'denied' ? 'bg-danger' : app.status === 'blocked' ? 'bg-dark' : 'bg-secondary'}">${escapeHtml(app.status || 'unknown')}</span>
+          </div>
+
+          <div class="row mb-2">
+            <div class="col-md-6">
+              <small class="text-muted">Email:</small><br>
+              <span>${escapeHtml(app.userEmail || 'N/A')}</span>
+            </div>
+            <div class="col-md-6">
+              <small class="text-muted">Age:</small><br>
+              <span>${app.age || 'N/A'}</span>
+            </div>
+          </div>
+
+          <div class="row mb-2">
+            <div class="col-md-6">
+              <small class="text-muted">Experience:</small><br>
+              <span>${escapeHtml(app.minecraftExperience || 'N/A')}</span>
+            </div>
+            <div class="col-md-6">
+              <small class="text-muted">Favorite Gamemode:</small><br>
+              <span>${escapeHtml(app.favoriteGamemode || 'N/A')}</span>
+            </div>
+          </div>
+
+          <div class="row mb-3">
+            <div class="col-md-6">
+              <small class="text-muted">Availability:</small><br>
+              <span>${escapeHtml(app.availability || 'N/A')}</span>
+            </div>
+            <div class="col-md-6">
+              <small class="text-muted">Submitted:</small><br>
+              <span>${app.submittedAt ? new Date(app.submittedAt).toLocaleDateString() : 'N/A'}</span>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <small class="text-muted">Why they want to be a tester:</small>
+            <p class="mt-1 mb-2">${escapeHtml(app.whyTester || 'N/A')}</p>
+          </div>
+
+          ${app.previousTesting ? `
+            <div class="mb-3">
+              <small class="text-muted">Previous testing experience:</small>
+              <p class="mt-1 mb-2">${escapeHtml(app.previousTesting)}</p>
+            </div>
+          ` : ''}
+
+          ${app.improvementIdeas ? `
+            <div class="mb-3">
+              <small class="text-muted">Improvement ideas:</small>
+              <p class="mt-1 mb-2">${escapeHtml(app.improvementIdeas)}</p>
+            </div>
+          ` : ''}
+
+          ${app.reviewNotes ? `
+            <div class="mb-3">
+              <small class="text-muted">Review notes:</small>
+              <p class="mt-1 mb-2 fst-italic">${escapeHtml(app.reviewNotes)}</p>
+            </div>
+          ` : ''}
+
+          ${app.status === 'pending' ? `
+            <div class="d-flex gap-2 mt-3">
+              <button class="btn btn-success btn-sm" onclick="approveTierTesterApplication('${app.id}')">
+                <i class="fas fa-check"></i> Approve
+              </button>
+              <button class="btn btn-danger btn-sm" onclick="denyTierTesterApplication('${app.id}')">
+                <i class="fas fa-times"></i> Deny
+              </button>
+              <button class="btn btn-dark btn-sm" onclick="blockTierTesterApplication('${app.id}')">
+                <i class="fas fa-ban"></i> Block
+              </button>
+            </div>
+          ` : ''}
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error loading tier tester applications:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading applications: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function saveTierTesterAppsOpenSetting() {
+  try {
+    const toggle = document.getElementById('tierTesterAppsOpenToggle');
+    const btn = document.getElementById('saveTierTesterAppsOpenBtn');
+    if (!toggle) return;
+
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+    }
+
+    await apiService.adminSetTierTesterApplicationsOpen(toggle.checked === true);
+    Swal.fire({ icon: 'success', title: 'Saved', timer: 1500, showConfirmButton: false });
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Save failed', text: error.message || 'Please try again.' });
+  } finally {
+    const btn = document.getElementById('saveTierTesterAppsOpenBtn');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-save"></i> Save';
+    }
+  }
+}
+
+/**
+ * Approve tier tester application
+ */
+async function approveTierTesterApplication(applicationId) {
+  const { value: reviewNotes } = await Swal.fire({
+    title: 'Approve Application',
+    input: 'textarea',
+    inputLabel: 'Review notes (optional)',
+    inputPlaceholder: 'Add any notes about this approval...',
+    showCancelButton: true,
+    confirmButtonText: 'Approve',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (reviewNotes === undefined) return; // Cancelled
+
+  try {
+    await apiService.post(`/admin/tier-tester-applications/${applicationId}/approve`, {
+      reviewNotes: reviewNotes.trim()
+    });
+
+    Swal.fire({
+      icon: 'success',
+      title: 'Approved!',
+      text: 'Tier Tester application has been approved.',
+      timer: 2000,
+      showConfirmButton: false
+    });
+
+    // Bust player cache so new tester badge shows correctly
+    if (typeof apiService.clearCache === 'function') {
+      apiService.clearCache('/players');
+    }
+
+    loadTierTesterApplications(); // Reload the list
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Approve',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Deny tier tester application
+ */
+async function denyTierTesterApplication(applicationId) {
+  const { value: reviewNotes } = await Swal.fire({
+    title: 'Deny Application',
+    input: 'textarea',
+    inputLabel: 'Review notes (required)',
+    inputPlaceholder: 'Please provide a reason for denying this application...',
+    inputValidator: (value) => {
+      if (!value || !value.trim()) {
+        return 'Review notes are required when denying an application!';
+      }
+    },
+    showCancelButton: true,
+    confirmButtonText: 'Deny',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (reviewNotes === undefined) return; // Cancelled
+
+  try {
+    await apiService.post(`/admin/tier-tester-applications/${applicationId}/deny`, {
+      reviewNotes: reviewNotes.trim()
+    });
+
+    Swal.fire({
+      icon: 'success',
+      title: 'Denied',
+      text: 'Tier Tester application has been denied.',
+      timer: 2000,
+      showConfirmButton: false
+    });
+
+    loadTierTesterApplications(); // Reload the list
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Deny',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Block user from future tier tester applications
+ */
+async function blockTierTesterApplication(applicationId) {
+  const { value: reviewNotes } = await Swal.fire({
+    title: 'Block User from Future Applications',
+    input: 'textarea',
+    inputLabel: 'Blocking reason (required)',
+    inputPlaceholder: 'Please provide a detailed reason for blocking this user...',
+    inputValidator: (value) => {
+      if (!value || !value.trim()) {
+        return 'Blocking reason is required!';
+      }
+    },
+    showCancelButton: true,
+    confirmButtonText: 'Block User',
+    confirmButtonColor: '#dc3545',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (reviewNotes === undefined) return; // Cancelled
+
+  const { value: confirmed } = await Swal.fire({
+    title: 'Confirm Blocking',
+    text: 'This will prevent the user from submitting any future Tier Tester applications. Are you sure?',
+    icon: 'warning',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Block User',
+    confirmButtonColor: '#dc3545',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!confirmed) return;
+
+  try {
+    await apiService.post(`/admin/tier-tester-applications/${applicationId}/block`, {
+      reviewNotes: reviewNotes.trim()
+    });
+
+    Swal.fire({
+      icon: 'success',
+      title: 'User Blocked',
+      text: 'User has been blocked from future Tier Tester applications.',
+      timer: 2000,
+      showConfirmButton: false
+    });
+
+    loadTierTesterApplications(); // Reload the list
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Block',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Handle reset cooldown for a player
+ */
+async function handleResetCooldown(username) {
+  if (!username) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Error',
+      text: 'No username provided'
+    });
+    return;
+  }
+
+  // Ask which gamemode or all
+  const result = await Swal.fire({
+    title: 'Reset Cooldown',
+    html: `
+      <p>Reset testing cooldown for <strong>${escapeHtml(username)}</strong>?</p>
+      <div class="form-group" style="margin-top: 1rem;">
+        <label class="form-label">Gamemode</label>
+        <select id="cooldownGamemode" class="form-select">
+          <option value="">All Gamemodes</option>
+          <option value="vanilla">Vanilla</option>
+          <option value="uhc">UHC</option>
+          <option value="pot">Pot</option>
+          <option value="nethop">NethOP</option>
+          <option value="smp">SMP</option>
+          <option value="sword">Sword</option>
+          <option value="axe">Axe</option>
+          <option value="mace">Mace</option>
+        </select>
+      </div>
+    `,
+    showCancelButton: true,
+    confirmButtonText: 'Reset Cooldown',
+    cancelButtonText: 'Cancel',
+    preConfirm: () => {
+      return document.getElementById('cooldownGamemode').value || null;
+    }
+  });
+
+  if (!result.isConfirmed) return;
+
+  const gamemode = result.value;
+
+  try {
+    const response = await apiService.resetCooldown(username, gamemode);
+    
+    Swal.fire({
+      icon: 'success',
+      title: 'Cooldown Reset',
+      text: response.message || `Cooldown reset for ${username}`,
+      timer: 2000,
+      showConfirmButton: false
+    });
+
+    // Refresh search results
+    setTimeout(async () => {
+      const searchTerm = document.getElementById('unifiedSearch')?.value.trim();
+      if (searchTerm) {
+        const event = { preventDefault: () => {} };
+        await handleUnifiedSearch(event);
+      }
+    }, 500);
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Reset Cooldown',
+      text: error.message || 'An error occurred'
+    });
+  }
+}
+
+/**
+ * Load whitelisted servers
+ */
+async function loadWhitelistedServers() {
+  const serversList = document.getElementById('whitelistedServersList');
+  if (!serversList) return;
+
+  try {
+    serversList.innerHTML = '<div class="spinner"></div>';
+
+    const response = await apiService.getWhitelistedServers();
+
+    if (!response.success || !response.servers || response.servers.length === 0) {
+      serversList.innerHTML = `
+        <div class="empty-state">
+          <i class="fas fa-server" style="font-size: 3rem; color: var(--text-muted); margin-bottom: 1rem;"></i>
+          <p class="text-muted">No whitelisted servers found. Add one above to get started.</p>
+        </div>
+      `;
+      return;
+    }
+
+    serversList.innerHTML = `
+      <div class="table-responsive">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Server Name</th>
+              <th>IP/Domain</th>
+              <th>Added</th>
+              <th style="width: 100px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${response.servers.map(server => `
+              <tr>
+                <td><strong>${escapeHtml(server.name)}</strong></td>
+                <td><code>${escapeHtml(server.ip)}</code></td>
+                <td>${server.addedAt ? new Date(server.addedAt).toLocaleDateString() : 'N/A'}</td>
+                <td>
+                  <button class="btn btn-danger btn-sm" onclick="handleDeleteServer('${server.id}', '${escapeHtml(server.name)}')">
+                    <i class="fas fa-trash"></i>
+                  </button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error loading whitelisted servers:', error);
+    serversList.innerHTML = `
+      <div class="alert alert-danger">
+        <i class="fas fa-exclamation-triangle"></i>
+        Error loading servers: ${escapeHtml(error.message)}
+      </div>
+    `;
+  }
+}
+
+/**
+ * Handle add server form submission
+ */
+async function handleAddServer(event) {
+  event.preventDefault();
+
+  const nameInput = document.getElementById('serverName');
+  const ipInput = document.getElementById('serverIp');
+
+  const name = nameInput.value.trim();
+  const ip = ipInput.value.trim();
+
+  if (!name || !ip) {
+    Swal.fire({
+      icon: 'warning',
+      title: 'Missing Information',
+      text: 'Please provide both server name and IP/domain.'
+    });
+    return;
+  }
+
+  try {
+    const response = await apiService.addWhitelistedServer(name, ip);
+
+    if (response.success) {
+      Swal.fire({
+        icon: 'success',
+        title: 'Server Added',
+        text: `${name} has been added to the whitelist.`,
+        timer: 2000,
+        showConfirmButton: false
+      });
+
+      // Clear form
+      nameInput.value = '';
+      ipInput.value = '';
+
+      // Reload list
+      loadWhitelistedServers();
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Add Server',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Handle delete server
+ */
+async function handleDeleteServer(serverId, serverName) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Delete Server?',
+    text: `Are you sure you want to remove "${serverName}" from the whitelist?`,
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Delete',
+    confirmButtonColor: '#e74c3c',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!result.isConfirmed) return;
+
+  try {
+    const response = await apiService.deleteWhitelistedServer(serverId);
+
+    if (response.success) {
+      Swal.fire({
+        icon: 'success',
+        title: 'Server Deleted',
+        text: `${serverName} has been removed from the whitelist.`,
+        timer: 2000,
+        showConfirmButton: false
+      });
+
+      // Reload list
+      loadWhitelistedServers();
+    }
+  } catch (error) {
+    Swal.fire({
+      icon: 'error',
+      title: 'Failed to Delete Server',
+      text: error.message
+    });
+  }
+}
+
+/**
+ * Load No Show Reports
+ */
+async function loadNoshowReports() {
+  const listDiv = document.getElementById('noshowReportsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const playerFilter = document.getElementById('noshowPlayerFilter')?.value?.trim() || '';
+    const statusFilter = document.getElementById('noshowStatusFilter')?.value || '';
+    
+    const response = await apiService.getNoshowReports(playerFilter, statusFilter);
+    
+    if (!response || !response.reports) {
+      listDiv.innerHTML = '<div class="alert alert-info">No No-Show reports found</div>';
+      return;
+    }
+
+    const reports = response.reports || [];
+    if (reports.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No No-Show reports</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = reports.map(report => `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <h5>${escapeHtml(report.playerName || report.playerId)}</h5>
+              <p class="text-muted"><small>Report ID: ${report.id}</small></p>
+              <p><strong>Status:</strong> <span class="badge badge-${report.status === 'pending' ? 'warning' : report.status === 'resolved' ? 'success' : 'secondary'}">${report.status}</span></p>
+              <p><strong>Times No-Show:</strong> ${report.noShowCount || 0}</p>
+              <p class="text-muted">Reported: ${new Date(report.createdAt || Date.now()).toLocaleString()}</p>
+            </div>
+            <div class="col-md-4">
+              <div class="d-flex flex-column gap-2">
+                <button class="btn btn-warning btn-sm" onclick="resolveNoshowReport('${report.id}')">
+                  <i class="fas fa-check"></i> Resolve
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error loading no-show reports:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading reports: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Load User Reports
+ */
+async function loadUserReports() {
+  const listDiv = document.getElementById('userReportsList');
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const playerFilter = document.getElementById('userReportsPlayerFilter')?.value?.trim() || '';
+    const categoryFilter = document.getElementById('userReportsCategoryFilter')?.value || '';
+    const statusFilter = document.getElementById('userReportsStatusFilter')?.value || '';
+    
+    const response = await apiService.getUserReports(playerFilter, categoryFilter, statusFilter);
+    
+    if (!response || !response.reports) {
+      listDiv.innerHTML = '<div class="alert alert-info">No user reports found</div>';
+      return;
+    }
+
+    const reports = response.reports || [];
+    if (reports.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No user reports</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = reports.map(report => `
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-8">
+              <h5>Report against ${escapeHtml(report.reportedPlayer || 'Unknown')}</h5>
+              <p class="text-muted"><small>By: ${escapeHtml(report.reporterEmail || 'Anonymous')}</small></p>
+              <p><strong>Category:</strong> <span class="badge badge-info">${report.category || 'Other'}</span></p>
+              <p><strong>Status:</strong> <span class="badge badge-${report.status === 'pending' ? 'warning' : report.status === 'resolved' ? 'success' : 'secondary'}">${report.status || 'pending'}</span></p>
+              <p><strong>Description:</strong> ${escapeHtml((report.description || '').substring(0, 100))}...</p>
+              <p class="text-muted">Submitted: ${new Date(report.createdAt || Date.now()).toLocaleString()}</p>
+            </div>
+            <div class="col-md-4">
+              <div class="d-flex flex-column gap-2">
+                <button class="btn btn-info btn-sm" onclick="viewUserReport('${report.id}')">
+                  <i class="fas fa-eye"></i> View Details
+                </button>
+                <button class="btn btn-success btn-sm" onclick="markUserReportResolved('${report.id}')">
+                  <i class="fas fa-check"></i> Mark Resolved
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `).join('');
+  } catch (error) {
+    console.error('Error loading user reports:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading reports: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Add account to security whitelist
+ */
+async function addToWhitelist() {
+  const input = document.getElementById('whitelistUserInput');
+  const userId = input.value.trim();
+
+  if (!userId) {
+    Swal.fire('Error', 'Please enter a user ID or email', 'warning');
+    return;
+  }
+
+  try {
+    const response = await apiService.whitelistSecurityReports(userId);
+
+    if (response.success) {
+      Swal.fire({
+        icon: 'success',
+        title: 'Added to Whitelist',
+        text: 'This account will not receive automated security reports.',
+        timer: 2000,
+        showConfirmButton: false
+      });
+
+      input.value = '';
+      loadSecurityWhitelist();
+    }
+  } catch (error) {
+    Swal.fire('Error', error.message || 'Failed to whitelist account', 'error');
+  }
+}
+
+/**
+ * Load security whitelist
+ */
+async function loadSecurityWhitelist() {
+  const listDiv = document.getElementById('securityWhitelistList');
+  if (!listDiv) return;
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.getSecurityWhitelist();
+    const whitelisted = response.whitelisted || [];
+
+    if (whitelisted.length === 0) {
+      listDiv.innerHTML = '<p class="text-muted">No whitelisted accounts</p>';
+      return;
+    }
+
+    listDiv.innerHTML = `
+      <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.75rem;">
+        ${whitelisted.map(account => `
+          <div style="background: var(--bg-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.75rem; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${account.email || account.uid}">${escapeHtml(account.email || account.uid)}</span>
+            <button class="btn btn-sm" onclick="removeFromSecurityWhitelist('${account.id}')" style="background: #ef4444; color: white; border: none; padding: 0.25rem 0.5rem; border-radius: 4px; cursor: pointer;">×</button>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error loading whitelist:', error);
+    listDiv.innerHTML = '<p class="text-muted">Could not load whitelist</p>';
+  }
+}
+
+/**
+ * Load Message Reports
+ */
+async function loadMessageReports() {
+  const listDiv = document.getElementById('messageReportsList');
+  if (!listDiv) return;
+  listDiv.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const playerFilter = document.getElementById('messageReportsPlayerFilter')?.value?.trim() || '';
+    const statusFilter = document.getElementById('messageReportsStatusFilter')?.value || '';
+
+    const response = await apiService.getMessageReports(playerFilter, statusFilter);
+    const reports = response?.reports || [];
+
+    if (reports.length === 0) {
+      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No message reports</p></div>';
+      return;
+    }
+
+    listDiv.innerHTML = reports.map(report => {
+      const msg = report.messageReport?.reportedMessage || {};
+      const status = report.status || 'pending';
+      const statusBadge = status === 'pending' ? 'warning' : status === 'resolved' ? 'success' : 'secondary';
+      return `
+        <div class="card mb-3">
+          <div class="card-body">
+            <div class="row">
+              <div class="col-md-8">
+                <h5>Message report against ${escapeHtml(report.reportedPlayer || msg.username || 'Unknown')}</h5>
+                <p class="text-muted"><small>By: ${escapeHtml(report.reporterEmail || 'Anonymous')}</small></p>
+                <p><strong>Status:</strong> <span class="badge badge-${statusBadge}">${escapeHtml(status)}</span></p>
+                <p><strong>Message:</strong> ${escapeHtml((msg.text || '').slice(0, 180))}${(msg.text || '').length > 180 ? '...' : ''}</p>
+                <p><strong>Match:</strong> ${escapeHtml(report.matchId || 'N/A')}</p>
+                <p class="text-muted">Submitted: ${new Date(report.createdAt || Date.now()).toLocaleString()}</p>
+              </div>
+              <div class="col-md-4">
+                <div class="d-flex flex-column gap-2">
+                  <button class="btn btn-info btn-sm" onclick="viewUserReport('${report.id}')">
+                    <i class="fas fa-eye"></i> View Details
+                  </button>
+                  <button class="btn btn-success btn-sm" onclick="markUserReportResolved('${report.id}')">
+                    <i class="fas fa-check"></i> Mark Resolved
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (error) {
+    console.error('Error loading message reports:', error);
+    listDiv.innerHTML = `<div class="alert alert-error">Error loading reports: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Remove account from security whitelist
+ */
+async function removeFromSecurityWhitelist(accountId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Remove from Whitelist?',
+    text: 'This account will start receiving automated security reports again.',
+    showCancelButton: true,
+    confirmButtonText: 'Yes, Remove',
+    confirmButtonColor: '#ef4444',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!result.isConfirmed) return;
+
+  try {
+    const response = await apiService.removeSecurityWhitelist(accountId);
+
+    if (response.success) {
+      Swal.fire({
+        icon: 'success',
+        title: 'Removed from Whitelist',
+        timer: 1500,
+        showConfirmButton: false
+      });
+
+      loadSecurityWhitelist();
+    }
+  } catch (error) {
+    Swal.fire('Error', error.message || 'Failed to remove from whitelist', 'error');
+  }
+}
+
+/**
+ * Resolve no-show report
+ */
+async function resolveNoshowReport(reportId) {
+  const result = await Swal.fire({
+    icon: 'question',
+    title: 'Resolve No-Show Report?',
+    input: 'textarea',
+    inputLabel: 'Resolution notes (optional)',
+    inputPlaceholder: 'Enter resolution notes...',
+    showCancelButton: true,
+    confirmButtonText: 'Resolve',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!result.isConfirmed) return;
+
+  try {
+    const response = await apiService.resolveNoshowReport(reportId, result.value);
+
+    if (response.success) {
+      Swal.fire('Success', 'No-Show report resolved', 'success');
+      loadNoshowReports();
+    }
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  }
+}
+
+/**
+ * View user report details
+ */
+async function viewUserReport(reportId) {
+  try {
+    const response = await apiService.getUserReportDetails(reportId);
+    const report = response.report;
+    const evidenceLinks = Array.isArray(report.evidenceLinks) ? report.evidenceLinks : [];
+    const messageReport = report.messageReport || null;
+    const conversation = Array.isArray(messageReport?.conversationSnapshot) ? messageReport.conversationSnapshot : [];
+    const messageDetail = messageReport?.reportedMessage || null;
+
+    await Swal.fire({
+      title: `Report Details - ${escapeHtml(report.reportedPlayer)}`,
+      html: `
+        <div style="text-align: left;">
+          <p><strong>Category:</strong> ${escapeHtml(report.category)}</p>
+          <p><strong>Reported By:</strong> ${escapeHtml(report.reporterEmail || 'Anonymous')}</p>
+          <p><strong>Status:</strong> ${escapeHtml(report.status || 'pending')}</p>
+          ${report.reportedUUID ? `<p><strong>Reported UUID:</strong> ${escapeHtml(report.reportedUUID)}</p>` : ''}
+          ${report.matchId ? `<p><strong>Match ID:</strong> ${escapeHtml(report.matchId)}</p>` : ''}
+          ${report.hasEvidence ? '<p><strong>Evidence:</strong> Provided</p>' : '<p><strong>Evidence:</strong> None</p>'}
+          ${evidenceLinks.length > 0 ? `
+            <p><strong>Evidence Links:</strong></p>
+            <ul>
+              ${evidenceLinks.map(link => `<li><a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link)}</a></li>`).join('')}
+            </ul>
+          ` : ''}
+          ${messageDetail ? `
+            <p><strong>Reported Message:</strong></p>
+            <div style="background: var(--bg-color); padding: 0.75rem; border-radius: 8px; margin-bottom: 0.75rem;">
+              <p style="margin: 0 0 0.35rem 0;"><strong>${escapeHtml(messageDetail.username || 'Unknown')}:</strong> ${escapeHtml(messageDetail.text || '')}</p>
+              <small class="text-muted">${new Date(messageDetail.timestamp || Date.now()).toLocaleString()}</small>
+            </div>
+          ` : ''}
+          <p><strong>Description:</strong></p>
+          <p style="background: var(--bg-color); padding: 1rem; border-radius: 8px;">${escapeHtml(report.description)}</p>
+          ${conversation.length > 0 ? `
+            <p><strong>Conversation Snapshot (${conversation.length} messages):</strong></p>
+            <div style="max-height: 220px; overflow-y: auto; background: var(--bg-color); padding: 0.75rem; border-radius: 8px;">
+              ${conversation.map(msg => `
+                <div style="padding: 0.35rem 0; border-bottom: 1px solid var(--border-color);">
+                  <strong>${escapeHtml(msg.username || 'Unknown')}:</strong> ${escapeHtml(msg.text || '')}
+                  <div><small class="text-muted">${new Date(msg.timestamp || Date.now()).toLocaleString()}</small></div>
+                </div>
+              `).join('')}
+            </div>
+          ` : ''}
+          ${report.reviewNotes ? `<p><strong>Review Notes:</strong> ${escapeHtml(report.reviewNotes)}</p>` : ''}
+          ${report.actionTaken ? `<p><strong>Action Taken:</strong> ${escapeHtml(report.actionTaken)}</p>` : ''}
+          <p class="text-muted"><small>Submitted: ${new Date(report.createdAt).toLocaleString()}</small></p>
+        </div>
+      `,
+      showConfirmButton: true
+    });
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  }
+}
+
+/**
+ * Mark user report as resolved
+ */
+async function markUserReportResolved(reportId) {
+  const result = await Swal.fire({
+    icon: 'question',
+    title: 'Mark as Resolved?',
+    input: 'textarea',
+    inputLabel: 'Resolution notes',
+    inputPlaceholder: 'Enter resolution notes...',
+    showCancelButton: true,
+    confirmButtonText: 'Resolve',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!result.isConfirmed) return;
+
+  try {
+    const response = await apiService.resolveUserReport(reportId, result.value);
+
+    if (response.success) {
+      Swal.fire('Success', 'Report marked as resolved', 'success');
+      loadUserReports();
+    }
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  }
+}
+
+let currentSupportTicketId = null;
+
+function supportStatusBadge(status) {
+  const safe = escapeHtml(status || 'unknown');
+  if (status === 'open') return '<span class="badge badge-primary">Open</span>';
+  if (status === 'awaiting_admin') return '<span class="badge badge-warning">Awaiting Admin</span>';
+  if (status === 'awaiting_user') return '<span class="badge badge-info">Awaiting User</span>';
+  if (status === 'resolved') return '<span class="badge badge-success">Resolved</span>';
+  if (status === 'closed') return '<span class="badge badge-secondary">Closed</span>';
+  return `<span class="badge badge-secondary">${safe}</span>`;
+}
+
+async function loadSupportTickets() {
+  const listEl = document.getElementById('supportTicketsList');
+  if (!listEl) return;
+
+  listEl.innerHTML = '<div class="spinner"></div>';
+  const status = document.getElementById('supportStatusFilter')?.value || 'active';
+
+  try {
+    const response = await apiService.adminGetSupportTickets(status, 150);
+    const tickets = response.tickets || [];
+    if (tickets.length === 0) {
+      listEl.innerHTML = '<div class="empty-state"><p class="text-muted">No support tickets found.</p></div>';
+      const detail = document.getElementById('supportTicketDetail');
+      if (detail) detail.innerHTML = '<div class="empty-state"><p class="text-muted">Select a support ticket to view and reply.</p></div>';
+      currentSupportTicketId = null;
+      return;
+    }
+
+    listEl.innerHTML = tickets.map(ticket => `
+      <button class="btn btn-secondary" style="width: 100%; text-align: left; margin-bottom: 0.5rem;"
+              onclick="openSupportTicket('${ticket.id}')">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;">
+          <strong>#${escapeHtml(ticket.id)}</strong>
+          ${supportStatusBadge(ticket.status)}
+        </div>
+        <div style="font-size: 0.85rem; margin-top: 0.35rem;">${escapeHtml(ticket.subject || '(No subject)')}</div>
+        <div class="text-muted" style="font-size: 0.75rem; margin-top: 0.35rem;">
+          ${escapeHtml(ticket.minecraftUsername || ticket.email || ticket.userId || 'Unknown user')} •
+          ${new Date(ticket.updatedAt || ticket.createdAt).toLocaleString()}
+        </div>
+      </button>
+    `).join('');
+
+    if (!currentSupportTicketId && tickets[0]?.id) {
+      await openSupportTicket(tickets[0].id);
+    }
+  } catch (error) {
+    listEl.innerHTML = `<div class="alert alert-error">Failed to load tickets: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function openSupportTicket(ticketId) {
+  const detailEl = document.getElementById('supportTicketDetail');
+  if (!detailEl) return;
+
+  currentSupportTicketId = ticketId;
+  detailEl.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.adminGetSupportTicket(ticketId);
+    const ticket = response.ticket;
+    const messages = response.messages || [];
+
+    const isClosed = ticket.status === 'resolved' || ticket.status === 'closed';
+    detailEl.innerHTML = `
+      <div class="card">
+        <div class="card-body">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem;">
+            <h4 style="margin: 0;">#${escapeHtml(ticket.id)} - ${escapeHtml(ticket.subject || '(No subject)')}</h4>
+            ${supportStatusBadge(ticket.status)}
+          </div>
+          <div class="text-muted" style="font-size: 0.85rem; margin-bottom: 1rem;">
+            User: ${escapeHtml(ticket.minecraftUsername || ticket.email || ticket.userId)} •
+            Category: ${escapeHtml(ticket.category || 'other')}
+          </div>
+
+          <div style="max-height: 300px; overflow-y: auto; display: grid; gap: 0.5rem; margin-bottom: 1rem;">
+            ${messages.map(msg => `
+              <div style="padding: 0.75rem; border-radius: 8px; background: ${msg.senderType === 'admin' ? 'rgba(59,130,246,0.12)' : 'rgba(255,255,255,0.04)'};">
+                <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">
+                  ${msg.senderType === 'admin' ? 'Admin' : 'User'} • ${new Date(msg.createdAt).toLocaleString()}
+                </div>
+                <div style="white-space: pre-wrap;">${escapeHtml(msg.message || '')}</div>
+              </div>
+            `).join('')}
+          </div>
+
+          <form onsubmit="replySupportTicket(event)">
+            <div class="form-group">
+              <textarea id="supportReplyMessage" class="form-input" rows="3" maxlength="2000" placeholder="Reply to this ticket..." ${isClosed ? 'disabled' : ''}></textarea>
+            </div>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+              <button id="supportReplyBtn" class="btn btn-primary" type="submit" ${isClosed ? 'disabled' : ''}>
+                <i class="fas fa-reply"></i> Send Reply
+              </button>
+              <button class="btn btn-success" type="button" onclick="updateSupportTicketStatus('resolved')" ${isClosed ? 'disabled' : ''}>
+                <i class="fas fa-check"></i> Resolve
+              </button>
+              <button class="btn btn-secondary" type="button" onclick="updateSupportTicketStatus('closed')" ${isClosed ? 'disabled' : ''}>
+                <i class="fas fa-times"></i> Close
+              </button>
+              <button class="btn btn-warning" type="button" onclick="updateSupportTicketStatus('open')">
+                <i class="fas fa-redo"></i> Reopen
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  } catch (error) {
+    detailEl.innerHTML = `<div class="alert alert-error">Failed to load ticket: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function replySupportTicket(event) {
+  event.preventDefault();
+  if (!currentSupportTicketId) return;
+  const input = document.getElementById('supportReplyMessage');
+  const btn = document.getElementById('supportReplyBtn');
+  const message = (input?.value || '').trim();
+  if (!message) return;
+
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+    }
+    await apiService.adminReplySupportTicket(currentSupportTicketId, message);
+    await openSupportTicket(currentSupportTicketId);
+    await loadSupportTickets();
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-reply"></i> Send Reply';
+    }
+  }
+}
+
+async function updateSupportTicketStatus(status) {
+  if (!currentSupportTicketId) return;
+  try {
+    await apiService.adminUpdateSupportTicketStatus(currentSupportTicketId, status);
+    await openSupportTicket(currentSupportTicketId);
+    await loadSupportTickets();
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  }
+}
+
+// ─── Security Scores Tab ────────────────────────────────────────────────────
+
+const RISK_LEVEL_META = {
+  critical: { label: 'Critical', cls: 'security-risk-critical', icon: 'fas fa-skull-crossbones' },
+  high:     { label: 'High',     cls: 'security-risk-high',     icon: 'fas fa-exclamation-triangle' },
+  medium:   { label: 'Medium',   cls: 'security-risk-medium',   icon: 'fas fa-exclamation-circle' },
+  low:      { label: 'Low',      cls: 'security-risk-low',      icon: 'fas fa-info-circle' },
+  clean:    { label: 'Clean',    cls: 'security-risk-clean',    icon: 'fas fa-check-circle' }
+};
+
+function buildRiskBadge(riskLevel) {
+  const meta = RISK_LEVEL_META[riskLevel] || RISK_LEVEL_META.clean;
+  return `<span class="security-risk-badge ${meta.cls}"><i class="${meta.icon}"></i> ${meta.label}</span>`;
+}
+
+function buildScoreBar(score) {
+  const capped = Math.min(score, 200);
+  const pct = Math.round((capped / 200) * 100);
+  const color = score >= 100 ? '#ef4444' : score >= 70 ? '#f97316' : score >= 40 ? '#eab308' : score >= 20 ? '#3b82f6' : '#22c55e';
+  return `
+    <div class="security-score-bar-wrap" title="Score: ${score}">
+      <div class="security-score-bar-fill" style="width:${pct}%; background:${color};"></div>
+    </div>`;
+}
+
+async function loadSecurityScores() {
+  const list = document.getElementById('securityScoresList');
+  const topEl = document.getElementById('securityTopScore');
+  if (!list) return;
+
+  list.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const riskFilter = document.getElementById('securityRiskFilter')?.value || '';
+    const url = `/api/admin/security-scores?limit=100${riskFilter ? `&riskLevel=${encodeURIComponent(riskFilter)}` : ''}`;
+    const data = await apiService.get(url.replace('/api/', ''));
+
+    const scores = (data.scores || []).sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    if (scores.length === 0) {
+      list.innerHTML = '<div class="text-muted" style="padding:1.5rem;">No security score data available yet. Scores are computed after matches are finalized.</div>';
+      if (topEl) topEl.style.display = 'none';
+      return;
+    }
+
+    // Highlight top scorer
+    const topScore = scores[0];
+    if (topEl && topScore && topScore.score >= 20) {
+      const meta = RISK_LEVEL_META[topScore.riskLevel] || RISK_LEVEL_META.clean;
+      topEl.style.display = '';
+      topEl.innerHTML = `<div class="security-top-banner"><i class="${meta.icon}"></i> Highest Risk: <strong>${escapeHtml(topScore.username || topScore.userId)}</strong> — Score ${topScore.score} ${buildRiskBadge(topScore.riskLevel)}</div>`;
+    } else if (topEl) {
+      topEl.style.display = 'none';
+    }
+
+    list.innerHTML = `
+      <table class="admin-table" style="width:100%;">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Player</th>
+            <th>Score</th>
+            <th>Risk</th>
+            <th>Matches</th>
+            <th>Flags</th>
+            <th>Last Computed</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${scores.map((s, i) => {
+            const age = s.lastComputed ? new Date(s.lastComputed).toLocaleString() : 'Never';
+            const flagCount = (s.factors || []).length;
+            return `
+              <tr class="${s.riskLevel === 'critical' ? 'security-row-critical' : s.riskLevel === 'high' ? 'security-row-high' : ''}">
+                <td>${i + 1}</td>
+                <td>
+                  <strong>${escapeHtml(s.username || s.userId)}</strong>
+                  ${s.isTester ? '<span class="role-pill-badge role-pill-tester" style="margin-left:4px;">Tester</span>' : ''}
+                  ${s.isAdmin ? '<span class="role-pill-badge role-pill-admin" style="margin-left:4px;">Admin</span>' : ''}
+                </td>
+                <td>
+                  <span style="font-weight:700; font-size:1.1rem;">${s.score}</span>
+                  ${buildScoreBar(s.score)}
+                </td>
+                <td>${buildRiskBadge(s.riskLevel)}</td>
+                <td>${s.matchCount || 0}</td>
+                <td>${flagCount > 0 ? `<span style="color:#f97316; font-weight:700;">${flagCount}</span>` : '<span style="color:#22c55e;">0</span>'}</td>
+                <td style="font-size:0.8rem;">${age}</td>
+                <td>
+                  <button class="btn btn-sm btn-secondary" onclick="viewPlayerSecurityDetail('${escapeHtml(s.userId)}', '${escapeHtml(s.username || s.userId)}')">
+                    <i class="fas fa-eye"></i> Detail
+                  </button>
+                </td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>`;
+  } catch (err) {
+    console.error('Error loading security scores:', err);
+    list.innerHTML = `<div class="alert alert-danger"><i class="fas fa-exclamation-triangle"></i> ${err.message === 'Firestore not configured' ? 'Firestore is not enabled for this project. Please enable Cloud Firestore in the Firebase Console.' : 'Failed to load security scores: ' + escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function viewPlayerSecurityDetail(userId, username) {
+  try {
+    const data = await apiService.get(`admin/security-scores/${encodeURIComponent(userId)}`);
+
+    const factorRows = (data.factors || []).map(f => {
+      const sev = f.severity || 'medium';
+      const sevColor = sev === 'critical' ? '#ef4444' : sev === 'high' ? '#f97316' : sev === 'medium' ? '#eab308' : '#3b82f6';
+      return `<tr>
+        <td style="padding:0.4rem 0.75rem;">${escapeHtml(f.label)}</td>
+        <td style="padding:0.4rem 0.75rem; text-align:right;"><span style="color:${sevColor}; font-weight:700;">+${f.points}</span></td>
+      </tr>`;
+    }).join('');
+
+    Swal.fire({
+      title: `Security Detail – ${escapeHtml(username)}`,
+      html: `
+        <div style="text-align:left;">
+          <div style="display:flex; align-items:center; gap:1rem; margin-bottom:1rem;">
+            <span style="font-size:2rem; font-weight:800; color:${data.score >= 100 ? '#ef4444' : data.score >= 70 ? '#f97316' : '#eab308'};">${data.score}</span>
+            ${buildRiskBadge(data.riskLevel)}
+          </div>
+          ${factorRows.length > 0 ? `
+            <table style="width:100%; border-collapse:collapse;">
+              <thead>
+                <tr style="border-bottom:1px solid #333;">
+                  <th style="text-align:left; padding:0.35rem 0.75rem;">Factor</th>
+                  <th style="text-align:right; padding:0.35rem 0.75rem;">Points</th>
+                </tr>
+              </thead>
+              <tbody>${factorRows}</tbody>
+            </table>` : '<p style="color:#aaa;">No risk factors detected.</p>'}
+          <p style="margin-top:1rem; color:#aaa; font-size:0.8rem;">Last computed: ${data.lastComputed ? new Date(data.lastComputed).toLocaleString() : 'Unknown'} | ${data.matchCount || 0} matches analysed</p>
+        </div>`,
+      confirmButtonText: 'Close',
+      width: '600px'
+    });
+  } catch (err) {
+    Swal.fire('Error', 'Failed to load security detail: ' + err.message, 'error');
+  }
+}
+
+// Make functions globally available
+window.switchModerationTab = switchModerationTab;
+window.switchReportsTab = switchReportsTab;
+window.loadNoshowReports = loadNoshowReports;
+window.loadUserReports = loadUserReports;
+window.loadMessageReports = loadMessageReports;
+window.addToWhitelist = addToWhitelist;
+window.removeFromWhitelist = removeFromWhitelist;
+window.resolveNoshowReport = resolveNoshowReport;
+window.viewUserReport = viewUserReport;
+window.markUserReportResolved = markUserReportResolved;
+window.loadSecurityWhitelist = loadSecurityWhitelist;
+window.loadTierTesterApplications = loadTierTesterApplications;
+window.approveTierTesterApplication = approveTierTesterApplication;
+window.denyTierTesterApplication = denyTierTesterApplication;
+window.blockTierTesterApplication = blockTierTesterApplication;
+window.loadWhitelistedServers = loadWhitelistedServers;
+window.handleAddServer = handleAddServer;
+window.handleDeleteServer = handleDeleteServer;
+window.loadSupportTickets = loadSupportTickets;
+window.openSupportTicket = openSupportTicket;
+window.replySupportTicket = replySupportTicket;
+window.updateSupportTicketStatus = updateSupportTicketStatus;
+window.loadSecurityScores = loadSecurityScores;
+window.viewPlayerSecurityDetail = viewPlayerSecurityDetail;
+
+// Initialize on page load
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initAdmin);
+} else {
+  initAdmin();
+}

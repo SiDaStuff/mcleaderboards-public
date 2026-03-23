@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign Up - MC Leaderboards</title>
+    <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
+    
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="js/loading-overlay.js"></script>
+    
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container navbar-content">
+            <a href="index.html" class="navbar-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="navbar-logo"> MC Leaderboards
+                <span class="beta-badge">BETA</span>
+            </a>
+            <div class="navbar-search-wrapper">
+                <div class="navbar-search">
+                    <i class="fas fa-search navbar-search-icon"></i>
+                    <input type="text"
+                           class="navbar-search-input"
+                           id="searchInput"
+                           placeholder="Search player..."
+                           autocomplete="off">
+                </div>
+            </div>
+            <ul class="navbar-nav" id="navbarNav">
+                <li><a href="index.html">Leaderboards</a></li>
+                <li><a href="login.html">Sign in</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container" style="max-width: 500px; margin-top: 5rem;">
+        <!-- Welcome Message -->
+        <div style="text-align: center; margin-bottom: 2rem;">
+            <h1 style="font-size: 2rem; margin-bottom: 0.5rem;">Join MC Leaderboards</h1>
+            <p style="color: var(--text-muted); font-size: 1rem;">Create your account and start climbing the ranks</p>
+        </div>
+
+        <div class="card" style="border: 2px solid var(--accent-color); border-radius: 16px;">
+            <div class="card-header text-center" style="background: linear-gradient(135deg, var(--accent-color), var(--primary-color)); color: white; border-radius: 14px 14px 0 0; padding: 1.5rem;">
+                <h2 class="card-title" style="color: white; margin: 0;">
+                    <i class="fas fa-user-plus"></i> Create Account
+                </h2>
+            </div>
+            <div class="card-body">
+                <form id="signupForm" onsubmit="handleSignup(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="email" style="display: flex; align-items: center; gap: 0.5rem;">
+                            <i class="fas fa-envelope" style="color: var(--accent-color);"></i>
+                            Email Address
+                        </label>
+                        <input type="email" 
+                               class="form-input" 
+                               id="email" 
+                               required 
+                               autocomplete="email"
+                               placeholder="your@email.com"
+                               style="padding: 0.75rem;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label" for="password" style="display: flex; align-items: center; gap: 0.5rem;">
+                            <i class="fas fa-lock" style="color: var(--accent-color);"></i>
+                            Password
+                        </label>
+                        <input type="password" 
+                               class="form-input" 
+                               id="password" 
+                               required 
+                               autocomplete="new-password"
+                               placeholder="********"
+                               minlength="6"
+                               style="padding: 0.75rem;">
+                        <div class="form-help" style="display: flex; align-items: center; gap: 0.25rem;">
+                            <i class="fas fa-info-circle"></i> Password must be at least 6 characters
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label" for="confirmPassword" style="display: flex; align-items: center; gap: 0.5rem;">
+                            <i class="fas fa-lock" style="color: var(--accent-color);"></i>
+                            Confirm Password
+                        </label>
+                        <input type="password" 
+                               class="form-input" 
+                               id="confirmPassword" 
+                               required 
+                               autocomplete="new-password"
+                               placeholder="********"
+                               style="padding: 0.75rem;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label" for="age" style="display: flex; align-items: center; gap: 0.5rem;">
+                            <i class="fas fa-birthday-cake" style="color: var(--accent-color);"></i>
+                            Age
+                        </label>
+                        <input type="number" 
+                               class="form-input" 
+                               id="age" 
+                               required 
+                               min="13"
+                               style="padding: 0.75rem;"
+                               max="120"
+                               placeholder="Enter your age">
+                        <div class="form-help" style="display: flex; align-items: center; gap: 0.25rem;">
+                            <i class="fas fa-info-circle"></i> You must be at least 13 years old to use this service
+                        </div>
+                    </div>
+                    
+                    <div class="alert alert-info" style="margin-top: 1rem; margin-bottom: 1rem; padding: 0.75rem; font-size: 0.9rem;">
+                        <i class="fas fa-shield-alt"></i>
+                        <strong>Next Steps:</strong> After creating your account, you'll need to link your Minecraft username and set your skill levels before joining the queue.
+                    </div>
+                    
+                    <div class="form-group">
+                        <button type="submit" class="btn btn-primary" style="width: 100%; padding: 1rem; font-size: 1.1rem; font-weight: 600;" id="signupBtn">
+                            <i class="fas fa-user-plus"></i> Create Account
+                        </button>
+                    </div>
+
+                    <div class="text-center text-muted" style="margin: 1rem 0; font-size: 0.9rem;">
+                        or
+                    </div>
+
+                    <div class="form-group">
+                        <button type="button" class="btn btn-secondary" style="width: 100%;" id="googleSignupBtn" onclick="handleGoogleSignup(event)">
+                            <i class="fab fa-google"></i> Sign up with Google
+                        </button>
+                        <div class="form-help" style="text-align: center; margin-top: 0.5rem;">
+                            Age verification is required before creating an account.
+                        </div>
+                    </div>
+                </form>
+                
+                <div style="margin-top: 1.5rem; padding: 1rem; background: rgba(52, 152, 219, 0.1); border: 1px solid rgba(52, 152, 219, 0.3); border-radius: 8px; text-align: center;">
+                    <i class="fas fa-video" style="color: #3498db; margin-right: 0.5rem;"></i>
+                    <span style="color: var(--text-color); font-size: 0.9rem;">New here? Watch our </span>
+                    <a href="https://www.youtube.com/watch?v=HFzDUSVxuxM" target="_blank" rel="noopener noreferrer" style="color: #3498db; text-decoration: none; font-weight: 600; font-size: 0.9rem;">
+                        tutorial video
+                        <i class="fas fa-external-link-alt" style="font-size: 0.7rem; margin-left: 0.25rem;"></i>
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Sign In Prompt -->
+        <div class="card" style="margin-top: 1.5rem; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 16px;">
+            <div class="card-body" style="text-align: center; padding: 1.5rem;">
+                <p style="margin: 0 0 1rem 0; color: var(--text-muted); display: flex; align-items: center; justify-content: center; gap: 0.5rem;">
+                    <i class="fas fa-sign-in-alt"></i> 
+                    <span>Already have an account?</span>
+                </p>
+                <a href="login.html" class="btn btn-secondary" style="padding: 0.75rem 2rem;">
+                    Sign In
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="footer-logo">
+                <span>MC Leaderboards</span>
+            </div>
+            <div class="footer-links">
+                <a href="rules.html">Rules</a>
+                <a href="/privacy-policy.html">Privacy Policy</a>
+                <a href="/terms-of-service.html">Terms of Service</a>
+                <a href="support.html">Support</a>
+                <a href="report.html">Report Player</a>
+                <a href="api-docs.html">API Docs</a>
+            </div>
+            <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="js/config.js"></script>
+    <script src="js/dev-mode-toggle.js"></script>
+    <script src="js/firebase-service.js"></script>
+    <script src="js/app-state.js"></script>
+    <script src="js/api-service.js"></script>
+    <script src="js/player-search.js"></script>
+    <script src="js/firebase-auth-service.js"></script>
+    <script src="js/auth-guard.js"></script>
+    <script>
+        // Wait for Firebase to initialize, then verify guest status
+        // Wait for deferred scripts to load
+        window.addEventListener('DOMContentLoaded', async function() {
+            // Wait for requireGuest to be available
+            const waitForAuth = () => {
+                return new Promise((resolve) => {
+                    if (typeof requireGuest === 'function') {
+                        resolve();
+                    } else {
+                        const checkInterval = setInterval(() => {
+                            if (typeof requireGuest === 'function') {
+                                clearInterval(checkInterval);
+                                resolve();
+                            }
+                        }, 50);
+                    }
+                });
+            };
+
+            await waitForAuth();
+
+            // Wait for Firebase to be fully initialized
+            let attempts = 0;
+            while ((typeof firebase === 'undefined' || !firebase.apps || firebase.apps.length === 0) && attempts < 100) {
+                await new Promise(resolve => setTimeout(resolve, 50));
+                attempts++;
+            }
+
+            if (typeof firebase === 'undefined' || !firebase.apps || firebase.apps.length === 0) {
+                console.error('Firebase failed to initialize');
+                return;
+            }
+
+            const isGuest = await requireGuest();
+            if (!isGuest) return; // Redirected to dashboard
+        });
+        
+        async function handleSignup(event) {
+            event.preventDefault();
+
+            // Ensure Firebase is ready
+            if (typeof firebase === 'undefined' || !firebase.auth) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Service Unavailable',
+                    text: 'Authentication service is not ready. Please refresh the page.'
+                });
+                return;
+            }
+
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirmPassword').value;
+            const age = parseInt(document.getElementById('age').value);
+            const signupBtn = document.getElementById('signupBtn');
+            
+            
+            if (password !== confirmPassword) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Password Mismatch',
+                    text: 'Passwords do not match.'
+                });
+                return;
+            }
+            
+            if (password.length < 6) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Weak Password',
+                    text: 'Password must be at least 6 characters long.'
+                });
+                return;
+            }
+            
+            signupBtn.disabled = true;
+            signupBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating account...';
+            
+            try {
+                // Get real IP address from external service
+                let clientIP = 'unknown';
+                try {
+                    const ipResponse = await fetch('https://api.ipify.org?format=json');
+                    if (ipResponse.ok) {
+                        const ipData = await ipResponse.json();
+                        clientIP = ipData.ip;
+                    }
+                } catch (ipError) {
+                    console.warn('Failed to get real IP:', ipError);
+                }
+
+                // Create Firebase account
+                const user = await firebaseAuthService.signUp(email, password);
+                const firebaseUid = user.uid;
+
+                // Wait for Firebase token to be set
+                await new Promise((resolve) => {
+                    const checkToken = () => {
+                        // Get a fresh token directly from Firebase
+                        const auth = firebase.auth();
+                        const currentUser = auth.currentUser;
+                        if (currentUser) {
+                            currentUser.getIdToken().then(token => {
+                                apiService.setToken(token);
+                                resolve();
+                            }).catch(err => {
+                                console.error('Failed to get token:', err);
+                                setTimeout(checkToken, 100);
+                            });
+                        } else {
+                            setTimeout(checkToken, 100);
+                        }
+                    };
+                    checkToken();
+                });
+
+                // Register with backend (includes alt detection)
+                const token = apiService.getToken();
+                const response = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        email,
+                        firebaseUid,
+                        minecraftUsername: null, // Will be linked later
+                        clientIP: clientIP,
+                        age: age
+                    })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    // If registration fails due to alt detection, delete the Firebase account
+                    if (result.code === 'ALT_DETECTED') {
+                        await user.delete();
+                    }
+                    // Create error with backend error code and message
+                    const backendError = new Error(result.message || 'Registration failed');
+                    backendError.response = result;
+                    backendError.code = result.code;
+                    throw backendError;
+                }
+
+                Swal.fire({
+                    icon: 'success',
+                    title: 'Account Created!',
+                    text: 'Redirecting to onboarding...',
+                    timer: 1500,
+                    showConfirmButton: false
+                }).then(() => {
+                    window.location.href = 'onboarding.html';
+                });
+            } catch (error) {
+                // Handle backend error codes
+                let errorMessage = error.userMessage || error.message || 'Sign up failed';
+                let suggestion = error.suggestion || '';
+                let action = error.action || '';
+                
+                // Check for backend error codes in response or error.code
+                const backendCode = error.code || (error.response && error.response.code) || '';
+                const backendMessage = (error.response && error.response.message) || error.message || '';
+                
+                if (backendCode || (error.response && Object.keys(error.response).length > 0)) {
+                    try {
+                        const errorData = error.response || { code: backendCode, message: backendMessage };
+                        
+                        // Translate backend error codes
+                        const backendErrors = {
+                            'MISSING_DATA': {
+                                message: 'Required information is missing.',
+                                suggestion: 'Please make sure you\'ve filled in all required fields (email, password, age).',
+                                action: 'check_fields'
+                            },
+                            'AGE_VERIFICATION_FAILED': {
+                                message: 'You must be at least 13 years old to create an account.',
+                                suggestion: 'This is required by our Terms of Service. If you believe this is an error, please contact support.',
+                                action: 'contact_support'
+                            },
+                            'PROFANITY_DETECTED': {
+                                message: 'Your Minecraft username contains inappropriate language.',
+                                suggestion: 'Please choose a different username that follows our community guidelines.',
+                                action: 'change_username'
+                            },
+                            'FILTER_UNAVAILABLE': {
+                                message: 'Content verification is temporarily unavailable.',
+                                suggestion: 'Please try again in a few minutes. If the problem persists, contact support.',
+                                action: 'try_later'
+                            },
+                            'ACCOUNT_BANNED': {
+                                message: 'This email address is associated with a banned account.',
+                                suggestion: 'If you believe this is an error, please contact support for assistance.',
+                                action: 'contact_support'
+                            },
+                            'SERVER_ERROR': {
+                                message: 'A server error occurred while creating your account.',
+                                suggestion: 'Please try again in a few moments. If the problem continues, contact support.',
+                                action: 'try_later'
+                            }
+                        };
+                        
+                        const backendError = backendErrors[backendCode];
+                        if (backendError) {
+                            errorMessage = backendError.message;
+                            suggestion = backendError.suggestion;
+                            action = backendError.action;
+                        } else if (backendMessage && !error.userMessage) {
+                            // Only use backend message if we don't have a Firebase error message
+                            errorMessage = backendMessage;
+                            suggestion = 'If this problem persists, please contact support.';
+                            action = 'contact_support';
+                        }
+                    } catch (parseError) {
+                        // If parsing fails, use the error message as-is
+                        console.warn('Failed to parse error response:', parseError);
+                    }
+                } else if (backendCode) {
+                    // Check error.code directly if no response object
+                    const backendErrors = {
+                        'MISSING_DATA': {
+                            message: 'Required information is missing.',
+                            suggestion: 'Please make sure you\'ve filled in all required fields (email, password, age).',
+                            action: 'check_fields'
+                        },
+                        'AGE_VERIFICATION_FAILED': {
+                            message: 'You must be at least 13 years old to create an account.',
+                            suggestion: 'This is required by our Terms of Service. If you believe this is an error, please contact support.',
+                            action: 'contact_support'
+                        }
+                    };
+                    const backendError = backendErrors[backendCode];
+                    if (backendError) {
+                        errorMessage = backendError.message;
+                        suggestion = backendError.suggestion;
+                        action = backendError.action;
+                    }
+                }
+                
+                // Check if the error is a ban error from registration tracking
+                if (error.message && error.message.includes('ACCOUNT_BANNED')) {
+                    try {
+                        const errorData = JSON.parse(error.message);
+                        const banMessage = errorData.message || 'Your account has been banned';
+                        const expiryInfo = errorData.banExpires && errorData.banExpires !== 'permanent'
+                            ? `\n\nBan expires: ${new Date(errorData.banExpires).toLocaleString()}`
+                            : '\n\nThis ban is permanent.';
+
+                        Swal.fire({
+                            icon: 'error',
+                            title: 'Account Banned',
+                            text: banMessage + expiryInfo,
+                            footer: '<div style="margin-top: 1rem; text-align: center;"><a href="support.html" style="color: var(--accent-color); text-decoration: underline;">Contact support</a></div>',
+                            confirmButtonText: 'OK'
+                        });
+                        return;
+                    } catch (parseError) {
+                        // Fallback if JSON parsing fails
+                        Swal.fire({
+                            icon: 'error',
+                            title: 'Account Banned',
+                            text: 'Your account has been banned. Please contact an administrator.',
+                            footer: '<div style="margin-top: 1rem; text-align: center;"><a href="support.html" style="color: var(--accent-color); text-decoration: underline;">Contact support</a></div>',
+                            confirmButtonText: 'OK'
+                        });
+                        return;
+                    }
+                }
+                
+                // Build helpful message
+                let message = errorMessage;
+                if (suggestion) {
+                    message += '\n\n' + suggestion;
+                }
+                
+                // Add action-specific help
+                let footer = '';
+                if (action === 'signin') {
+                    footer = '<a href="login.html" style="color: var(--accent-color); text-decoration: underline;">Sign in instead</a>';
+                } else if (action === 'contact_support') {
+                    footer = '<a href="support.html" style="color: var(--accent-color); text-decoration: underline;">Contact support</a>';
+                }
+                
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Sign Up Failed',
+                    html: message.replace(/\n/g, '<br>'),
+                    footer: footer ? `<div style="margin-top: 1rem; text-align: center;">${footer}</div>` : undefined,
+                    confirmButtonText: 'OK'
+                });
+            } finally {
+                signupBtn.disabled = false;
+                signupBtn.innerHTML = '<i class="fas fa-user-plus"></i> Create Account';
+            }
+        }
+
+        // Google signup (requires age verification, same as email signup)
+        async function handleGoogleSignup(event) {
+            event.preventDefault();
+
+            // Ensure Firebase is ready
+            if (typeof firebase === 'undefined' || !firebase.auth) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Service Unavailable',
+                    text: 'Authentication service is not ready. Please refresh the page.'
+                });
+                return;
+            }
+
+            const age = parseInt(document.getElementById('age').value);
+            const googleBtn = document.getElementById('googleSignupBtn');
+
+            if (!age || Number.isNaN(age)) {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'Age Required',
+                    text: 'Please enter your age before signing up with Google.'
+                });
+                return;
+            }
+            if (age < 13) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Age Verification Failed',
+                    text: 'You must be at least 13 years old to create an account.'
+                });
+                return;
+            }
+
+            googleBtn.disabled = true;
+            googleBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting...';
+
+            try {
+                // Get real IP address from external service
+                let clientIP = 'unknown';
+                try {
+                    const ipResponse = await fetch('https://api.ipify.org?format=json');
+                    if (ipResponse.ok) {
+                        const ipData = await ipResponse.json();
+                        clientIP = ipData.ip;
+                    }
+                } catch (ipError) {
+                    console.warn('Failed to get real IP:', ipError);
+                }
+
+                await firebaseAuthService.signUpWithGoogle({ age, clientIP });
+
+                Swal.fire({
+                    icon: 'success',
+                    title: 'Account Created!',
+                    text: 'Redirecting to onboarding...',
+                    timer: 1500,
+                    showConfirmButton: false
+                }).then(() => {
+                    window.location.href = 'onboarding.html';
+                });
+            } catch (error) {
+                console.error('Google signup error:', error);
+
+                const errorMessage = error.userMessage || error.message || 'Google sign up failed';
+                const suggestion = error.suggestion || '';
+                const action = error.action || '';
+
+                let message = errorMessage;
+                if (suggestion) message += '\n\n' + suggestion;
+
+                let footer = '';
+                if (action === 'signin_email_then_link_google') {
+                    footer = '<a href="login.html" style="color: var(--accent-color); text-decoration: underline;">Sign in with email + password</a>';
+                } else if (action === 'contact_support') {
+                    footer = '<a href="support.html" style="color: var(--accent-color); text-decoration: underline;">Contact support</a>';
+                }
+
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Google Sign-up Failed',
+                    html: message.replace(/\n/g, '<br>'),
+                    footer: footer ? `<div style="margin-top: 1rem; text-align: center;">${footer}</div>` : undefined,
+                    confirmButtonText: 'OK'
+                });
+            } finally {
+                googleBtn.disabled = false;
+                googleBtn.innerHTML = '<i class="fab fa-google"></i> Sign up with Google';
+            }
+        }
+    </script>
+</body>
+</html>
+
+

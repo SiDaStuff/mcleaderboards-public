@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Support - MC Leaderboards</title>
+    <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
+
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="assets/fonts/local-fonts.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="js/loading-overlay.js"></script>
+    
+    <!-- Firebase SDK (compat) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+    <style>
+        .faq-container {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .faq-item {
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            overflow: hidden;
+            background: var(--secondary-bg);
+        }
+        .faq-question {
+            padding: 1rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 600;
+            transition: background-color 0.2s;
+            user-select: none;
+        }
+        .faq-question:hover {
+            background: var(--tertiary-bg);
+        }
+        .faq-question.active {
+            background: var(--tertiary-bg);
+        }
+        .faq-question.active .faq-icon {
+            transform: rotate(90deg);
+        }
+        .faq-icon {
+            transition: transform 0.3s;
+            color: var(--accent-color);
+        }
+        .faq-answer {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease;
+            padding: 0 1rem;
+        }
+        .faq-answer.active {
+            max-height: 500px;
+            padding: 0 1rem 1rem 1rem;
+        }
+        .faq-answer p {
+            margin: 0;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+        .faq-answer code {
+            background: var(--tertiary-bg);
+            padding: 0.2rem 0.4rem;
+            border-radius: 0.25rem;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container navbar-content">
+            <a href="index.html" class="navbar-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="navbar-logo"> MC Leaderboards
+                <span class="beta-badge">BETA</span>
+            </a>
+            <div class="navbar-search-wrapper">
+                <div class="navbar-search">
+                    <i class="fas fa-search navbar-search-icon"></i>
+                    <input type="text"
+                           class="navbar-search-input"
+                           id="searchInput"
+                           placeholder="Search player..."
+                           autocomplete="off">
+                </div>
+            </div>
+            <ul class="navbar-nav" id="navbarNav">
+                <li><a href="dashboard.html">Dashboard</a></li>
+                <li><a href="#" onclick="handleLogout()">Logout</a></li>
+            </ul>
+            <button class="hamburger" id="hamburgerBtn" onclick="toggleMobileMenu()">
+                <i class="fas fa-bars"></i>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="container" style="margin-top: 2rem; margin-bottom: 2rem;">
+        <div class="row justify-content-center">
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="text-center mb-4">
+                            <i class="fas fa-headset fa-3x text-primary mb-3"></i>
+                            <h1 class="h2">Support</h1>
+                            <p class="text-muted">Need help? We're here to assist you.</p>
+                        </div>
+
+                        <!-- Support Options -->
+                        <div class="row g-4 mb-4">
+                            <div class="col-md-6">
+                                <div class="card h-100 border-primary">
+                                    <div class="card-body text-center">
+                                        <i class="fab fa-x-twitter fa-2x text-primary mb-3"></i>
+                                        <h5 class="card-title">X (Twitter)</h5>
+                                        <p class="card-text">Follow us on X (Twitter) for updates, announcements, and support.</p>
+                                        <a href="https://x.com/mcleaderboards" target="_blank" class="btn btn-primary">
+                                            <i class="fab fa-x-twitter"></i> Follow on X
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card h-100 border-success">
+                                    <div class="card-body text-center">
+                                        <i class="fas fa-ticket-alt fa-2x text-success mb-3"></i>
+                                        <h5 class="card-title">Contact Form</h5>
+                                        <p class="card-text">Submit account help, bug reports, and moderation issues through our support form.</p>
+                                        <a class="btn btn-success"
+                                           href="https://docs.google.com/forms/d/e/1FAIpQLScYSAJyGEYMSXYJJ-neYfEr-ijFNC3bEPlSBvrVqJ3X4GtCFw/viewform?usp=publish-editor"
+                                           target="_blank"
+                                           rel="noopener noreferrer">
+                                            <i class="fas fa-file-alt"></i> Open Support Form
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- FAQ Section -->
+                        <div class="mb-4">
+                            <h3 class="h4 mb-3"><i class="fas fa-question-circle"></i> Frequently Asked Questions</h3>
+                            <div class="faq-container">
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How do I link my Minecraft account?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Go to your dashboard and complete the onboarding process. You'll be guided through linking your Minecraft account to your MC Leaderboards profile. You'll need to join one of our verification servers and run the <code>/link</code> command with your verification code.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How do I apply for Tier Tester?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Visit your dashboard and click on the "Think you have what it takes? Apply for the tier tester role" banner at the top. Fill out the application form with your details, including your experience level and availability.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How does the Elo rating system work?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>The Elo rating system matches you with testers who have similar ratings (Â±600 points). You compete in matches, and your rating adjusts based on match outcomes. Wins against higher-rated opponents give more points, while losses to lower-rated opponents cost more points.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>What are the match formats for each gamemode?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Each gamemode has a different match format:</p>
+                                        <ul style="margin-top: 0.5rem;">
+                                            <li><strong>Sword:</strong> First to 6</li>
+                                            <li><strong>Axe:</strong> First to 10</li>
+                                            <li><strong>NethOP:</strong> First to 3</li>
+                                            <li><strong>Pot:</strong> First to 5</li>
+                                            <li><strong>SMP:</strong> First to 2</li>
+                                            <li><strong>UHC:</strong> First to 4</li>
+                                            <li><strong>Vanilla:</strong> First to 3</li>
+                                            <li><strong>Mace:</strong> First to 3</li>
+                                        </ul>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>What is a provisional rating?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>A provisional rating appears when you've played fewer than 10 matches in a gamemode. These ratings are less reliable and may change more significantly as you play more matches. After 10+ matches, the provisional indicator disappears.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How do I join the testing queue?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Go to your dashboard, select a gamemode and region, enter your server IP, and click "Join Queue". You'll be matched with an available tester who has a similar Elo rating.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>Why was I removed from the queue?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>If no tester becomes available within 5 minutes, you'll be automatically removed from the queue. You can rejoin the queue at any time. There's also a 48-hour cooldown after completing a match in each gamemode.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>What are the testing rules?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Match formats and rule details are organized by gamemode on the <a href="rules.html">Rules page</a>. Check both Overall rules and your specific gamemode tab before queueing.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>My stats aren't updating. What should I do?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Stats should update automatically after finalized matches. A provisional marker may appear until 10 matches in a gamemode, but ratings and match history still update before that.</p>
+                                        <p>If something still looks wrong, refresh once and submit a support form report with the match ID.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How do I change my skill level?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Skill levels can only be set once during onboarding. Once set, they cannot be changed to ensure fair matchmaking. Your Elo rating will adjust automatically based on your match performance.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How do I report a bug or issue?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Use the support form to report bugs or issues. Include as much detail as possible: what happened, when it happened, how to reproduce it, and screenshots if available.</p>
+                                        <p style="margin-top: 0.5rem;">
+                                            <a href="https://docs.google.com/forms/d/e/1FAIpQLScYSAJyGEYMSXYJJ-neYfEr-ijFNC3bEPlSBvrVqJ3X4GtCFw/viewform?usp=publish-editor" target="_blank" rel="noopener noreferrer">
+                                                Submit a support report
+                                            </a>
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>What happens if I disconnect during a match?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>If you disconnect, you should rejoin as quickly as possible. Leaving for 15+ minutes without prior notice counts as an automatic loss. Be reasonably understanding of unpreventable circumstances, but communicate with your opponent if possible.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>Can I change my linked Minecraft username?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>Once linked and verified, your Minecraft username is permanently locked to prevent account spoofing. Contact an administrator if you need to change it due to a username change or other legitimate reason.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="supportContactSection">
+                            <h3 class="h4 mb-3"><i class="fas fa-envelope"></i> Contact Support</h3>
+                            <div class="alert alert-info" style="margin-bottom: 0;">
+                                <p style="margin: 0 0 0.5rem 0;">For all support requests, use the official contact form:</p>
+                                <p style="margin: 0; font-weight: 700; font-size: 1.05rem;">
+                                    <a href="https://docs.google.com/forms/d/e/1FAIpQLScYSAJyGEYMSXYJJ-neYfEr-ijFNC3bEPlSBvrVqJ3X4GtCFw/viewform?usp=publish-editor" target="_blank" rel="noopener noreferrer">
+                                        Open the MC Leaderboards Support Form
+                                    </a>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="footer-logo">
+                <span>MC Leaderboards</span>
+            </div>
+            <div class="footer-links">
+                <a href="rules.html">Rules</a>
+                <a href="/privacy-policy.html">Privacy Policy</a>
+                <a href="/terms-of-service.html">Terms of Service</a>
+                <a href="support.html">Support</a>
+                <a href="report.html">Report Player</a>
+                <a href="api-docs.html">API Docs</a>
+            </div>
+            <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <!-- Scripts -->
+    <script src="js/config.js"></script>
+    <script src="js/dev-mode-toggle.js"></script>
+    <script src="js/firebase-service.js"></script>
+    <script src="js/app-state.js"></script>
+    <script src="js/api-service.js"></script>
+    <script src="js/global-error-handler.js"></script>
+    <script src="js/player-search.js"></script>
+    <script src="js/firebase-auth-service.js"></script>
+    <!-- Auth guard removed - support page is public -->
+    <script src="js/navigation.js"></script>
+    <script>
+        // Toggle FAQ item
+        function toggleFaq(element) {
+            const item = element.closest('.faq-item');
+            const answer = item.querySelector('.faq-answer');
+            const isActive = element.classList.contains('active');
+            
+            // Close all other FAQs
+            document.querySelectorAll('.faq-item').forEach(faq => {
+                if (faq !== item) {
+                    faq.querySelector('.faq-question').classList.remove('active');
+                    faq.querySelector('.faq-answer').classList.remove('active');
+                }
+            });
+            
+            // Toggle current FAQ
+            if (isActive) {
+                element.classList.remove('active');
+                answer.classList.remove('active');
+            } else {
+                element.classList.add('active');
+                answer.classList.add('active');
+            }
+        }
+
+        function scrollToSupportTicket() {
+            document.getElementById('supportContactSection')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    </script>
+</body>
+</html>
+
+
+

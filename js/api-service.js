@@ -1,0 +1,1499 @@
+// MC Leaderboards - API Service
+// Handles all API communication with the backend
+
+class ApiService {
+  constructor() {
+    this.baseURL = CONFIG.API_BASE_URL;
+    this.token = localStorage.getItem('mc_leaderboards_token');
+    
+    // Performance optimizations
+    this.cache = new Map(); // Response cache
+    this.pendingRequests = new Map(); // Request deduplication
+    this.cacheTimeout = 30000; // 30 seconds cache timeout
+  }
+
+  /**
+   * Set authentication token
+   */
+  setToken(token) {
+    this.token = token;
+    if (token) {
+      localStorage.setItem('mc_leaderboards_token', token);
+    } else {
+      localStorage.removeItem('mc_leaderboards_token');
+    }
+  }
+
+  /**
+   * Get authentication token
+   */
+  getToken() {
+    return this.token || localStorage.getItem('mc_leaderboards_token');
+  }
+
+  /**
+   * Clear cache for specific endpoint or all
+   */
+  clearCache(endpoint = null) {
+    if (endpoint) {
+      const normalizedEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+      for (const key of this.cache.keys()) {
+        if (key.endsWith(`:${normalizedEndpoint}`)) {
+          this.cache.delete(key);
+        }
+      }
+    } else {
+      this.cache.clear();
+    }
+  }
+
+  /**
+   * Make API request with caching and deduplication
+   */
+  async request(endpoint, options = {}) {
+    const url = `${this.baseURL}${endpoint}`;
+    const token = this.getToken();
+    const method = (options.method || 'GET').toUpperCase();
+    const cacheKey = `${method}:${endpoint}`;
+    const retryCount = Number(options._retryCount || 0);
+    
+    // Only cache GET requests
+    const shouldCache = method === 'GET' && !options.noCache;
+    
+    // Check cache first for GET requests
+    if (shouldCache && this.cache.has(cacheKey)) {
+      const cached = this.cache.get(cacheKey);
+      if (Date.now() - cached.timestamp < this.cacheTimeout) {
+        return cached.data;
+      } else {
+        this.cache.delete(cacheKey);
+      }
+    }
+    
+    // Request deduplication - if same request is in flight, wait for it
+    if (this.pendingRequests.has(cacheKey)) {
+      return await this.pendingRequests.get(cacheKey);
+    }
+
+    // Create abort controller for timeout (configurable, default 30s)
+    const timeoutMs = options.timeout || 30000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    const requestOptions = { ...options };
+    delete requestOptions._retryCount;
+
+    const config = {
+      ...requestOptions,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token && { 'Authorization': `Bearer ${token}` }),
+        ...options.headers
+      },
+      signal: controller.signal
+    };
+
+    // Create request promise
+    const requestPromise = (async () => {
+      try {
+        AppState.setLoading('api', true);
+        const response = await fetch(url, config);
+        
+        // Check if response has content before trying to parse JSON
+        let data;
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          try {
+            const text = await response.text();
+            data = text ? JSON.parse(text) : {};
+          } catch (parseError) {
+            console.error('JSON Parse Error:', parseError);
+            data = {};
+          }
+        } else {
+          data = {};
+        }
+
+        if (!response.ok) {
+          const errorMessage = data.message || data.error?.message || data.error || `API Error (${response.status})`;
+          const error = new Error(errorMessage);
+          error.status = response.status;
+          error.data = data;
+          error.code = data.code || data.errorCode || null;
+          error.endpoint = endpoint;
+
+          // Attach rate limit metadata for 429 responses
+          if (response.status === 429) {
+            error.isRateLimit = true;
+            try {
+              const rateLimitReset = response.headers.get('RateLimit-Reset');
+              const retryAfterHeader = response.headers.get('Retry-After');
+              let retryAtMs = null;
+
+              if (data.resetAt) {
+                const resetDate = new Date(data.resetAt);
+                if (!Number.isNaN(resetDate.getTime())) {
+                  retryAtMs = resetDate.getTime();
+                }
+              } else if (rateLimitReset) {
+                const resetSeconds = Number(rateLimitReset);
+                if (!Number.isNaN(resetSeconds) && resetSeconds > 0) {
+                  retryAtMs = resetSeconds * 1000;
+                }
+              } else if (retryAfterHeader) {
+                const retryAfterSeconds = Number(retryAfterHeader);
+                if (!Number.isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
+                  retryAtMs = Date.now() + retryAfterSeconds * 1000;
+                }
+              }
+
+              error.retryAt = retryAtMs || null;
+              const limit = Number(response.headers.get('RateLimit-Limit'));
+              const remaining = Number(response.headers.get('RateLimit-Remaining'));
+              error.rateLimitInfo = {
+                limit: Number.isNaN(limit) ? null : limit,
+                remaining: Number.isNaN(remaining) ? null : remaining,
+                resetAt: error.retryAt
+              };
+            } catch (metaError) {
+              console.warn('Error parsing rate limit metadata:', metaError);
+            }
+          }
+
+          // Mark fatal backend errors (5xx) so pages can redirect to error screen.
+          if (response.status >= 500) {
+            error.isBackendError = true;
+            error.isFatalBackendError = true;
+          }
+          
+          // Handle authentication errors
+          if (response.status === 401) {
+            // Token might be expired, try to refresh it
+            if (data.code === 'AUTH_INVALID' || data.code === 'auth/id-token-expired') {
+              console.log('Token expired, attempting refresh...');
+              try {
+                const auth = typeof getAuth === 'function' ? getAuth() : firebase.auth();
+                const currentUser = auth.currentUser;
+                if (currentUser && retryCount < 1) {
+                  // Force refresh the token
+                  const newToken = await currentUser.getIdToken(true);
+                  this.setToken(newToken);
+                  console.log('Token refreshed successfully');
+                  // Retry the request once with the new token
+                  return this.request(endpoint, {
+                    ...options,
+                    _retryCount: retryCount + 1
+                  });
+                }
+              } catch (refreshError) {
+                console.error('Failed to refresh token:', refreshError);
+                // Redirect to login if refresh fails
+                if (typeof window !== 'undefined') {
+                  window.location.href = 'login.html';
+                }
+              }
+            }
+          }
+
+          throw error;
+        }
+
+        clearTimeout(timeoutId);
+        
+        // Cache successful GET responses
+        if (shouldCache && response.ok) {
+          this.cache.set(cacheKey, {
+            data: data,
+            timestamp: Date.now()
+          });
+        }
+        
+        return data;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        console.error('API Request Error:', error);
+        
+        // Handle timeout/abort errors
+        if (error.name === 'AbortError' || (typeof error.message === 'string' && error.message.includes('aborted'))) {
+          const timeoutError = new Error('Request timed out. Please try again.');
+          timeoutError.isBackendError = true;
+          timeoutError.isFatalBackendError = true;
+          timeoutError.endpoint = endpoint;
+          throw timeoutError;
+        }
+        
+        // Handle network errors
+        if (typeof error.message === 'string' && (error.message.includes('Failed to fetch') || error.message.includes('NetworkError'))) {
+          const netError = new Error('Network error. Please check your connection.');
+          netError.isBackendError = true;
+          netError.isFatalBackendError = true;
+          netError.endpoint = endpoint;
+          throw netError;
+        }
+        
+        // Re-throw to allow caller to handle
+        throw error;
+      } finally {
+        // Always clear loading state, even on error
+        AppState.setLoading('api', false);
+        // Remove from pending requests
+        this.pendingRequests.delete(cacheKey);
+      }
+    })();
+    
+    // Store pending request for deduplication
+    this.pendingRequests.set(cacheKey, requestPromise);
+    
+    return requestPromise;
+  }
+
+  /**
+   * GET request
+   */
+  async get(endpoint) {
+    return this.request(endpoint, { method: 'GET' });
+  }
+
+  /**
+   * POST request
+   */
+  async post(endpoint, data) {
+    return this.request(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  /**
+   * PUT request
+   */
+  async put(endpoint, data) {
+    return this.request(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  /**
+   * DELETE request
+   */
+  async delete(endpoint) {
+    return this.request(endpoint, { method: 'DELETE' });
+  }
+
+  // ===== Authentication Endpoints =====
+
+  /**
+   * Get current user profile
+   */
+  async getProfile() {
+    return this.get('/users/me');
+  }
+
+  /**
+   * Get profile with short timeout (for polling/verification checks)
+   */
+  async getProfileQuick() {
+    return this.request('/users/me', { 
+      method: 'GET',
+      timeout: 5000, // 5 second timeout
+      noCache: true // Don't use stale cache for verification checks
+    });
+  }
+
+  /**
+   * Get detailed moderation standing for current user
+   */
+  async getMyStanding() {
+    return this.get('/users/me/standing');
+  }
+
+  /**
+   * Update user profile
+   */
+  async updateProfile(data) {
+    return this.put('/users/me', data);
+  }
+
+  /**
+   * Link Minecraft username
+   */
+  async linkMinecraftUsername(username, region) {
+    return this.post('/users/me/minecraft', { username, region });
+  }
+
+  /**
+   * Get current user profile
+   */
+  async getUserProfile() {
+    return this.get('/users/me');
+  }
+
+  /**
+   * Get retirement status for a user by userId
+   */
+  async getUserRetirementStatus(userId) {
+    return this.get(`/users/${userId}/retirement-status`);
+  }
+
+  /**
+   * Get recent matches for current user
+   */
+  async getRecentMatches(limit = 5) {
+    return this.get(`/users/me/recent-matches?limit=${limit}`);
+  }
+
+
+  // ===== Player Endpoints =====
+
+  /**
+   * Get all players
+   */
+  async getPlayers(gamemode = null, offset = 0, limit = 25) {
+    let endpoint = '/players?';
+    const params = [];
+    
+    if (gamemode && gamemode !== 'overall') {
+      params.push(`gamemode=${gamemode}`);
+    }
+    // Always send explicit offset for stable pagination/caching behavior
+    params.push(`offset=${Math.max(0, parseInt(offset, 10) || 0)}`);
+    if (limit) {
+      params.push(`limit=${limit}`);
+    }
+    
+    endpoint += params.join('&');
+    return this.get(endpoint);
+  }
+
+    /**
+     * Get players with advanced filters
+     */
+    async getPlayersFiltered(options = {}) {
+      const {
+        gamemode = null,
+        offset = 0,
+        limit = 25,
+        ratingMin = null,
+        ratingMax = null,
+        region = null,
+        createdAfter = null,
+        createdBefore = null,
+        search = null
+      } = options;
+    
+      let endpoint = '/players?';
+      const params = [];
+    
+      if (gamemode && gamemode !== 'overall') {
+        params.push(`gamemode=${encodeURIComponent(gamemode)}`);
+      }
+      params.push(`offset=${Math.max(0, parseInt(offset, 10) || 0)}`);
+      if (limit) {
+        params.push(`limit=${limit}`);
+      }
+      if (ratingMin !== null) {
+        params.push(`ratingMin=${ratingMin}`);
+      }
+      if (ratingMax !== null) {
+        params.push(`ratingMax=${ratingMax}`);
+      }
+      if (region) {
+        params.push(`region=${encodeURIComponent(region)}`);
+      }
+      if (createdAfter) {
+        params.push(`createdAfter=${encodeURIComponent(createdAfter)}`);
+      }
+      if (createdBefore) {
+        params.push(`createdBefore=${encodeURIComponent(createdBefore)}`);
+      }
+      if (search) {
+        params.push(`search=${encodeURIComponent(search)}`);
+      }
+    
+      endpoint += params.join('&');
+      return this.get(endpoint);
+    }
+
+    /**
+     * Get player search autocomplete suggestions
+     */
+    async getPlayerSuggestions(query, limit = 10) {
+      if (!query || query.trim().length < 2) {
+        return { suggestions: [], query };
+      }
+    
+      const endpoint = `/players/search/autocomplete?q=${encodeURIComponent(query)}&limit=${limit}`;
+      return this.get(endpoint);
+    }
+  /**
+   * Get player by username (public, case-sensitive username match)
+   * Used by global player search to power the header search bar.
+   */
+  async getPlayerByUsername(username) {
+    if (!username) {
+      throw new Error('Username is required');
+    }
+    return this.get(`/players/username/${encodeURIComponent(username)}`);
+  }
+
+  /**
+   * Get player by ID
+   */
+  async getPlayer(playerId) {
+    return this.get(`/players/${playerId}`);
+  }
+
+  /**
+   * Create a new player
+   */
+  async createPlayer(username, region = null) {
+    return this.post('/players', { username, region });
+  }
+
+  /**
+   * Add player (alias for createPlayer)
+   */
+  async addPlayer(username, region = null) {
+    return this.createPlayer(username, region);
+  }
+
+  // ===== Queue Endpoints =====
+
+  /**
+   * Join queue
+   */
+  async joinQueue(gamemode, region, serverIP) {
+    return this.post('/queue/join', {
+      gamemode,
+      region,
+      serverIP
+    });
+  }
+
+  /**
+   * Leave queue
+   */
+  async leaveQueue() {
+    return this.post('/queue/leave', {});
+  }
+
+  /**
+   * Get queue status
+   */
+  async getQueueStatus() {
+    return this.get('/queue/status');
+  }
+
+  /**
+   * Get queue statistics
+   */
+  async getQueueStats() {
+    return this.get('/queue/stats');
+  }
+
+  // ===== Tier Tester Endpoints =====
+
+  /**
+   * Set tester availability
+   */
+  async setTesterAvailability(available, gamemodeOrGamemodes, regionOrRegions = null) {
+    const gamemodes = Array.isArray(gamemodeOrGamemodes)
+      ? gamemodeOrGamemodes
+      : (gamemodeOrGamemodes ? [gamemodeOrGamemodes] : []);
+    const regions = Array.isArray(regionOrRegions)
+      ? regionOrRegions
+      : (regionOrRegions ? [regionOrRegions] : []);
+
+    return this.post('/tester/availability', {
+      available,
+      gamemode: gamemodes[0] || null,
+      region: regions[0] || null,
+      gamemodes,
+      regions
+    });
+  }
+
+  /**
+   * Get tester availability
+   */
+  async getTesterAvailability() {
+    return this.get('/tester/availability');
+  }
+
+  /**
+   * Get tester reputation metrics
+   */
+  async getTesterReputation() {
+    return this.get('/tester/reputation');
+  }
+
+  // ===== Match Endpoints =====
+
+  /**
+   * Get active match for current user
+   */
+  async getActiveMatch() {
+    return this.get('/match/active');
+  }
+
+  /**
+   * Get match by ID
+   */
+  async getMatch(matchId) {
+    return this.get(`/match/${matchId}`);
+  }
+
+  /**
+   * Join match
+   */
+  async joinMatch(matchId) {
+    return this.post(`/match/${matchId}/join`);
+  }
+
+  /**
+   * Update presence
+   */
+  async updatePresence(matchId, onPage) {
+    return this.post(`/match/${matchId}/presence`, { onPage });
+  }
+
+  /**
+   * Update page stats
+   */
+  async updatePageStats(matchId, isPlayer) {
+    return this.post(`/match/${matchId}/pagestats`, { isPlayer });
+  }
+
+  /**
+   * Send chat message
+   */
+  async sendChatMessage(matchId, message) {
+    return this.post(`/match/${matchId}/message`, { text: message });
+  }
+
+  /**
+   * Get chat messages
+   */
+  async getChatMessages(matchId) {
+    return this.get(`/match/${matchId}/messages`);
+  }
+
+  /**
+   * Delete chat message
+   */
+  async deleteChatMessage(matchId, messageId) {
+    return this.delete(`/match/${matchId}/message/${messageId}`);
+  }
+
+  /**
+   * Report a specific chat message
+   */
+  async reportChatMessage(matchId, messageId, payload = {}) {
+    return this.post(`/match/${matchId}/message/${messageId}/report`, {
+      reason: payload.reason || 'chat_abuse',
+      description: payload.description || '',
+      evidenceLinks: Array.isArray(payload.evidenceLinks) ? payload.evidenceLinks : [],
+      hasEvidence: payload.hasEvidence === true
+    });
+  }
+
+  /**
+   * Finalize match
+   */
+  async finalizeMatch(matchId, data) {
+    return this.post(`/match/${matchId}/finalize`, data);
+  }
+
+  /**
+   * Mark match as started
+   */
+  async markMatchStarted(matchId) {
+    return this.post(`/match/${matchId}/started`);
+  }
+
+  /**
+   * Abort match
+   */
+  async abortMatch(matchId) {
+    return this.post(`/match/${matchId}/abort`);
+  }
+
+  /**
+   * Vote to end match as draw (no scoring)
+   */
+  async voteDraw(matchId, agree = true) {
+    return this.post(`/match/${matchId}/draw-vote`, { agree: agree === true });
+  }
+
+  // ===== Admin Endpoints =====
+
+  /**
+   * Get all applications
+   */
+  async getApplications() {
+    return this.get('/admin/applications');
+  }
+
+  /**
+   * Approve application
+   */
+  async approveApplication(applicationId) {
+    return this.post(`/admin/applications/${applicationId}/approve`);
+  }
+
+  /**
+   * Deny application
+   */
+  async denyApplication(applicationId) {
+    return this.post(`/admin/applications/${applicationId}/deny`);
+  }
+
+  /**
+   * Submit tier tester application
+   */
+  async submitTierTesterApplication(applicationData) {
+    return this.post('/tier-tester/apply', applicationData);
+  }
+
+  /**
+   * Public: Check whether Tier Tester applications are currently open
+   */
+  async getTierTesterApplicationsOpen() {
+    return this.get('/tier-tester/applications-open');
+  }
+
+  /**
+   * Admin: Toggle whether Tier Tester applications are open
+   */
+  async adminSetTierTesterApplicationsOpen(open) {
+    return this.post('/admin/settings/tier-tester-applications', { open: open === true });
+  }
+
+  /**
+   * Admin: Get current Tier Tester applications-open setting
+   */
+  async adminGetTierTesterApplicationsOpen() {
+    return this.get('/admin/settings/tier-tester-applications');
+  }
+
+  /**
+   * Get tier tester applications (Admin only)
+   */
+  async getTierTesterApplications() {
+    return this.get('/admin/tier-tester-applications');
+  }
+
+  /**
+   * Approve tier tester application (Admin only)
+   */
+  async approveTierTesterApplication(applicationId, reviewNotes) {
+    return this.post(`/admin/tier-tester-applications/${applicationId}/approve`, { reviewNotes });
+  }
+
+  /**
+   * Deny tier tester application (Admin only)
+   */
+  async denyTierTesterApplication(applicationId, reviewNotes) {
+    return this.post(`/admin/tier-tester-applications/${applicationId}/deny`, { reviewNotes });
+  }
+
+  /**
+   * Block user from tier tester applications (Admin only)
+   */
+  async blockTierTesterApplication(applicationId, reviewNotes) {
+    return this.post(`/admin/tier-tester-applications/${applicationId}/block`, { reviewNotes });
+  }
+
+  /**
+   * Get pending games
+   */
+  async getPendingGames() {
+    return this.get('/admin/pending-games');
+  }
+
+  /**
+   * Bulk action on pending games
+   */
+  async bulkActionPendingGames(action, gameIds) {
+    return this.post('/admin/pending-games/bulk-action', {
+      action,
+      gameIds
+    });
+  }
+
+  /**
+   * Get blacklist
+   */
+  async getBlacklist(params = {}) {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.append(key, String(value));
+    });
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return this.get(`/admin/blacklist${suffix}`);
+  }
+
+  /**
+   * Add to blacklist
+   */
+  async addToBlacklist(data) {
+    return this.post('/admin/blacklist', data);
+  }
+
+  /**
+   * Remove from blacklist
+   */
+  async removeFromBlacklist(blacklistId) {
+    return this.delete(`/admin/blacklist/${blacklistId}`);
+  }
+
+  /**
+   * Get all users
+   */
+  async getUsers(params = {}) {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.append(key, String(value));
+    });
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return this.get(`/admin/users${suffix}`);
+  }
+
+  /**
+   * Set tier tester status
+   */
+  async setTesterStatus(userId, status) {
+    return this.post(`/admin/users/${userId}/tester`, { status });
+  }
+
+  /**
+   * Set admin status
+   */
+  async setAdminStatus(userId, status) {
+    return this.post(`/admin/users/${userId}/admin`, { status });
+  }
+
+  /**
+   * Force set rating for a player
+   */
+  async setPlayerRating(playerId, gamemode, rating) {
+    return this.post(`/admin/players/${playerId}/rating`, { gamemode, rating });
+  }
+
+  /**
+   * Admin: manage player (bulk actions)
+   */
+  async adminManagePlayer(playerId, action, payload = {}) {
+    return this.post(`/admin/players/${playerId}/manage`, { action, payload });
+  }
+
+  /**
+   * Admin: Manage user actions
+   */
+  async adminManageUser(userId, action, payload = {}) {
+    return this.post(`/admin/users/${userId}/manage`, { action, ...payload });
+  }
+
+  /**
+   * Admin: set per-user feature restrictions
+   */
+  async adminSetUserRestrictions(userId, restrictions = {}, durationHours = 0, reason = '') {
+    return this.post(`/admin/users/${userId}/restrictions`, { restrictions, durationHours, reason });
+  }
+
+  /**
+   * Admin: get warnings/blacklist/restrictions/audit history for one user
+   */
+  async adminGetUserModerationHistory(userId) {
+    return this.get(`/admin/users/${userId}/moderation-history`);
+  }
+
+  /**
+   * Verify Minecraft username via Mojang API
+   */
+  async verifyMinecraftUsername(username) {
+    return this.post('/auth/verify-minecraft-username', { username });
+  }
+
+  /**
+   * Admin: unlink minecraft username from account and optionally wipe player data
+   */
+  async adminUnlinkMinecraft(userId, wipePlayer = true) {
+    return this.post(`/admin/users/${userId}/unlink-minecraft`, { wipePlayer: wipePlayer === true });
+  }
+
+  /**
+   * Force link username to account (admin only)
+   */
+  async forceAuth(userId, username) {
+    return this.post('/admin/players/force-auth', { userId, username });
+  }
+
+  /**
+   * Force unlink username but keep ratings (admin only)
+   */
+  async forceAuthUnlink(userId) {
+    return this.post('/admin/players/force-auth-unlink', { userId });
+  }
+
+  /**
+   * Force create match between tester and player (admin only)
+   */
+  async forceTest(testerUserId, playerUserId, gamemode, region = 'NA', serverIP = 'play.example.com') {
+    return this.post('/admin/players/force-test', { testerUserId, playerUserId, gamemode, region, serverIP });
+  }
+
+  /**
+   * Transfer ratings from one player to another (admin only)
+   */
+  async ratingTransfer(fromPlayerId, toPlayerId) {
+    return this.post('/admin/players/rating-transfer', { fromPlayerId, toPlayerId });
+  }
+
+  /**
+   * Wipe all ratings from a player (admin only)
+   */
+  async ratingWipe(playerId) {
+    return this.post('/admin/players/rating-wipe', { playerId });
+  }
+
+  /**
+   * Reset cooldown for a player (admin only)
+   */
+  async resetCooldown(username, gamemode = null) {
+    return this.post('/admin/reset-cooldown', { username, gamemode });
+  }
+
+  // ===== Onboarding Endpoints =====
+
+
+  /**
+   * Save onboarding preferences (gamemodes and skill level)
+   */
+  async saveOnboardingPreferences(selectedGamemodes, gamemodeSkillLevels) {
+    return this.post('/onboarding/save-preferences', { selectedGamemodes, gamemodeSkillLevels });
+  }
+
+  /**
+   * Update skill levels (with locking protection)
+   */
+  async updateSkillLevels(gamemodeRatings) {
+    return this.post('/account/update-skill-levels', { gamemodeRatings });
+  }
+
+  /**
+   * Get onboarding status
+   */
+  async getOnboardingStatus() {
+    return this.get('/onboarding/status');
+  }
+
+  /**
+   * Update player region
+   */
+  async updatePlayerRegion(username, region) {
+    return this.post('/players/update-region', { username, region });
+  }
+
+  /**
+   * Complete onboarding
+   */
+  async completeOnboarding() {
+    return this.post('/onboarding/complete');
+  }
+
+  // ===== Account Management Endpoints =====
+
+  /**
+   * Reload account badges
+   */
+  async reloadAccountBadges() {
+    return this.post('/account/reload-badges', {});
+  }
+
+  /**
+   * Reload account tiers
+   */
+  async reloadAccountTiers() {
+    return this.post('/account/reload-tiers', {});
+  }
+
+  // ===== Plus Membership Endpoints =====
+
+  /**
+   * Create a Plus purchase/gift request (admin will approve)
+   */
+  async createPlusRequest({ giftUsername = null, years = 1 } = {}) {
+    return this.post('/plus/requests', { giftUsername, years });
+  }
+
+  /**
+   * Save Plus preferences (show badge + gradient settings)
+   */
+  async savePlusPreferences(preferences = {}) {
+    return this.post('/plus/preferences', preferences);
+  }
+
+  /**
+   * Sync Plus perks to player record (badge/gradient visible on leaderboard & popup)
+   */
+  async syncPlusToPlayer() {
+    return this.post('/plus/sync', {});
+  }
+
+  /**
+   * Redeem a 6-digit Plus purchase code
+   */
+  async redeemPlusCode(code) {
+    return this.post('/plus/redeem-code', { code });
+  }
+
+  /**
+   * Easter Egg: get current progression
+   */
+  async getEasterEggState() {
+    return this.get('/easter-egg/state');
+  }
+
+  /**
+   * Easter Egg: submit answer for the active step
+   */
+  async solveEasterEggStep(stepId, answer) {
+    return this.post('/easter-egg/solve', { stepId, answer });
+  }
+
+  /**
+   * Easter Egg: claim final reward code
+   */
+  async claimEasterEggReward() {
+    return this.post('/easter-egg/claim-reward', {});
+  }
+
+  /**
+   * Admin: grant Plus to a userId
+   */
+  async adminGrantPlus(userId, years = 1) {
+    return this.post('/admin/plus/grant', { userId, years });
+  }
+
+  /**
+   * Admin: cancel Plus for a userId
+   */
+  async adminCancelPlus(userId) {
+    return this.post('/admin/plus/cancel', { userId });
+  }
+
+  /**
+   * Admin: block/unblock Plus for a userId
+   */
+  async adminSetPlusBlocked(userId, blocked, reason = '') {
+    return this.post('/admin/plus/block', { userId, blocked: blocked === true, reason });
+  }
+
+  /**
+   * Admin: list Plus purchase codes
+   */
+  async adminListPlusCodes(includeRemoved = false) {
+    const suffix = includeRemoved ? '?includeRemoved=true' : '';
+    return this.get(`/admin/plus/codes${suffix}`);
+  }
+
+  /**
+   * Admin: create Plus purchase code
+   */
+  async adminCreatePlusCode({ code = null, years = 1, assignedUserId = null, note = '' } = {}) {
+    return this.post('/admin/plus/codes', { code, years, assignedUserId, note });
+  }
+
+  /**
+   * Admin: remove Plus purchase code
+   */
+  async adminRemovePlusCode(code) {
+    const safeCode = encodeURIComponent(String(code || '').trim());
+    return this.request(`/admin/plus/codes/${safeCode}`, { method: 'DELETE' });
+  }
+
+  /**
+   * Set gamemode retirement status
+   */
+  async setGamemodeRetirement(gamemode, retired) {
+    return this.post('/account/set-gamemode-retirement', { gamemode, retired });
+  }
+
+  /**
+   * Create support ticket (one active ticket allowed per user)
+   */
+  async submitSupportTicket(category, subject, message) {
+    return this.post('/support/tickets', { category, subject, message });
+  }
+
+  /**
+   * Submit signed-out account issue ticket
+   */
+  async submitGuestSupportTicket({ email, category = 'account', subject, message }) {
+    return this.post('/support/guest-ticket', { email, category, subject, message });
+  }
+
+  /**
+   * Get current user's active support ticket and recent history
+   */
+  async getMySupportTicket() {
+    return this.get('/support/tickets/me');
+  }
+
+  /**
+   * Reply to own support ticket
+   */
+  async replySupportTicket(ticketId, message) {
+    return this.post(`/support/tickets/${ticketId}/messages`, { message });
+  }
+
+  /**
+   * Close own support ticket
+   */
+  async closeSupportTicket(ticketId) {
+    return this.post(`/support/tickets/${ticketId}/close`, {});
+  }
+
+  /**
+   * Admin: list support tickets
+   */
+  async adminGetSupportTickets(status = 'active', limit = 100) {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    if (limit) params.set('limit', String(limit));
+    return this.get(`/admin/support/tickets?${params.toString()}`);
+  }
+
+  /**
+   * Admin: get support ticket details
+   */
+  async adminGetSupportTicket(ticketId) {
+    return this.get(`/admin/support/tickets/${ticketId}`);
+  }
+
+  /**
+   * Admin: send support ticket reply
+   */
+  async adminReplySupportTicket(ticketId, message) {
+    return this.post(`/admin/support/tickets/${ticketId}/messages`, { message });
+  }
+
+  /**
+   * Admin: update support ticket status
+   */
+  async adminUpdateSupportTicketStatus(ticketId, status) {
+    return this.post(`/admin/support/tickets/${ticketId}/status`, { status });
+  }
+
+  /**
+   * Update player roles (admin only)
+   */
+  async updatePlayerRoles(playerId, admin, tester) {
+    return this.post(`/admin/players/${playerId}/roles`, { admin, tester });
+  }
+
+  /**
+   * Ban account
+   */
+  async banAccount(identifier, duration, reason) {
+    return this.post('/admin/ban', { identifier, duration, reason });
+  }
+
+  /**
+   * Unban account
+   */
+  async unbanAccount(firebaseUid) {
+    return this.post(`/admin/unban/${firebaseUid}`);
+  }
+
+  /**
+   * Get all banned accounts
+   */
+  async getBannedAccounts() {
+    return this.get('/admin/banned');
+  }
+
+  /**
+   * Search banned accounts
+   */
+  async searchBannedAccounts(searchTerm) {
+    return this.get(`/admin/banned/search?q=${encodeURIComponent(searchTerm)}`);
+  }
+
+  /**
+   * Search blacklist
+   */
+  async searchBlacklist(searchTerm, params = {}) {
+    const query = new URLSearchParams({ q: searchTerm });
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.append(key, String(value));
+    });
+    return this.get(`/admin/blacklist/search?${query.toString()}`);
+  }
+
+  /**
+   * Search users
+   */
+  async searchUsers(searchTerm, params = {}) {
+    const query = new URLSearchParams({ q: searchTerm });
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.append(key, String(value));
+    });
+    return this.get(`/admin/users/search?${query.toString()}`);
+  }
+
+  /**
+   * Search players
+   */
+  async searchPlayers(searchTerm, params = {}) {
+    const query = new URLSearchParams({ q: searchTerm });
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') query.append(key, String(value));
+    });
+    return this.get(`/admin/players/search?${query.toString()}`);
+  }
+
+  // ===== User Cooldowns =====
+
+  /**
+   * Get user's active cooldowns
+   */
+  async getUserCooldowns() {
+    return this.get('/user/cooldowns');
+  }
+
+  // ===== Ban & Warning System =====
+
+  /**
+   * Check if an email is banned before login
+   */
+  async checkBanStatus(email) {
+    return this.post('/auth/check-ban', { email });
+  }
+
+  /**
+   * Acknowledge a warning
+   */
+  async acknowledgeWarning(warningId) {
+    return this.post('/auth/acknowledge-warning', { warningId });
+  }
+
+  /**
+   * Issue a warning to a user (admin only)
+   */
+  async warnUser(userId, reason) {
+    return this.post('/admin/warn', { userId, reason });
+  }
+
+  /**
+   * Get admin audit log (admin only)
+   */
+  async getAuditLog(params = {}) {
+    const queryParams = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value) queryParams.append(key, value);
+    });
+    return this.get(`/admin/audit-log?${queryParams}`);
+  }
+
+  /**
+   * Get per-gamemode dashboard stats (authenticated, cached server-side)
+   */
+  async getDashboardGamemodeStats(region = '') {
+    const params = region ? `?region=${encodeURIComponent(region)}` : '';
+    return this.get(`/dashboard/gamemode-stats${params}`);
+  }
+
+  /**
+   * Check ban status for email before login
+   */
+  async checkBanStatus(email) {
+    return this.post('/auth/check-ban', { email });
+  }
+
+  /**
+   * Acknowledge a warning
+   */
+  async acknowledgeWarning(warningId) {
+    return this.post('/auth/acknowledge-warning', { warningId });
+  }
+
+  /**
+   * Get reported accounts
+   */
+  async getReportedAccounts() {
+    return this.get('/admin/alt-reports');
+  }
+
+  /**
+   * Search reported accounts
+   */
+  async searchReportedAccounts(searchTerm) {
+    return this.get(`/admin/alt-reports/search?q=${encodeURIComponent(searchTerm)}`);
+  }
+
+  /**
+   * Get security logs
+   */
+  async getSecurityLogs(limit = 100, severity = null, type = null, userId = null) {
+    let url = `/admin/security-logs?limit=${limit}`;
+    if (severity) url += `&severity=${encodeURIComponent(severity)}`;
+    if (type) url += `&type=${encodeURIComponent(type)}`;
+    if (userId) url += `&userId=${encodeURIComponent(userId)}`;
+    return this.get(url);
+  }
+
+  /**
+   * Move report to judgment day
+   */
+  async moveToJudgmentDay(reportId) {
+    return this.post(`/admin/alt-reports/${reportId}/judgment-day`);
+  }
+
+  /**
+   * Remove alt report
+   */
+  async removeAltReport(reportId) {
+    return this.delete(`/admin/alt-reports/${reportId}`);
+  }
+
+  /**
+   * Get judgment day accounts
+   */
+  async getJudgmentDayAccounts() {
+    return this.get('/admin/judgment-day');
+  }
+
+  /**
+   * Execute judgment day
+   */
+  async executeJudgmentDay() {
+    return this.post('/admin/judgment-day/execute');
+  }
+
+  /**
+   * Add to alt whitelist
+   */
+  async addToAltWhitelist(identifier, type = null) {
+    return this.post('/admin/alt-whitelist', { identifier, type });
+  }
+
+  /**
+   * Remove from alt whitelist
+   */
+  async removeFromAltWhitelist(firebaseUid) {
+    return this.delete(`/admin/alt-whitelist/${firebaseUid}`);
+  }
+
+  /**
+   * Get alt whitelist
+   */
+  async getAltWhitelist() {
+    return this.get('/admin/alt-whitelist');
+  }
+
+  /**
+   * Remove security log
+   */
+  async removeSecurityLog(logId) {
+    return this.delete(`/admin/security-logs/${logId}`);
+  }
+
+  /**
+   * Get admin matches with filters
+   */
+  async getAdminMatches(status = null, gamemode = null, search = null, limit = 100) {
+    let url = `/admin/matches?limit=${limit}`;
+    if (status) url += `&status=${encodeURIComponent(status)}`;
+    if (gamemode) url += `&gamemode=${encodeURIComponent(gamemode)}`;
+    if (search) url += `&search=${encodeURIComponent(search)}`;
+    return this.get(url);
+  }
+
+  /**
+   * Delete admin match
+   */
+  async deleteAdminMatch(matchId) {
+    return this.delete(`/admin/matches/${matchId}`);
+  }
+
+  /**
+   * Admin finalize match
+   */
+  async adminFinalizeMatch(matchId, playerScore, testerScore) {
+    return this.post(`/admin/matches/${matchId}/finalize`, { playerScore, testerScore });
+  }
+
+  /**
+   * Admin revert match rating changes
+   */
+  async revertAdminMatch(matchId) {
+    return this.post(`/admin/matches/${matchId}/revert`, {});
+  }
+
+  /**
+   * Send test notification
+   */
+  async sendTestNotification(type, message) {
+    return this.post('/notifications/test', { type, message });
+  }
+
+  /**
+   * Get recent notifications for current user
+   */
+  async getNotifications(limit = 20, unreadOnly = true) {
+    const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 20, 50));
+    try {
+      return await this.get(`/notifications?limit=${safeLimit}&unreadOnly=${unreadOnly ? 'true' : 'false'}`);
+    } catch (error) {
+      if (error?.status === 404 || error?.code === 'NOT_FOUND') {
+        return { success: true, notifications: [], total: 0, unavailable: true };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Mark notification as read
+   */
+  async markNotificationRead(notificationId) {
+    return this.post(`/notifications/${encodeURIComponent(notificationId)}/read`, {});
+  }
+
+  /**
+   * Delete delivered notification
+   */
+  async deleteNotification(notificationId) {
+    return this.delete(`/notifications/${encodeURIComponent(notificationId)}`);
+  }
+
+  /**
+   * Get dashboard statistics
+   */
+  async getDashboardStats() {
+    return this.get('/dashboard/stats');
+  }
+
+  // ===== Whitelisted Servers Endpoints =====
+
+  /**
+   * Get all whitelisted servers (public)
+   */
+  async getWhitelistedServers() {
+    return this.get('/whitelisted-servers');
+  }
+
+  /**
+   * Add a whitelisted server (admin only)
+   */
+  async addWhitelistedServer(name, ip) {
+    return this.post('/admin/whitelisted-servers', { name, ip });
+  }
+
+  /**
+   * Remove a whitelisted server (admin only)
+   */
+  async deleteWhitelistedServer(serverId) {
+    return this.delete(`/admin/whitelisted-servers/${serverId}`);
+  }
+
+  /**
+   * Submit a player report
+   */
+  async submitPlayerReport(reportData) {
+    return this.post('/submit-player-report', {
+      reportedPlayer: reportData.reportedPlayer,
+      reportedUUID: reportData.reportedUUID || '',
+      category: reportData.category,
+      matchId: reportData.matchId || '',
+      description: reportData.description,
+      evidenceLinks: Array.isArray(reportData.evidenceLinks) ? reportData.evidenceLinks : [],
+      hasEvidence: reportData.hasEvidence === true,
+      reportedAt: reportData.reportedAt
+    });
+  }
+
+  /**
+   * Get recent reports submitted by current user
+   */
+  async getMyPlayerReports(limit = 5, options = {}) {
+    const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 5, 500));
+    const status = options?.status ? String(options.status).toLowerCase() : 'all';
+    const includeConversation = options?.includeConversation === true;
+    return this.get(`/reports/my?limit=${safeLimit}&status=${encodeURIComponent(status)}&includeConversation=${includeConversation ? 'true' : 'false'}`);
+  }
+
+  /**
+   * Admin: Get no-show reports
+   */
+  async getNoshowReports(playerFilter, statusFilter) {
+    return this.get(`/admin/reports/noshow?player=${encodeURIComponent(playerFilter || '')}&status=${statusFilter || ''}`);
+  }
+
+  /**
+   * Admin: Get user reports
+   */
+  async getUserReports(playerFilter, categoryFilter, statusFilter) {
+    return this.get(`/admin/reports/user?player=${encodeURIComponent(playerFilter || '')}&category=${categoryFilter || ''}&status=${statusFilter || ''}`);
+  }
+
+  /**
+   * Admin: Get chat message reports
+   */
+  async getMessageReports(playerFilter, statusFilter) {
+    return this.get(`/admin/reports/messages?player=${encodeURIComponent(playerFilter || '')}&status=${statusFilter || ''}`);
+  }
+
+  /**
+   * Admin: Get user report details
+   */
+  async getUserReportDetails(reportId) {
+    return this.get(`/admin/reports/user/${reportId}`);
+  }
+
+  /**
+   * Admin: Resolve no-show report
+   */
+  async resolveNoshowReport(reportId, notes) {
+    return this.post(`/admin/reports/noshow/${reportId}/resolve`, { notes });
+  }
+
+  /**
+   * Admin: Resolve user report
+   */
+  async resolveUserReport(reportId, notes) {
+    return this.post(`/admin/reports/user/${reportId}/resolve`, { notes });
+  }
+
+  /**
+   * Admin: Whitelist account from security reports
+   */
+  async whitelistSecurityReports(userId) {
+    return this.post('/admin/security/whitelist', { userId });
+  }
+
+  /**
+   * Admin: Get security whitelist
+   */
+  async getSecurityWhitelist() {
+    return this.get('/admin/security/whitelist');
+  }
+
+  /**
+   * Admin: Remove from security whitelist
+   */
+  async removeSecurityWhitelist(accountId) {
+    return this.delete(`/admin/security/whitelist/${accountId}`);
+  }
+
+}
+
+// Create singleton instance
+const apiService = new ApiService();
+
+// Export for use in other scripts
+if (typeof window !== 'undefined') {
+  window.apiService = apiService;
+}

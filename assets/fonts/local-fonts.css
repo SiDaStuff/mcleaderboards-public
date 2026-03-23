@@ -1,0 +1,119 @@
+/* Local font declarations for Plus username styling.
+   Place the corresponding .woff2 files in subfolders next to this CSS:
+   - assets/fonts/inter/Inter-Regular.woff2, Inter-SemiBold.woff2, Inter-ExtraBold.woff2
+   - assets/fonts/poppins/Poppins-SemiBold.woff2
+   - assets/fonts/roboto-mono/RobotoMono-SemiBold.woff2
+   - assets/fonts/oswald/Oswald-SemiBold.woff2
+   - assets/fonts/montserrat/Montserrat-SemiBold.woff2
+   - assets/fonts/raleway/Raleway-SemiBold.woff2
+   - assets/fonts/lobster/Lobster-Regular.woff2
+   - assets/fonts/bebas-neue/BebasNeue-Regular.woff2
+   - assets/fonts/anton/Anton-Regular.woff2
+   - assets/fonts/archivo-black/ArchivoBlack-Regular.woff2
+*/
+
+/* Inter */
+@font-face {
+    font-family: 'Inter';
+    src: url('inter/Inter-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Inter';
+    src: url('inter/Inter-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Inter';
+    src: url('inter/Inter-ExtraBold.woff2') format('woff2');
+    font-weight: 800;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Poppins */
+@font-face {
+    font-family: 'Poppins';
+    src: url('poppins/Poppins-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Roboto Mono */
+@font-face {
+    font-family: 'Roboto Mono';
+    src: url('roboto-mono/RobotoMono-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Oswald */
+@font-face {
+    font-family: 'Oswald';
+    src: url('oswald/Oswald-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Montserrat */
+@font-face {
+    font-family: 'Montserrat';
+    src: url('montserrat/Montserrat-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Raleway */
+@font-face {
+    font-family: 'Raleway';
+    src: url('raleway/Raleway-SemiBold.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Lobster */
+@font-face {
+    font-family: 'Lobster';
+    src: url('lobster/Lobster-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Bebas Neue */
+@font-face {
+    font-family: 'Bebas Neue';
+    src: url('bebas-neue/BebasNeue-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Anton */
+@font-face {
+    font-family: 'Anton';
+    src: url('anton/Anton-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Archivo Black */
+@font-face {
+    font-family: 'Archivo Black';
+    src: url('archivo-black/ArchivoBlack-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+

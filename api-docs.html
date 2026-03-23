@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Documentation - MC Leaderboards</title>
+    <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
+
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="assets/fonts/local-fonts.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="js/loading-overlay.js"></script>
+
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container navbar-content">
+            <a href="index.html" class="navbar-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="navbar-logo"> MC Leaderboards
+                <span class="beta-badge">BETA</span>
+            </a>
+            <div class="navbar-search-wrapper">
+                <div class="navbar-search">
+                    <i class="fas fa-search navbar-search-icon"></i>
+                    <input type="text"
+                           class="navbar-search-input"
+                           id="searchInput"
+                           placeholder="Search player..."
+                           autocomplete="off">
+                </div>
+            </div>
+            <ul class="navbar-nav" id="navbarNav">
+                <li><a href="index.html">Leaderboards</a></li>
+                <li><a href="dashboard.html">Dashboard</a></li>
+                <li><a href="api-docs.html" class="active">API</a></li>
+                <li><a href="login.html" id="navLogin">Login</a></li>
+                <li><a href="#" id="navLogout" class="d-none" onclick="handleLogout()">Logout</a></li>
+            </ul>
+            <button class="hamburger" id="hamburgerBtn" onclick="toggleMobileMenu()">
+                <i class="fas fa-bars"></i>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="container" style="margin-top: 2rem; margin-bottom: 2rem;">
+        <!-- Page Header -->
+        <div class="page-header">
+            <h1 class="page-title">
+                <i class="fas fa-code"></i> Public API Documentation
+            </h1>
+            <p class="page-subtitle">Access leaderboard data programmatically</p>
+        </div>
+
+        <!-- API Base URL -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-globe"></i> Base URL
+                </h2>
+            </div>
+            <div class="card-body">
+                <code class="api-base-url">https://mcleaderboards.org/api</code>
+                <p class="mt-2 text-muted">All endpoints are relative to this base URL.</p>
+            </div>
+        </div>
+
+        <!-- Authentication -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-key"></i> Authentication
+                </h2>
+            </div>
+            <div class="card-body">
+                <p>Most endpoints require authentication. Include the Bearer token in the Authorization header:</p>
+                <pre><code>Authorization: Bearer YOUR_JWT_TOKEN</code></pre>
+                <p class="text-muted mt-2">Get your token by logging into your account and using the authentication endpoints.</p>
+            </div>
+        </div>
+
+        <!-- Endpoints -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-list"></i> Endpoints
+                </h2>
+            </div>
+            <div class="card-body">
+                <!-- Health Check -->
+                <div class="endpoint">
+                    <h4>GET /health</h4>
+                    <p>Check API availability</p>
+                    <div class="endpoint-details">
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "status": "ok",
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Players -->
+                <div class="endpoint">
+                    <h4>GET /players</h4>
+                    <p>Get players with pagination support (optimized for infinite scroll)</p>
+                    <div class="endpoint-details">
+                        <strong>Parameters:</strong>
+                        <ul>
+                            <li><code>gamemode</code> (optional): Filter by specific gamemode (vanilla, uhc, pot, nethop, smp, sword, axe, mace, overall)</li>
+                            <li><code>offset</code> (optional): Starting position for pagination (default: 0)</li>
+                            <li><code>limit</code> (optional): Number of players to return (default: 25, max: 100)</li>
+                        </ul>
+                        <strong>Examples:</strong>
+                        <pre><code>GET /api/players?gamemode=vanilla&offset=0&limit=25
+GET /api/players?offset=25&limit=25
+GET /api/players?gamemode=pot</code></pre>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "players": [
+    {
+      "id": "playerId",
+      "username": "PlayerName",
+      "overallRating": 1500,
+      "gamemodeRatings": {
+        "vanilla": 1600,
+        "uhc": 1400
+      },
+      "gamemodeMatchCount": {
+        "vanilla": 15,
+        "uhc": 8
+      },
+      "region": "NA",
+      "achievementTitles": {
+        "overall": {
+          "title": "Gold Fighter",
+          "icon": "assets/titles/gold.svg"
+        }
+      },
+      "verifiedRoles": {
+        "admin": false,
+        "tester": true
+      }
+    }
+  ],
+  "total": 150,
+  "limit": 25,
+  "offset": 0,
+  "hasMore": true,
+  "cached": false
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Single Player by ID -->
+                <div class="endpoint">
+                    <h4>GET /players/:id</h4>
+                    <p>Get detailed information about a specific player by their player ID</p>
+                    <div class="endpoint-details">
+                        <strong>Parameters:</strong>
+                        <ul>
+                            <li><code>id</code>: Player ID (Firebase player record ID)</li>
+                        </ul>
+                        <strong>Example:</strong>
+                        <pre><code>GET /api/players/playerId123</code></pre>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "id": "playerId123",
+  "username": "PlayerName",
+  "userId": "firebaseUserId",
+  "overallRating": 1500,
+  "gamemodeRatings": {
+    "vanilla": 1600,
+    "uhc": 1400
+  },
+  "gamemodeMatchCount": {
+    "vanilla": 15,
+    "uhc": 8
+  },
+  "glicko2Params": {
+    "vanilla": {
+      "rd": 50,
+      "volatility": 0.06
+    }
+  },
+  "region": "NA",
+  "createdAt": "2024-01-01T00:00:00.000Z"
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Player by Username -->
+                <div class="endpoint">
+                    <h4>GET /players/username/:username</h4>
+                    <p>Get player information by their Minecraft username (for TierTagger mod integration)</p>
+                    <div class="endpoint-details">
+                        <strong>Parameters:</strong>
+                        <ul>
+                            <li><code>username</code>: Minecraft username (case-sensitive)</li>
+                        </ul>
+                        <strong>Example:</strong>
+                        <pre><code>GET /api/players/username/PlayerName</code></pre>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "uuid": "minecraft-uuid-or-player-id",
+  "name": "PlayerName",
+  "rankings": {
+    "vanilla": {
+      "rating": 1600,
+      "peak_rating": 1720,
+      "games_played": 45
+    },
+    "uhc": {
+      "rating": 1400,
+      "peak_rating": 1450,
+      "games_played": 30
+    },
+    "sword": {
+      "rating": 1890,
+      "peak_rating": 1920,
+      "games_played": 67
+    }
+  },
+  "region": "NA",
+  "points": 0,
+  "overall": 0,
+  "badges": [],
+  "combat_master": false
+}</code></pre>
+                        <strong>Note:</strong> This endpoint is specifically designed for the TierTagger mod and returns data in a format compatible with the mod's expectations.
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Queue Status -->
+                <div class="endpoint">
+                    <h4>GET /queue/status</h4>
+                    <p>Get current user's queue status</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "inQueue": true,
+  "queueEntry": {
+    "gamemode": "vanilla",
+    "region": "NA",
+    "serverIP": "play.example.com",
+    "status": "waiting"
+  }
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Active Match -->
+                <div class="endpoint">
+                    <h4>GET /match/active</h4>
+                    <p>Get current user's active match</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "hasMatch": true,
+  "match": {
+    "matchId": "match123",
+    "gamemode": "vanilla",
+    "region": "NA",
+    "serverIP": "play.example.com",
+    "status": "active"
+  }
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get Match Details -->
+                <div class="endpoint">
+                    <h4>GET /match/:matchId</h4>
+                    <p>Get detailed match information</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Parameters:</strong>
+                        <ul>
+                            <li><code>matchId</code>: Match ID</li>
+                        </ul>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "matchId": "match123",
+  "playerId": "playerId",
+  "playerUsername": "Player1",
+  "testerId": "testerId",
+  "testerUsername": "Tester1",
+  "gamemode": "vanilla",
+  "region": "NA",
+  "serverIP": "play.example.com",
+  "status": "active",
+  "matchType": "regular",
+  "playerCurrentRating": 1500,
+  "testerCurrentRating": 1800,
+  "createdAt": "2024-01-01T00:00:00.000Z",
+  "finalized": false,
+  "pagestats": {
+    "playerJoined": true,
+    "testerJoined": true
+  },
+  "joinTimeout": {
+    "startedAt": "2024-01-01T00:00:00.000Z",
+    "timeoutMinutes": 3,
+    "expiresAt": "2024-01-01T00:03:00.000Z"
+  }
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Join Queue -->
+                <div class="endpoint">
+                    <h4>POST /queue/join</h4>
+                    <p>Join the matchmaking queue</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Body:</strong>
+                        <pre><code>{
+  "gamemode": "vanilla",
+  "region": "NA",
+  "serverIP": "play.example.com"
+}</code></pre>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "success": true,
+  "queueId": "queue123",
+  "queueEntry": { ... }
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Leave Queue -->
+                <div class="endpoint">
+                    <h4>POST /queue/leave</h4>
+                    <p>Leave the matchmaking queue</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "success": true,
+  "message": "Left queue successfully"
+}</code></pre>
+                    </div>
+                </div>
+
+                <hr>
+
+                <!-- Get User Profile -->
+                <div class="endpoint">
+                    <h4>GET /users/me</h4>
+                    <p>Get current user profile</p>
+                    <div class="endpoint-details">
+                        <strong>Auth Required:</strong> Yes
+                        <br>
+                        <strong>Response:</strong>
+                        <pre><code>{
+  "uid": "userId",
+  "email": "user@example.com",
+  "minecraftUsername": "PlayerName",
+  "totalPoints": 1500,
+  "gamemodeTiers": { ... },
+  "gamemodePoints": { ... }
+}</code></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Rate Limiting -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-clock"></i> Rate Limiting
+                </h2>
+            </div>
+            <div class="card-body">
+                <ul>
+                    <li><strong>100 requests per minute</strong> for general endpoints</li>
+                    <li><strong>5 requests per 15 minutes</strong> for authentication endpoints</li>
+                    <li><strong>30 requests per minute</strong> for queue operations</li>
+                </ul>
+                <p class="mt-2">Rate limits help ensure fair usage of the API and prevent abuse.</p>
+            </div>
+        </div>
+
+        <!-- Caching -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-database"></i> Caching
+                </h2>
+            </div>
+            <div class="card-body">
+                <p>The API uses intelligent caching to improve performance:</p>
+                <ul>
+                    <li><strong>Player data:</strong> Cached for 5 seconds</li>
+                    <li><strong>Dashboard stats:</strong> Cached for 5 seconds</li>
+                    <li><strong>Blacklist:</strong> Cached for 30 seconds</li>
+                </ul>
+                <p class="mt-2">Cached responses include a <code>"cached": true</code> field in the response.</p>
+            </div>
+        </div>
+
+        <!-- Pagination Best Practices -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-list-ol"></i> Pagination Best Practices
+                </h2>
+            </div>
+            <div class="card-body">
+                <p>When implementing pagination with the <code>/api/players</code> endpoint:</p>
+                <ul>
+                    <li>Start with <code>offset=0</code> and <code>limit=25</code></li>
+                    <li>Check the <code>hasMore</code> field to determine if more pages exist</li>
+                    <li>Increment <code>offset</code> by <code>limit</code> for each subsequent request</li>
+                    <li>Use the <code>total</code> field to display total player count</li>
+                    <li>Implement infinite scroll by loading more when user scrolls near bottom</li>
+                </ul>
+                <p class="mt-2"><strong>Example sequence:</strong></p>
+                <pre><code>1. GET /api/players?offset=0&limit=25
+2. GET /api/players?offset=25&limit=25
+3. GET /api/players?offset=50&limit=25
+...</code></pre>
+            </div>
+        </div>
+
+        <!-- Error Handling -->
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">
+                    <i class="fas fa-exclamation-triangle"></i> Error Handling
+                </h2>
+            </div>
+            <div class="card-body">
+                <p>All errors follow this format:</p>
+                <pre><code>{
+  "error": true,
+  "code": "ERROR_CODE",
+  "message": "Human readable error message"
+}</code></pre>
+                <p class="mt-2"><strong>Common HTTP Status Codes:</strong></p>
+                <ul>
+                    <li><code>200</code> - Success</li>
+                    <li><code>400</code> - Bad Request (validation error)</li>
+                    <li><code>401</code> - Unauthorized (invalid/missing token)</li>
+                    <li><code>403</code> - Forbidden (insufficient permissions)</li>
+                    <li><code>404</code> - Not Found</li>
+                    <li><code>429</code> - Too Many Requests (rate limited)</li>
+                    <li><code>500</code> - Internal Server Error</li>
+                </ul>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="footer-logo">
+                <span>MC Leaderboards</span>
+            </div>
+            <div class="footer-links">
+                <a href="/privacy-policy.html">Privacy Policy</a>
+                <a href="/terms-of-service.html">Terms of Service</a>
+                <a href="support.html">Support</a>
+                <a href="report.html">Report Player</a>
+                <a href="api-docs.html">API Docs</a>
+            </div>
+            <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <!-- Scripts -->
+    <script src="js/config.js"></script>
+    <script src="js/dev-mode-toggle.js"></script>
+    <script src="js/firebase-service.js"></script>
+    <script src="js/app-state.js"></script>
+    <script src="js/player-search.js"></script>
+    <script src="js/navigation.js"></script>
+    <script>
+        // Basic navigation setup
+        function toggleMobileMenu() {
+            const navbar = document.getElementById('navbarNav');
+            if (navbar) {
+                navbar.classList.toggle('mobile-menu-open');
+            }
+        }
+
+        // Update navigation based on auth status
+        async function updateNavigation() {
+            const isLoggedIn = localStorage.getItem('mc_leaderboards_token');
+            const navLogin = document.getElementById('navLogin');
+            const navLogout = document.getElementById('navLogout');
+
+            if (isLoggedIn) {
+                navLogin.classList.add('d-none');
+                navLogout.classList.remove('d-none');
+            } else {
+                navLogin.classList.remove('d-none');
+                navLogout.classList.add('d-none');
+            }
+        }
+
+        function handleLogout() {
+            localStorage.removeItem('mc_leaderboards_token');
+            window.location.href = 'login.html';
+        }
+
+        // Initialize
+        updateNavigation();
+    </script>
+</body>
+</html>
+
+

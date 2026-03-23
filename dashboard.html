@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - MC Leaderboards</title>
+    <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
+    
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="assets/fonts/local-fonts.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="js/loading-overlay.js"></script>
+    
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11" defer></script>
+
+    <style>
+        .dashboard-content {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+            margin-top: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .status-card {
+            background: var(--secondary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            transition: all 0.3s ease;
+        }
+
+        .status-card:hover {
+            border-color: var(--accent-color);
+            transform: translateY(-2px);
+        }
+
+        .status-card-icon {
+            width: 48px;
+            height: 48px;
+            background: rgba(92, 210, 169, 0.1);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            color: var(--accent-color);
+            margin-bottom: 0.5rem;
+        }
+
+        .status-card-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-card-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--text-color);
+        }
+
+        .status-card-subtitle {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: auto;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .badge-active {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success-color);
+        }
+
+        .badge-warning {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning-color);
+        }
+
+        .badge-critical {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+        }
+
+        .badge-inactive {
+            background: rgba(107, 114, 128, 0.15);
+            color: var(--text-muted);
+        }
+
+        .section-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+        }
+
+        .card {
+            border-radius: 14px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 1.5rem;
+            background: var(--secondary-bg);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-color);
+        }
+
+        .card-body {
+            padding: 1.5rem;
+        }
+
+        .info-banner {
+            background: linear-gradient(135deg, rgba(52, 152, 219, 0.1), rgba(155, 89, 182, 0.1));
+            border: 2px solid rgba(52, 152, 219, 0.3);
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .info-banner-icon {
+            flex-shrink: 0;
+            font-size: 1.25rem;
+            color: var(--accent-color);
+        }
+
+        .info-banner-text {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            font-size: 0.95rem;
+            color: var(--text-color);
+        }
+
+        .form-select,
+        .form-input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--primary-bg);
+            color: var(--text-color);
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+        }
+
+        .form-select:focus,
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 3px rgba(92, 210, 169, 0.1);
+        }
+
+        .form-help {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .gamemode-choice-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.5rem;
+        }
+
+        .gamemode-choice {
+            display: block;
+            cursor: pointer;
+        }
+
+        .gamemode-choice input {
+            position: absolute;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .gamemode-choice-content {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.6rem 0.7rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--primary-bg);
+            transition: all 0.2s ease;
+            min-height: 44px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .gamemode-choice input:checked + .gamemode-choice-content {
+            border-color: var(--accent-color);
+            background: rgba(92, 210, 169, 0.12);
+            box-shadow: 0 0 0 2px rgba(92, 210, 169, 0.15);
+        }
+
+        .gamemode-choice-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            object-fit: cover;
+            flex-shrink: 0;
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--accent-color);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #4ab897;
+            transform: translateY(-2px);
+        }
+
+        .btn-success {
+            background: var(--success-color);
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: var(--secondary-bg);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border-color);
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(92, 210, 169, 0.2);
+            border-radius: 50%;
+            border-top-color: var(--accent-color);
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .alert {
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .alert-info {
+            background: rgba(52, 152, 219, 0.1);
+            border: 1px solid rgba(52, 152, 219, 0.3);
+            color: #3498db;
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--success-color);
+        }
+
+        .alert-warning {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: var(--warning-color);
+        }
+
+        .alert-danger {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .col-6 {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .text-muted {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        .mb-0 { margin-bottom: 0; }
+        .mb-1 { margin-bottom: 0.5rem; }
+        .mb-2 { margin-bottom: 1rem; }
+        .mb-3 { margin-bottom: 1.5rem; }
+        .mb-4 { margin-bottom: 2rem; }
+        .mt-2 { margin-top: 1rem; }
+        .mt-3 { margin-top: 1.5rem; }
+
+        .h5 {
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+
+        .progress {
+            width: 100%;
+            height: 6px;
+            background: var(--secondary-bg);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: var(--accent-color);
+            animation: progress 2s ease;
+        }
+
+        @keyframes progress {
+            0% { width: 0; }
+        }
+
+        @media (max-width: 992px) {
+            .status-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .status-card {
+                flex-direction: row;
+                align-items: center;
+                gap: 1rem;
+            }
+
+            .status-card-value {
+                font-size: 1.5rem;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .dashboard-content {
+                grid-template-columns: 1fr;
+                gap: 1rem;
+                margin-top: 1rem;
+                margin-bottom: 1rem;
+            }
+
+            .status-grid {
+                gap: 1rem;
+            }
+
+            .form-group {
+                margin-bottom: 0.75rem;
+            }
+
+            .btn {
+                padding: 0.65rem 1.25rem;
+                font-size: 0.95rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container navbar-content">
+            <a href="index.html" class="navbar-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="navbar-logo"> MC Leaderboards
+                <span class="beta-badge">BETA</span>
+            </a>
+            <div class="navbar-search-wrapper">
+                <div class="navbar-search">
+                    <i class="fas fa-search navbar-search-icon"></i>
+                    <input type="text"
+                           class="navbar-search-input"
+                           id="searchInput"
+                           placeholder="Search player..."
+                           autocomplete="off">
+                </div>
+            </div>
+            <ul class="navbar-nav" id="navbarNav">
+                <li><a href="index.html">Leaderboards</a></li>
+                <li><a href="dashboard.html" class="active">Dashboard</a></li>
+                <li><a href="account.html">Account</a></li>
+                <li><a href="admin.html" id="navAdmin" class="d-none">Admin</a></li>
+                <li><a href="#" id="navLogout" onclick="handleLogout()">Logout</a></li>
+            </ul>
+            <button class="hamburger" id="hamburgerBtn" onclick="toggleMobileMenu()">
+                <i class="fas fa-bars"></i>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="container dashboard-content">
+        <!-- Page Header -->
+        <div class="page-header">
+            <h1 class="page-title">
+                <i class="fas fa-tachometer-alt" style="margin-right: 0.5rem; color: var(--accent-color);"></i>
+                Dashboard
+            </h1>
+            <p class="page-subtitle">Your central hub for competitive Minecraft PvP testing</p>
+        </div>
+
+        <!-- Status Cards Row -->
+        <div class="status-grid" id="statusCardsGrid">
+            <!-- Account Status Card -->
+            <div class="status-card">
+                <div class="status-card-icon">
+                    <i class="fas fa-user-circle"></i>
+                </div>
+                <div class="status-card-title">Account Status</div>
+                <div class="status-card-value" id="userStatusValue">-</div>
+                <div class="status-card-subtitle" id="userStatusSubtitle">Loading profile...</div>
+            </div>
+
+            <!-- Tier Tester Card -->
+            <div class="status-card" id="testerStatusCard">
+                <div class="status-card-icon">
+                    <i class="fas fa-shield-alt"></i>
+                </div>
+                <div class="status-card-title" id="testerCardTitle">Tier Tester Status</div>
+                <div id="testerCardContent" style="margin-top: 0.75rem; font-size: 0.9rem;">
+                    <div class="status-card-subtitle">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Plus Subscription Card -->
+            <div class="status-card" id="plusStatusCard">
+                <div class="status-card-icon">
+                    <i class="fas fa-crown"></i>
+                </div>
+                <div class="status-card-title" id="plusCardTitle">Plus Subscription</div>
+                <div id="plusCardContent" style="margin-top: 0.75rem; font-size: 0.9rem;">
+                    <div class="status-card-subtitle">Loading...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Queue Stats -->
+        <div class="section-grid">
+            <!-- Join Queue Card -->
+            <div class="card">
+                <div class="card-header" style="background: linear-gradient(135deg, var(--accent-color), var(--primary-color)); color: white; border: none;">
+                    <h2 class="card-title" style="color: white;">
+                        <i class="fas fa-play-circle"></i> Join Competitive Queue
+                    </h2>
+                </div>
+                <div class="card-body">
+                    <p style="color: var(--text-muted); margin-bottom: 1rem;">Get matched with a tier tester and prove your skills</p>
+                    <div class="alert alert-info" style="margin-bottom: 1rem;">
+                        <i class="fas fa-route"></i>
+                        <div>
+                            <strong>Queue flow:</strong> Choose gamemode and region, pick a whitelisted server, then join queue.
+                        </div>
+                    </div>
+                    
+                    <form id="queueForm" onsubmit="handleJoinQueue(event)">
+                        <div class="row">
+                            <div class="form-group">
+                                <label class="form-label" for="gamemode">
+                                    <i class="fas fa-gamepad" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Gamemode
+                                </label>
+                                <input type="hidden" id="gamemode" required>
+                                <div id="queueGamemodeSelections" class="gamemode-choice-grid"></div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="region">
+                                    <i class="fas fa-globe-americas" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Region
+                                </label>
+                                <select class="form-select" id="region" required>
+                                    <option value="">Select your region...</option>
+                                    <option value="NA">North America</option>
+                                    <option value="EU">Europe</option>
+                                    <option value="AS">Asia</option>
+                                    <option value="SA">South America</option>
+                                    <option value="AU">Australia</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label" for="serverIP">
+                                <i class="fas fa-server" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Server IP
+                            </label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="text" 
+                                       class="form-input" 
+                                       id="serverIP" 
+                                       required 
+                                       placeholder="play.example.com">
+                                <button type="button" 
+                                        class="btn btn-secondary" 
+                                        onclick="showServerSelectionPopup()"
+                                        style="white-space: nowrap;">
+                                    <i class="fas fa-list"></i> Browse
+                                </button>
+                            </div>
+                            <div class="form-help">
+                                <i class="fas fa-info-circle"></i>
+                                Enter a server IP or click "Browse" to choose from approved servers
+                            </div>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary" style="width: 100%; padding: 1rem; font-size: 1.1rem;" id="joinQueueBtn">
+                            <i class="fas fa-play-circle"></i> Join Queue Now
+                        </button>
+                        <div style="text-align: center; margin-top: 0.75rem; font-size: 0.9rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.25rem; align-items: center;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <i class="fas fa-clock"></i> 
+                                <span>Average wait time: 2-5 minutes</span>
+                            </div>
+                        </div>
+                    </form>
+
+                    <!-- Queue Cooldowns -->
+                    <div style="margin-top: 1rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary btn-sm" id="loadQueueCooldownsBtn" onclick="loadQueueCooldownsOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
+                            <i class="fas fa-clock"></i> Load Queue Cooldowns
+                        </button>
+                        <span class="text-muted" style="font-size: 0.85rem;">Optional, loads on demand</span>
+                    </div>
+                    <div id="queueCooldowns" style="margin-top: 1rem;"></div>
+
+                    <!-- Queue Status -->
+                    <div id="queueStatus" style="display: none; margin-top: 1rem;">
+                        <div class="alert alert-info">
+                            <div style="flex: 1;">
+                                <div style="font-weight: 600; margin-bottom: 0.5rem;" id="queueStatusText">Waiting for Tier Tester</div>
+                                <div class="text-muted" id="queueWaitingTime">Just joined queue</div>
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; margin-bottom: 1rem;">
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Gamemode</div>
+                                <div class="h5 mb-0" id="queueGamemode">-</div>
+                            </div>
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Region</div>
+                                <div class="h5 mb-0" id="queueRegion">-</div>
+                            </div>
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Players in Queue</div>
+                                <div class="h5 mb-0" id="queuePlayersCount">-</div>
+                            </div>
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Available Testers</div>
+                                <div class="h5 mb-0" id="queueAvailableTesters">-</div>
+                            </div>
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Your Position</div>
+                                <div class="h5 mb-0" id="queuePosition">-</div>
+                            </div>
+                            <div class="status-card" style="padding: 0.75rem;">
+                                <div class="text-muted">Estimated Wait</div>
+                                <div class="h5 mb-0" id="queueEta">Calculating...</div>
+                            </div>
+                        </div>
+                        <button class="btn btn-danger" style="width: 100%;" onclick="handleLeaveQueue()">
+                            <i class="fas fa-times"></i> Leave Queue
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tier Tester Interface -->
+            <div class="card" id="testerCard" style="display: none;">
+                <div class="card-header" style="background: linear-gradient(135deg, var(--success-color), #27ae60); color: white; border: none;">
+                    <h2 class="card-title" style="color: white;">
+                        <i class="fas fa-user-shield"></i> Tier Tester Dashboard
+                    </h2>
+                </div>
+                <div class="card-body">
+                    <p style="color: var(--text-muted); margin-bottom: 1rem;">Set your availability and start testing players</p>
+
+                    <div class="info-banner">
+                        <div class="info-banner-icon">
+                            <i class="fas fa-lightbulb"></i>
+                        </div>
+                        <div class="info-banner-text">
+                            <strong>Tip:</strong> Select one or more gamemodes and regions, then click "Set Available" to start matching with players. You'll be notified when a match is found!
+                        </div>
+                    </div>
+
+                    <!-- Current Status -->
+                    <div id="currentAvailabilityStatus" style="display: none; margin-bottom: 1rem;">
+                        <div class="alert alert-success">
+                            <i class="fas fa-check-circle"></i>
+                            <span id="availabilityStatusText">Currently Available</span>
+                        </div>
+                    </div>
+
+                    <!-- Selection -->
+                    <div class="row">
+                        <div>
+                            <div class="form-group">
+                                <label class="form-label">Gamemodes</label>
+                                <div id="testerGamemodeSelections" class="gamemode-choice-grid"></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="form-group">
+                                <label class="form-label">Regions</label>
+                                <div id="testerRegionSelections" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.5rem;">
+                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="NA"> NA</label>
+                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="EU"> EU</label>
+                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="AS"> AS</label>
+                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="SA"> SA</label>
+                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="AU"> AU</label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Stay in Queue Toggle -->
+                    <div class="form-group" style="margin-top: 1rem;">
+                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                            <span>Stay in queue after match</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="stayInQueueAfterMatch">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </label>
+                        <div class="form-help">When enabled, you'll remain available for testing after each match ends</div>
+                    </div>
+
+                    <!-- Action Button -->
+                    <div id="testerStatus" style="margin-top: 1.5rem;">
+                        <button class="btn btn-success" style="width: 100%; padding: 1rem;" onclick="handleSetAvailable()" id="setAvailableBtn">
+                            <i class="fas fa-check"></i> Set Available
+                        </button>
+                    </div>
+                    <div style="margin-top: 1rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary btn-sm" id="loadTesterReputationBtn" onclick="loadTesterReputationOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
+                            <i class="fas fa-star"></i> Load Reputation
+                        </button>
+                        <span class="text-muted" style="font-size: 0.85rem;">Optional, loads on demand</span>
+                    </div>
+                    <div id="testerReputationCard" class="alert alert-info" style="margin-top: 1rem; display: none;">
+                        <div style="width: 100%;">
+                            <div style="font-weight: 700; margin-bottom: 0.5rem;">
+                                <i class="fas fa-star"></i> Tester Reputation
+                            </div>
+                            <div class="row">
+                                <div class="col-6">
+                                    <div class="text-muted">On-time Rate</div>
+                                    <div id="testerOnTimeRate" class="h5 mb-0">-</div>
+                                </div>
+                                <div class="col-6">
+                                    <div class="text-muted">No-show Rate</div>
+                                    <div id="testerNoShowRate" class="h5 mb-0">-</div>
+                                </div>
+                                <div class="col-6">
+                                    <div class="text-muted">Avg Completion</div>
+                                    <div id="testerAvgCompletion" class="h5 mb-0">-</div>
+                                </div>
+                                <div class="col-6">
+                                    <div class="text-muted">Evaluated Matches</div>
+                                    <div id="testerMatchCount" class="h5 mb-0">-</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Gamemode Activity Stats -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title" style="flex: 1;">
+                        <i class="fas fa-chart-bar"></i> Gamemode Activity
+                    </h2>
+                    <button type="button" class="btn btn-secondary btn-sm" id="loadGamemodeActivityBtn" onclick="loadGamemodeActivityOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                    <select class="form-select" id="regionFilter" style="width: auto; min-width: 150px;" onchange="handleRegionFilterChange()">
+                        <option value="">All Regions</option>
+                        <option value="NA">NA</option>
+                        <option value="EU">EU</option>
+                        <option value="AS">AS</option>
+                        <option value="SA">SA</option>
+                        <option value="AU">AU</option>
+                    </select>
+                    <small id="gamemodeStatsUpdated" class="text-muted" style="margin-left: 1rem;"></small>
+                </div>
+                <div class="card-body">
+                    <div id="gamemodeStatsList">
+                        <div class="spinner"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Notification Settings -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">
+                        <i class="fas fa-bell"></i> Notification Settings
+                    </h2>
+                    <button type="button" class="btn btn-secondary btn-sm" id="loadNotificationSettingsBtn" onclick="loadNotificationSettingsOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
+                        <i class="fas fa-download"></i> Load
+                    </button>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted mb-3">Configure when you want to receive notifications about matches and tester availability.</p>
+                    
+                    <div class="form-group">
+                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                            Notify when put in a match
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="notifyMatchCreated">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                            Notify when match is finalized
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="notifyMatchFinalized">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
+                            Notify when a tester is available (selected gamemodes)
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="notifyTesterAvailable">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </label>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                        <button class="btn btn-primary btn-sm" id="configureTesterNotificationsBtn" onclick="openTesterAvailabilitySettings()" style="padding: 0.5rem 1rem; font-size: 0.9rem;" disabled>
+                            <i class="fas fa-cog"></i> Configure Tester Notifications
+                        </button>
+                        <button class="btn btn-secondary btn-sm" id="saveNotificationSettingsBtn" onclick="saveNotificationSettings()" style="padding: 0.5rem 1rem; font-size: 0.9rem;" disabled>
+                            <i class="fas fa-save"></i> Save Settings
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Matches -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">
+                        <i class="fas fa-history"></i> Recent Matches
+                    </h2>
+                    <button type="button" class="btn btn-secondary btn-sm" id="loadRecentMatchesBtn" onclick="loadRecentMatchesOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
+                        <i class="fas fa-download"></i> Load
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div id="recentMatchesContainer">
+                        <div class="text-muted">Click <strong>Load</strong> to fetch recent matches.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Active Match -->
+            <div class="card" id="activeMatchCard" style="display: none;">
+                <div class="card-header">
+                    <h2 class="card-title">
+                        <i class="fas fa-gamepad"></i> Active Match
+                    </h2>
+                </div>
+                <div class="card-body">
+                    <div id="activeMatchInfo"></div>
+                    <button class="btn btn-primary" style="width: 100%; margin-top: 1rem; padding: 1rem;" onclick="openTestingPage()">
+                        <i class="fas fa-external-link-alt"></i> Open Testing Page
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-brand">
+                <img src="assets/vanilla.svg" alt="MC Leaderboards" class="footer-logo">
+                <span>MC Leaderboards</span>
+            </div>
+            <div class="footer-links">
+                <a href="rules.html">Rules</a>
+                <a href="/privacy-policy.html">Privacy Policy</a>
+                <a href="/terms-of-service.html">Terms of Service</a>
+                <a href="support.html">Support</a>
+                <a href="report.html">Report Player</a>
+                <a href="api-docs.html">API Docs</a>
+            </div>
+            <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <!-- Scripts -->
+    <script src="js/config.js" defer></script>
+    <script src="js/dev-mode-toggle.js" defer></script>
+    <script src="js/utils.js" defer></script>
+    <script src="js/firebase-service.js" defer></script>
+    <script src="js/app-state.js" defer></script>
+    <script src="js/api-service.js" defer></script>
+    <script src="js/global-error-handler.js" defer></script>
+    <script src="js/player-search.js" defer></script>
+    <script src="js/firebase-auth-service.js" defer></script>
+    <script src="js/auth-guard.js" defer></script>
+    <script src="js/navigation.js" defer></script>
+    <script src="js/dashboard.js?v=20260309" defer></script>
+
+    <script>
+        // Helper functions for status displays
+        function calculateTesterTenure(approvedAtDate) {
+            if (!approvedAtDate) return 'Calculating...';
+            
+            const approvedAt = new Date(approvedAtDate);
+            const now = new Date();
+            const diffMs = now - approvedAt;
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            const diffMonths = Math.floor(diffDays / 30);
+            const residualDays = diffDays % 30;
+
+            if (diffMonths === 0) {
+                return `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
+            } else {
+                return `${diffMonths} month${diffMonths !== 1 ? 's' : ''} and ${residualDays} day${residualDays !== 1 ? 's' : ''}`;
+            }
+        }
+
+        function getPlusExpiryStatus(expiresAtDate) {
+            if (!expiresAtDate) {
+                return {
+                    daysRemaining: 0,
+                    isExpired: true,
+                    isCritical: false,
+                    formattedDate: 'N/A'
+                };
+            }
+
+            const expiresAt = new Date(expiresAtDate);
+            const now = new Date();
+            const diffMs = expiresAt - now;
+            const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+
+            return {
+                daysRemaining: diffDays,
+                isExpired: diffDays <= 0,
+                isCritical: diffDays <= 7 && diffDays > 0,
+                formattedDate: expiresAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+            };
+        }
+
+        function renderStatusCards() {
+            const profile = AppState.userProfile;
+            if (!profile) return;
+
+            // Update user status
+            const userStatusValue = document.getElementById('userStatusValue');
+            const userStatusSubtitle = document.getElementById('userStatusSubtitle');
+            if (userStatusValue && userStatusSubtitle) {
+                userStatusValue.textContent = profile.minecraftUsername || profile.email || 'Player';
+                userStatusSubtitle.textContent = profile.createdAt 
+                    ? `Joined ${new Date(profile.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short' })}`
+                    : 'Active';
+            }
+
+            // Update tier tester status (always shown)
+            const testerCardContent = document.getElementById('testerCardContent');
+            if (profile.tester && profile.testerApprovedAt) {
+                // User is an approved tier tester
+                document.getElementById('testerCardTitle').textContent = 'Tier Tester - Active';
+                testerCardContent.innerHTML = `
+                    <div class="status-badge badge-active" style="display: inline-block; margin-bottom: 0.5rem;">Approved</div>
+                    <div style="color: #d1d5db; margin-bottom: 0.5rem;">
+                        Tenure: <strong style="color: white;">${calculateTesterTenure(profile.testerApprovedAt)}</strong>
+                    </div>
+                    <button type="button" onclick="scrollToTesterDashboard()" class="btn btn-primary" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
+                        <i class="fas fa-user-shield"></i> Tester Dashboard
+                    </button>
+                `;
+            } else if (profile.pendingTesterApplication === true) {
+                // Application is pending
+                const lastApplicationDate = profile.lastApplicationSubmitted ? new Date(profile.lastApplicationSubmitted).toLocaleDateString() : '-';
+                document.getElementById('testerCardTitle').textContent = 'Tier Tester - Pending';
+                testerCardContent.innerHTML = `
+                    <div class="status-badge badge-warning" style="display: inline-block; margin-bottom: 0.5rem;">Pending Review</div>
+                    <div style="color: #d1d5db; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                        Your application is under review by admins. This typically takes 3-7 days.
+                    </div>
+                    <div style="color: #9ca3af; font-size: 0.75rem;">Submitted: ${lastApplicationDate}</div>
+                `;
+            } else if (profile.testerApplicationDenied === true) {
+                // Application was denied
+                document.getElementById('testerCardTitle').textContent = 'Tier Tester - Denied';
+                testerCardContent.innerHTML = `
+                    <div class="status-badge badge-critical" style="display: inline-block; margin-bottom: 0.5rem;">Denied</div>
+                    <div style="color: #d1d5db; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                        ${profile.testerDenialReason || 'Application did not meet requirements.'}
+                    </div>
+                    <a href="tier-tester-application.html" class="btn btn-secondary" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
+                        <i class="fas fa-reload"></i> Apply Again
+                    </a>
+                `;
+            } else {
+                // Not a tier tester and no application
+                document.getElementById('testerCardTitle').textContent = 'Become a Tier Tester';
+                testerCardContent.innerHTML = `
+                    <div style="color: #d1d5db; font-size: 0.85rem; margin-bottom: 0.75rem;">
+                        Help evaluate players and earn exclusive perks!
+                    </div>
+                    <a href="tier-tester-application.html" class="btn btn-success" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
+                        <i class="fas fa-clipboard-check"></i> Apply Now
+                    </a>
+                `;
+            }
+
+            // Update Plus status (always shown)
+            const plusCardContent = document.getElementById('plusCardContent');
+            const plus = profile.plus || {};
+            
+            if (plus.active && plus.expiresAt) {
+                // User has Plus
+                const expiryStatus = getPlusExpiryStatus(plus.expiresAt);
+                let badgeClass = 'badge-active';
+                let statusText = 'Active';
+                
+                if (expiryStatus.isCritical) {
+                    badgeClass = 'badge-critical';
+                    statusText = 'Expiring Soon';
+                }
+
+                document.getElementById('plusCardTitle').textContent = 'Plus - Active';
+                plusCardContent.innerHTML = `
+                    <div class="status-badge ${badgeClass}" style="display: inline-block; margin-bottom: 0.5rem;">${statusText}</div>
+                    <div style="color: #d1d5db; font-size: 0.85rem; margin-bottom: 0.5rem;">
+                        Expires ${expiryStatus.formattedDate}<br>
+                        <strong style="color: white;">${expiryStatus.daysRemaining} days remaining</strong>
+                    </div>
+                    <a href="dashboard.html" class="btn btn-primary" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
+                        <i class="fas fa-star"></i> Enjoy Plus
+                    </a>
+                `;
+            } else if (plus.blocked) {
+                // Plus is blocked
+                document.getElementById('plusCardTitle').textContent = 'Plus - Blocked';
+                plusCardContent.innerHTML = `
+                    <div style="color: #ef4444; font-size: 0.85rem;">
+                        Plus is blocked for your account. Contact support for details.
+                    </div>
+                `;
+            } else {
+                // No Plus membership
+                document.getElementById('plusCardTitle').textContent = 'Upgrade to Plus';
+                plusCardContent.innerHTML = `
+                    <div style="color: #d1d5db; font-size: 0.85rem; margin-bottom: 0.75rem;">
+                        Get priority queue, custom badges, and exclusive features!
+                    </div>
+                    <a href="plus.html" class="btn btn-primary" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
+                        <i class="fas fa-star"></i> View Plus
+                    </a>
+                `;
+            }
+        }
+
+        // Initialize dashboard
+        window.addEventListener('DOMContentLoaded', async function() {
+            // Wait for Firebase to initialize first
+            const waitForFirebase = () => {
+                return new Promise((resolve) => {
+                    if (typeof waitForFirebaseInit === 'function') {
+                        waitForFirebaseInit().then(resolve);
+                    } else {
+                        const checkInterval = setInterval(() => {
+                            if (typeof waitForFirebaseInit === 'function') {
+                                clearInterval(checkInterval);
+                                waitForFirebaseInit().then(resolve);
+                            }
+                        }, 50);
+                    }
+                });
+            };
+
+            // Wait for requireAuth to be available
+            const waitForAuth = () => {
+                return new Promise((resolve) => {
+                    if (typeof requireAuth === 'function') {
+                        resolve();
+                    } else {
+                        const checkInterval = setInterval(() => {
+                            if (typeof requireAuth === 'function') {
+                                clearInterval(checkInterval);
+                                resolve();
+                            }
+                        }, 50);
+                    }
+                });
+            };
+
+            // Wait for Firebase to initialize
+            await waitForFirebase();
+            
+            // Then wait for auth guard
+            await waitForAuth();
+            
+            // Now authenticate
+            const authenticated = await requireAuth();
+            if (!authenticated) return; // Redirected to login
+
+            // Listen for profile updates to update status cards
+            const originalUpdateProfile = AppState.setUserProfile;
+            AppState.setUserProfile = function(profile) {
+                originalUpdateProfile.call(this, profile);
+                renderStatusCards();
+            };
+
+            // Initialize dashboard after authentication
+            if (typeof initDashboard === 'function') {
+                initDashboard();
+                
+                // Initial render of status cards
+                setTimeout(() => {
+                    renderStatusCards();
+                }, 500);
+            }
+        });
+    </script>
+</body>
+</html>
+
+

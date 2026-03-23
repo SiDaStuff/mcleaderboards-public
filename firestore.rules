@@ -1,0 +1,48 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ────────────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.admin == true ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminRole') != null);
+    }
+
+    function isTester() {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.tester == true;
+    }
+
+    // ─── securityScores ─────────────────────────────────────────────────────
+    // Each document is keyed by userId.
+    // Players can read their own score; admins can read/write all.
+    // Only the backend service account can write (enforced via Admin SDK bypass).
+    match /securityScores/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow write: if false; // Backend Admin SDK only
+    }
+
+    // ─── matchMetrics ────────────────────────────────────────────────────────
+    // Immutable match duration/score snapshots used for security analysis.
+    // Only admins can read; backend writes only.
+    match /matchMetrics/{matchId} {
+      allow read: if isAdmin();
+      allow write: if false; // Backend Admin SDK only
+    }
+
+    // ─── Deny everything else ───────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

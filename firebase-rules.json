@@ -1,0 +1,119 @@
+{
+  "rules": {
+    "tempUnblocks": {
+      ".read": "auth != null",
+      ".write": false
+    },
+    "users": {
+      ".indexOn": ["email"],
+      "$userId": {
+        ".read": "$userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null",
+        ".write": false,
+        "warnings": {
+          ".read": "$userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null",
+          ".write": "root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null"
+        }
+      }
+    },
+    "players": {
+      ".read": true,
+      ".write": false,
+      ".indexOn": ["username", "userId"]
+    },
+    "securityLogs": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".write": false,
+      ".indexOn": ["userId", "timestamp"]
+    },
+    "altReports": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".write": false,
+      ".indexOn": ["groupId", "createdAt"]
+    },
+    "queue": {
+      ".read": false,
+      ".write": false,
+      ".indexOn": ["gamemode", "userId", "region", "joinedAt"],
+      "$queueId": {
+        ".read": "auth != null && (data.child('userId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".write": false
+      }
+    },
+    "matches": {
+      ".read": false,
+      ".write": false,
+      ".indexOn": ["status", "playerId", "testerId", "createdAt"],
+      "$matchId": {
+        ".read": "auth != null && (data.child('playerId').val() === auth.uid || data.child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        "chat": {
+          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          "$messageId": {
+            ".write": false,
+            ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)"
+          }
+        },
+        "presence": {
+          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          "$userId": {
+            ".write": false
+          }
+        },
+        "pagestats": {
+          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          ".write": false
+        },
+        "participants": {
+          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          "$userId": {
+            ".write": false
+          }
+        }
+      }
+    },
+    "testerAvailability": {
+      ".read": false,
+      "$userId": {
+        ".read": "auth != null && (auth.uid === $userId || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".write": false
+      }
+    },
+    "adminAuditLog": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".write": false,
+      ".indexOn": ["timestamp", "adminUid", "action", "adminId"]
+    },
+    "adminNotes": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".write": false,
+      ".indexOn": ["timestamp"]
+    },
+    "blacklist": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null || root.child('users').child(auth.uid).child('tester').val() === true)",
+      ".write": false
+    },
+    "playerReports": {
+      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".write": false,
+      ".indexOn": ["reporterId", "createdAt", "status"]
+    },
+    "playerReportsByUser": {
+      ".read": false,
+      ".write": false,
+      "$userId": {
+        ".read": "auth != null && ($userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".write": false,
+        ".indexOn": ["createdAt"]
+      }
+    },
+    "applications": {
+      ".read": false,
+      ".write": false
+    },
+    "news": {
+      ".read": true,
+      ".write": false,
+      ".indexOn": ["createdAt"]
+    }
+  }
+}
+
