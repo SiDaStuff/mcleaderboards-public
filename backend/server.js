@@ -151,6 +151,265 @@ async function fsRead(docPath) {
   }
 }
 
+async function readStoredSecurityScore(userId) {
+  if (!userId) return null;
+
+  const firestoreScore = await fsRead(`securityScores/${userId}`);
+  if (firestoreScore) {
+    return firestoreScore;
+  }
+
+  try {
+    const snapshot = await db.ref(`securityScores/${userId}`).once('value');
+    return snapshot.val() || null;
+  } catch (err) {
+    logger.error('RTDB security score read failed', { userId, error: err });
+    return null;
+  }
+}
+
+async function writeStoredSecurityScore(userId, scoreData) {
+  if (!userId || !scoreData) return false;
+
+  const safeScoreData = sanitizeFirebaseValue(scoreData);
+  const writes = [
+    db.ref(`securityScores/${userId}`).set(safeScoreData)
+  ];
+
+  if (fsdb) {
+    writes.push(fsWrite(`securityScores/${userId}`, safeScoreData, false));
+  }
+
+  const results = await Promise.allSettled(writes);
+  return results.some((result) => result.status === 'fulfilled' && result.value !== false);
+}
+
+async function listStoredSecurityScores({ limit = 50, riskLevel = null, startAfter = null } = {}) {
+  try {
+    const snapshot = await db.ref('securityScores').once('value');
+    const scoreMap = snapshot.val() || {};
+    let scores = Object.entries(scoreMap).map(([userId, score]) => ({
+      userId,
+      ...(score || {})
+    }));
+
+    if (riskLevel) {
+      scores = scores.filter((score) => score?.riskLevel === riskLevel);
+    }
+
+    scores.sort((a, b) => {
+      const scoreDiff = Number(b?.score || 0) - Number(a?.score || 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      return new Date(b?.lastComputed || 0).getTime() - new Date(a?.lastComputed || 0).getTime();
+    });
+
+    if (Number.isFinite(startAfter)) {
+      scores = scores.filter((score) => Number(score?.score || 0) < startAfter);
+    }
+
+    return scores.slice(0, limit);
+  } catch (err) {
+    logger.error('RTDB security score list failed', { error: err });
+    return [];
+  }
+}
+
+const RTDB_BACKUP_COLLECTION = 'realtimeDatabaseBackups';
+const RTDB_BACKUP_CHUNK_SIZE = 900000;
+
+function normalizeMinecraftUUID(uuid) {
+  const normalized = String(uuid || '').trim().replace(/-/g, '').toLowerCase();
+  return /^[0-9a-f]{32}$/.test(normalized) ? normalized : null;
+}
+
+function fetchJsonOverHttps(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (response) => {
+      let data = '';
+
+      response.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      response.on('end', () => {
+        resolve({ statusCode: response.statusCode || 0, body: data });
+      });
+    }).on('error', reject);
+  });
+}
+
+async function fetchMojangProfile(username) {
+  const trimmedUsername = String(username || '').trim();
+  if (!trimmedUsername) return null;
+
+  const mojangApiUrl = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(trimmedUsername)}`;
+  const response = await fetchJsonOverHttps(mojangApiUrl);
+
+  if (response.statusCode === 204 || response.statusCode === 404) {
+    return null;
+  }
+
+  if (response.statusCode !== 200) {
+    throw new Error(`Mojang API returned status ${response.statusCode}`);
+  }
+
+  const profile = JSON.parse(response.body || '{}');
+  const uuid = normalizeMinecraftUUID(profile.id);
+  if (!profile.name || !uuid) {
+    throw new Error('Invalid Mojang API response');
+  }
+
+  return {
+    username: profile.name,
+    uuid
+  };
+}
+
+function chunkString(value, size) {
+  const chunks = [];
+  for (let index = 0; index < value.length; index += size) {
+    chunks.push(value.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function deleteFirestoreBackupDoc(docId) {
+  if (!fsdb || !docId) return;
+  const backupRef = fsdb.collection(RTDB_BACKUP_COLLECTION).doc(docId);
+  const chunkSnapshot = await backupRef.collection('chunks').get();
+  const batch = fsdb.batch();
+  chunkSnapshot.docs.forEach((doc) => batch.delete(doc.ref));
+  batch.delete(backupRef);
+  await batch.commit();
+}
+
+async function createRealtimeDatabaseFirestoreBackup(reason = 'scheduled') {
+  if (!fsdb) {
+    throw new Error('Firestore not configured');
+  }
+
+  const snapshot = await db.ref('/').once('value');
+  const payload = JSON.stringify(snapshot.val() || {});
+  const chunks = chunkString(payload, RTDB_BACKUP_CHUNK_SIZE);
+  const backupId = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupRef = fsdb.collection(RTDB_BACKUP_COLLECTION).doc(backupId);
+
+  await backupRef.set({
+    backupId,
+    reason,
+    createdAt: new Date().toISOString(),
+    chunkCount: chunks.length,
+    payloadLength: payload.length
+  });
+
+  for (let index = 0; index < chunks.length; index++) {
+    await backupRef.collection('chunks').doc(String(index).padStart(6, '0')).set({
+      order: index,
+      content: chunks[index]
+    });
+  }
+
+  const existingBackups = await fsdb.collection(RTDB_BACKUP_COLLECTION).orderBy('createdAt', 'desc').get();
+  const staleDocs = existingBackups.docs.slice(1);
+  for (const staleDoc of staleDocs) {
+    await deleteFirestoreBackupDoc(staleDoc.id);
+  }
+
+  return { backupId, chunkCount: chunks.length };
+}
+
+async function recomputeAllSecurityScores() {
+  const [playersSnapshot, matchesSnapshot, usersSnapshot] = await Promise.all([
+    db.ref('players').once('value'),
+    db.ref('matches').once('value'),
+    db.ref('users').once('value')
+  ]);
+
+  const players = playersSnapshot.val() || {};
+  const matches = matchesSnapshot.val() || {};
+  const users = usersSnapshot.val() || {};
+  const userIds = new Set();
+
+  Object.values(players).forEach((player) => {
+    if (player?.userId) {
+      userIds.add(player.userId);
+    }
+  });
+
+  Object.values(matches).forEach((match) => {
+    if (match?.playerId) {
+      userIds.add(match.playerId);
+    }
+    if (match?.testerId) {
+      userIds.add(match.testerId);
+    }
+  });
+
+  Object.entries(users).forEach(([userId, userProfile]) => {
+    if (userProfile?.admin === true || userProfile?.tester === true || userProfile?.adminRole) {
+      userIds.add(userId);
+    }
+  });
+
+  let computed = 0;
+  for (const userId of userIds) {
+    const score = await computeAndStoreSecurityScore(userId);
+    if (score) computed++;
+  }
+
+  return computed;
+}
+
+async function cleanupRetiredNotificationData() {
+  await Promise.allSettled([
+    db.ref('notifications').remove(),
+    db.ref('adminNotifications').remove()
+  ]);
+}
+
+function sanitizeFirebaseValue(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    const sanitizedArray = value
+      .map((item) => sanitizeFirebaseValue(item))
+      .filter((item) => item !== undefined);
+    return sanitizedArray;
+  }
+  if (typeof value === 'object') {
+    const output = {};
+    for (const [key, nested] of Object.entries(value)) {
+      const sanitizedNested = sanitizeFirebaseValue(nested);
+      if (sanitizedNested !== undefined) {
+        output[key] = sanitizedNested;
+      }
+    }
+    return output;
+  }
+  return value;
+}
+
+function normalizeSuspiciousAccountsList(accounts) {
+  const input = Array.isArray(accounts) ? accounts : [];
+  const byUid = new Map();
+
+  input.forEach((rawAccount) => {
+    const safeAccount = sanitizeFirebaseValue(rawAccount || {});
+    const uid = String(safeAccount?.uid || '').trim();
+    if (!uid) return;
+
+    byUid.set(uid, {
+      uid,
+      email: safeAccount.email || null,
+      minecraftUsername: safeAccount.minecraftUsername || null,
+      reason: safeAccount.reason || 'Suspicious account',
+      confidence: safeAccount.confidence || 'low'
+    });
+  });
+
+  return Array.from(byUid.values());
+}
+
 // Initialize Express app
 const app = express();
 const PORT = config.port;
@@ -303,13 +562,24 @@ const usernameVerifyLimiter = rateLimit({
 // Stricter rate limiting for admin operations
 const adminLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 10, // 10 admin requests per minute
+  max: 30, // 30 admin write requests per minute
   message: 'Too many admin requests, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
     const clientIP = getClientIP(req);
     return clientIP;
+  }
+});
+
+const adminSearchLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 240, // Admin search can fire multiple requests per interaction
+  message: 'Too many admin search requests. Please wait a moment and try again.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    return req.user?.uid || getClientIP(req);
   }
 });
 
@@ -350,7 +620,12 @@ const messageLimiter = rateLimit({
   }
 });
 
-app.use('/api/', limiter);
+app.use('/api/', (req, res, next) => {
+  if (req.path.startsWith('/admin/')) {
+    return next();
+  }
+  return limiter(req, res, next);
+});
 // Apply auth limiter to most auth endpoints, but allow more frequent calls for verification and cleanup
 app.use('/api/auth/', (req, res, next) => {
   // Allow more frequent calls for endpoints that may be called repeatedly by normal auth flows
@@ -403,8 +678,11 @@ const ADMIN_CAPABILITY_MATRIX = {
     'blacklist:view',
     'blacklist:manage',
     'audit:view',
+    'matches:view',
     'matches:manage',
     'reports:manage',
+    'disputes:manage',
+    'queue:inspect',
     'settings:manage'
   ],
   moderator: [
@@ -412,13 +690,200 @@ const ADMIN_CAPABILITY_MATRIX = {
     'blacklist:view',
     'blacklist:manage',
     'audit:view',
-    'reports:manage'
+    'matches:view',
+    'reports:manage',
+    'disputes:manage'
   ],
   support: [
     'users:view',
-    'audit:view'
+    'audit:view',
+    'matches:view'
   ]
 };
+
+const STAFF_ROLE_ICON_PRESETS = {
+  shield: { label: 'Shield', iconClass: 'fas fa-shield-alt' },
+  star: { label: 'Star', iconClass: 'fas fa-star' },
+  crown: { label: 'Crown', iconClass: 'fas fa-crown' },
+  gavel: { label: 'Gavel', iconClass: 'fas fa-gavel' },
+  bolt: { label: 'Bolt', iconClass: 'fas fa-bolt' },
+  eye: { label: 'Eye', iconClass: 'fas fa-eye' }
+};
+
+const LEGACY_STAFF_ROLE_PRESET_MAP = {
+  'rookie.svg': 'shield',
+  'combat_novice.svg': 'shield',
+  'combat_cadet.svg': 'shield',
+  'combat_specialist.svg': 'shield',
+  'combat_ace.svg': 'star',
+  'combat_master.webp': 'crown',
+  'combat_grandmaster.webp': 'gavel',
+  'mace.svg': 'bolt',
+  'nethop.svg': 'bolt',
+  'pot.svg': 'star',
+  'smp.svg': 'shield',
+  'sword.svg': 'shield',
+  'uhc.svg': 'star',
+  'vanilla.svg': 'crown',
+  'axe.svg': 'gavel'
+};
+
+const STAFF_DASHBOARD_ACTION_DEFINITIONS = {
+  open_admin_management: { label: 'User Management', icon: 'fa-users-cog' },
+  open_admin_moderation: { label: 'Blacklist & Applications', icon: 'fa-ban' },
+  open_admin_reports: { label: 'Reports Review', icon: 'fa-flag' },
+  open_admin_matches: { label: 'Match Manager', icon: 'fa-gamepad' },
+  open_admin_operations: { label: 'Queue & Match Ops', icon: 'fa-diagram-project' },
+  open_admin_security_scores: { label: 'Security Scores', icon: 'fa-shield-alt' },
+  open_admin_support: { label: 'Support Tickets', icon: 'fa-life-ring' },
+  open_admin_servers: { label: 'Whitelisted Servers', icon: 'fa-server' },
+  open_admin_staff_roles: { label: 'Staff Roles', icon: 'fa-user-shield' },
+  queue_open: { label: 'Join Queue', icon: 'fa-play', legacy: true },
+  queue_leave: { label: 'Leave Queue', icon: 'fa-sign-out-alt', legacy: true },
+  queue_refresh: { label: 'Refresh Queue', icon: 'fa-sync-alt', legacy: true },
+  load_activity: { label: 'Load Activity', icon: 'fa-chart-line', legacy: true },
+  load_cooldowns: { label: 'Load Cooldowns', icon: 'fa-clock', legacy: true },
+  open_reports_page: { label: 'Open Reports', icon: 'fa-flag', legacy: true },
+  open_support_page: { label: 'Open Support', icon: 'fa-life-ring', legacy: true },
+  open_testing_page: { label: 'Open Testing', icon: 'fa-flask', legacy: true }
+};
+
+const STAFF_DASHBOARD_ACTIONS = new Set(Object.keys(STAFF_DASHBOARD_ACTION_DEFINITIONS));
+
+function normalizeStaffRoleIconPreset(value) {
+  const raw = String(value || '').trim();
+  if (STAFF_ROLE_ICON_PRESETS[raw]) {
+    return raw;
+  }
+  if (LEGACY_STAFF_ROLE_PRESET_MAP[raw]) {
+    return LEGACY_STAFF_ROLE_PRESET_MAP[raw];
+  }
+  return 'shield';
+}
+
+function sanitizeStaffRoleId(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  const slug = raw
+    .replace(/[^a-z0-9\s_-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return slug.slice(0, 48);
+}
+
+function sanitizeStaffRolePayload(input = {}) {
+  const name = String(input.name || '').trim().slice(0, 32);
+  const colorRaw = String(input.color || '').trim();
+  const color = /^#([0-9a-fA-F]{6})$/.test(colorRaw) ? colorRaw : '#38bdf8';
+  const iconPreset = normalizeStaffRoleIconPreset(input.iconPreset);
+  const iconUrlRaw = String(input.iconUrl || '').trim();
+  const dashboardActions = Array.isArray(input.dashboardActions)
+    ? [...new Set(input.dashboardActions.map((action) => String(action || '').trim()).filter((action) => STAFF_DASHBOARD_ACTIONS.has(action)))]
+    : [];
+
+  let iconType = 'preset';
+  let iconValue = 'shield';
+
+  if (iconUrlRaw) {
+    try {
+      const parsed = new URL(iconUrlRaw);
+      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && iconUrlRaw.length <= 300) {
+        iconType = 'url';
+        iconValue = iconUrlRaw;
+      }
+    } catch (_) {
+      // ignore invalid URL and fall back to preset
+    }
+  }
+
+  if (iconType !== 'url') {
+    const fallbackPreset = normalizeStaffRoleIconPreset(iconPreset);
+    iconType = 'preset';
+    iconValue = fallbackPreset;
+  }
+
+  return {
+    valid: name.length >= 2,
+    data: {
+      name,
+      color,
+      iconType,
+      iconValue,
+      dashboardActions
+    }
+  };
+}
+
+function buildStaffRoleIconConfig(role = {}) {
+  if (role.iconType === 'url' && typeof role.iconValue === 'string' && role.iconValue.trim()) {
+    return {
+      iconType: 'url',
+      iconValue: role.iconValue,
+      iconUrl: role.iconValue,
+      iconClass: null,
+      iconLabel: 'Custom icon'
+    };
+  }
+  const preset = normalizeStaffRoleIconPreset(role.iconValue || role.iconPreset);
+  const presetMeta = STAFF_ROLE_ICON_PRESETS[preset] || STAFF_ROLE_ICON_PRESETS.shield;
+  return {
+    iconType: 'preset',
+    iconValue: preset,
+    iconUrl: null,
+    iconClass: presetMeta.iconClass,
+    iconLabel: presetMeta.label
+  };
+}
+
+async function getAllStaffRoles() {
+  const snapshot = await db.ref('settings/staffRoles').once('value');
+  const roles = snapshot.val() || {};
+  return roles;
+}
+
+function resolveStaffRoleForProfile(profile = {}, roleMap = {}) {
+  const roleId = String(profile.staffRoleId || '').trim();
+  if (!roleId || !roleMap[roleId]) return null;
+  const role = roleMap[roleId] || {};
+  const iconConfig = buildStaffRoleIconConfig(role);
+  return {
+    id: roleId,
+    name: role.name || roleId,
+    color: role.color || '#38bdf8',
+    iconType: iconConfig.iconType,
+    iconValue: iconConfig.iconValue,
+    iconUrl: iconConfig.iconUrl,
+    iconClass: iconConfig.iconClass,
+    iconLabel: iconConfig.iconLabel,
+    dashboardActions: Array.isArray(role.dashboardActions) ? role.dashboardActions : []
+  };
+}
+
+function buildBlacklistEntryResponse(id, entry = {}) {
+  const addedAtMs = parseDateToMs(entry.addedAt);
+  const expiresAtMs = parseDateToMs(entry.expiresAt);
+
+  return {
+    id,
+    username: entry.username || null,
+    userId: entry.userId || null,
+    minecraftUUID: entry.minecraftUUID || null,
+    reason: entry.reason || 'No reason provided',
+    addedAt: entry.addedAt || null,
+    expiresAt: entry.expiresAt || null,
+    active: isBlacklistEntryActive(entry),
+    temporary: Boolean(expiresAtMs),
+    expired: Boolean(expiresAtMs && expiresAtMs <= Date.now()),
+    addedAtMs,
+    expiresAtMs
+  };
+}
+
+function buildBlacklistEntries(blacklist = {}) {
+  return Object.entries(blacklist)
+    .map(([id, entry]) => buildBlacklistEntryResponse(id, entry || {}))
+    .sort((a, b) => (b.addedAtMs || 0) - (a.addedAtMs || 0));
+}
 
 function getAdminRole(profile = {}, email = '') {
   if (config.adminBypassEmail && email === config.adminBypassEmail) return 'owner';
@@ -518,15 +983,16 @@ async function verifyAuth(req, res, next) {
         });
       }
 
-      const restrictionKey = getRestrictionKeyForRequest(req.path, req.method);
-      const activeRestriction = restrictionKey ? moderationState.restrictions?.[restrictionKey] : null;
+      const restrictionKeys = getRestrictionKeysForRequest(req.path, req.method);
+      const activeRestrictionKey = restrictionKeys.find((restrictionKey) => moderationState.restrictions?.[restrictionKey]?.active);
+      const activeRestriction = activeRestrictionKey ? moderationState.restrictions?.[activeRestrictionKey] : null;
       if (activeRestriction?.active) {
         return res.status(403).json({
           error: true,
           code: 'FEATURE_RESTRICTED',
-          message: `This feature is temporarily disabled for your account (${restrictionKey}).`,
+          message: `This feature is temporarily disabled for your account (${activeRestrictionKey}).`,
           moderation: {
-            restriction: restrictionKey,
+            restriction: activeRestrictionKey,
             reason: activeRestriction.reason || 'Restricted by admin',
             expiresAt: activeRestriction.expiresAt || null
           }
@@ -667,18 +1133,43 @@ function parseDateToMs(value) {
   return Number.isFinite(ms) ? ms : 0;
 }
 
-function getRestrictionKeyForRequest(reqPath, method) {
+function getRestrictionKeysForRequest(reqPath, method) {
   const m = String(method || 'GET').toUpperCase();
-  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return null;
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return [];
 
-  if (reqPath.startsWith('/api/queue/')) return 'queue';
-  if (reqPath.startsWith('/api/tier-tester/apply')) return 'applications';
-  if (reqPath.startsWith('/api/reports') || reqPath.startsWith('/api/report')) return 'reports';
-  if (reqPath.includes('/chat') || reqPath.includes('/messages')) return 'chat';
-  if (reqPath.startsWith('/api/support/tickets/') && reqPath.endsWith('/messages')) return 'support_messages';
-  if (reqPath.startsWith('/api/users/me') || reqPath.startsWith('/api/account/') || reqPath.startsWith('/api/plus/')) return 'account_changes';
+  const restrictionKeys = [];
 
-  return null;
+  if (reqPath === '/api/queue/join') {
+    restrictionKeys.push('queue_join', 'queue');
+  } else if (reqPath === '/api/queue/leave') {
+    restrictionKeys.push('queue_leave', 'queue');
+  } else if (reqPath.startsWith('/api/queue/')) {
+    restrictionKeys.push('queue');
+  }
+
+  if (reqPath.startsWith('/api/tier-tester/apply')) {
+    restrictionKeys.push('applications_submit', 'applications');
+  }
+
+  if (reqPath === '/api/submit-player-report') {
+    restrictionKeys.push('report_submit', 'reports');
+  } else if (reqPath.startsWith('/api/reports') || reqPath.startsWith('/api/report')) {
+    restrictionKeys.push('reports');
+  }
+
+  if (reqPath.includes('/chat') || reqPath.includes('/messages')) {
+    restrictionKeys.push('chat');
+  }
+
+  if (reqPath.startsWith('/api/support/tickets/') && reqPath.endsWith('/messages')) {
+    restrictionKeys.push('support_messages');
+  }
+
+  if (reqPath.startsWith('/api/users/me') || reqPath.startsWith('/api/account/') || reqPath.startsWith('/api/plus/')) {
+    restrictionKeys.push('account_changes');
+  }
+
+  return [...new Set(restrictionKeys)];
 }
 
 function isUserRetiredFromGamemode(profile, gamemode) {
@@ -729,6 +1220,371 @@ function normalizeAvailabilitySelections(body = {}) {
   return { gamemodes, regions };
 }
 
+function normalizeQueueSelections(body = {}) {
+  const rawGamemodes = Array.isArray(body.gamemodes)
+    ? body.gamemodes
+    : (body.gamemode ? [body.gamemode] : []);
+  const rawRegions = Array.isArray(body.regions)
+    ? body.regions
+    : (body.region ? [body.region] : []);
+
+  const gamemodes = [...new Set(rawGamemodes.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+  const regions = [...new Set(rawRegions.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))];
+
+  return { gamemodes, regions };
+}
+
+async function getCanonicalWhitelistedServerIP(serverIP) {
+  const sanitizedServerIP = String(serverIP || '').trim();
+  if (!sanitizedServerIP) {
+    return null;
+  }
+
+  const whitelistedServersSnapshot = await db.ref('whitelistedServers').once('value');
+  const whitelistedServers = whitelistedServersSnapshot.val() || {};
+  const matchingServer = Object.values(whitelistedServers).find((server) => (
+    server?.ip && String(server.ip).trim().toLowerCase() === sanitizedServerIP.toLowerCase()
+  ));
+
+  return matchingServer?.ip ? String(matchingServer.ip).trim() : null;
+}
+
+async function getUserPreferredServerIP(userId, fallbackServerIP = null) {
+  if (userId) {
+    const queueSnapshot = await db.ref('queue').orderByChild('userId').equalTo(userId).once('value');
+    const queueEntries = Object.values(queueSnapshot.val() || {}).filter((entry) => entry?.serverIP);
+    const preferredEntry = queueEntries.find((entry) => getQueueRolePreference(entry) === 'player') || queueEntries[0];
+    const preferredServerIP = await getCanonicalWhitelistedServerIP(preferredEntry?.serverIP);
+    if (preferredServerIP) {
+      return {
+        serverIP: preferredServerIP,
+        source: 'player_queue'
+      };
+    }
+  }
+
+  const fallbackResolved = await getCanonicalWhitelistedServerIP(fallbackServerIP);
+  return {
+    serverIP: fallbackResolved,
+    source: fallbackResolved ? 'request' : null
+  };
+}
+
+const QUEUE_COOLDOWN_MS = 30 * 60 * 1000;
+
+function getQueueCooldownState(userProfile = {}, gamemode) {
+  if (!gamemode) {
+    return { allowed: true };
+  }
+
+  const normalizedGamemode = String(gamemode).trim().toLowerCase();
+  const lastTestCompletions = userProfile.lastTestCompletions || {};
+  const lastQueueJoins = userProfile.lastQueueJoins || {};
+  const nowMs = Date.now();
+
+  const lastTestCompletion = lastTestCompletions[normalizedGamemode];
+  if (lastTestCompletion) {
+    const completedAtMs = new Date(lastTestCompletion).getTime();
+    if (Number.isFinite(completedAtMs)) {
+      const remainingMs = QUEUE_COOLDOWN_MS - (nowMs - completedAtMs);
+      if (remainingMs > 0) {
+        return {
+          allowed: false,
+          remainingMs,
+          type: 'testing',
+          startedAt: lastTestCompletion,
+          reason: 'You were recently tested in this gamemode. Please wait before queuing again.'
+        };
+      }
+    }
+  }
+
+  const lastQueueJoin = lastQueueJoins[normalizedGamemode];
+  if (lastQueueJoin) {
+    const joinedAtMs = new Date(lastQueueJoin).getTime();
+    if (Number.isFinite(joinedAtMs)) {
+      const remainingMs = QUEUE_COOLDOWN_MS - (nowMs - joinedAtMs);
+      if (remainingMs > 0) {
+        return {
+          allowed: false,
+          remainingMs,
+          type: 'queue',
+          startedAt: lastQueueJoin,
+          reason: 'You recently completed a match in this gamemode.'
+        };
+      }
+    }
+  }
+
+  return { allowed: true };
+}
+
+function getQueueGamemodeList(entry = {}) {
+  if (Array.isArray(entry.gamemodes) && entry.gamemodes.length > 0) {
+    return entry.gamemodes.filter(Boolean);
+  }
+  return entry.gamemode ? [entry.gamemode] : [];
+}
+
+function getQueueRegionList(entry = {}) {
+  if (Array.isArray(entry.regions) && entry.regions.length > 0) {
+    return entry.regions.filter(Boolean);
+  }
+  return entry.region ? [entry.region] : [];
+}
+
+function hasTierTesterQueueRole(profile = {}) {
+  return Boolean(
+    profile?.tester === true
+    || profile?.tierTester === true
+    || profile?.admin === true
+    || profile?.adminRole
+  );
+}
+
+function getQueueRolePreference(entry = {}) {
+  return entry?.queueRolePreference === 'tester' ? 'tester' : 'player';
+}
+
+function isQueueEntryExpired(entry = {}) {
+  return Boolean(entry?.timeoutAt && parseDateToMs(entry.timeoutAt) <= Date.now());
+}
+
+function isQueueEntryTesterEligible(entry = {}, profile = null) {
+  if (typeof entry?.testerEligible === 'boolean') {
+    return entry.testerEligible === true;
+  }
+  if (getQueueRolePreference(entry) === 'tester') {
+    return true;
+  }
+  return hasTierTesterQueueRole(profile || {});
+}
+
+function buildQueueEntry({
+  queueId,
+  userId,
+  minecraftUsername,
+  gamemodes,
+  regions,
+  serverIP,
+  rolePreference = 'player',
+  testerEligible = false,
+  source = 'player_queue',
+  joinedAt = new Date().toISOString(),
+  timeoutAt = null
+}) {
+  return {
+    queueId,
+    userId,
+    minecraftUsername,
+    gamemode: gamemodes[0] || null,
+    region: regions[0] || null,
+    gamemodes,
+    regions,
+    serverIP: serverIP || null,
+    status: 'waiting',
+    joinedAt,
+    queueRolePreference: rolePreference === 'tester' ? 'tester' : 'player',
+    testerEligible: testerEligible === true,
+    queueSource: source,
+    timeoutAt: timeoutAt || null
+  };
+}
+
+function queueEntriesShareCompatibility(entryA = {}, entryB = {}) {
+  const gamemodesA = getQueueGamemodeList(entryA);
+  const gamemodesB = getQueueGamemodeList(entryB);
+  const regionsA = getQueueRegionList(entryA);
+  const regionsB = getQueueRegionList(entryB);
+
+  const sharedGamemode = gamemodesA.some((gamemode) => gamemodesB.includes(gamemode));
+  const sharedRegion = regionsA.some((region) => regionsB.includes(region));
+  return sharedGamemode && sharedRegion;
+}
+
+async function buildQueueStatusSummary(currentEntry = {}, currentUserId = null) {
+  const [queueSnapshot, activeMatchesSnapshot] = await Promise.all([
+    db.ref('queue').once('value'),
+    db.ref('matches').orderByChild('status').equalTo('active').once('value')
+  ]);
+
+  const queueEntries = queueSnapshot.val() || {};
+  const activeMatches = activeMatchesSnapshot.val() || {};
+  const busyUserIds = new Set();
+
+  Object.values(activeMatches).forEach((match) => {
+    if (!match || match.finalized) return;
+    if (match.playerId) busyUserIds.add(match.playerId);
+    if (match.testerId) busyUserIds.add(match.testerId);
+  });
+
+  const queueList = Object.values(queueEntries).filter((entry) => (
+    entry?.userId
+    && !busyUserIds.has(entry.userId)
+    && getQueueGamemodeList(entry).length > 0
+    && getQueueRegionList(entry).length > 0
+    && !isQueueEntryExpired(entry)
+  ));
+
+  const compatibleEntries = queueList.filter((entry) => queueEntriesShareCompatibility(currentEntry, entry));
+  const compatiblePlayers = compatibleEntries.filter((entry) => getQueueRolePreference(entry) !== 'tester');
+  const compatibleTesters = compatibleEntries.filter((entry) => getQueueRolePreference(entry) === 'tester');
+  const currentRolePreference = getQueueRolePreference(currentEntry);
+  const sameRoleEntries = (currentRolePreference === 'tester' ? compatibleTesters : compatiblePlayers)
+    .slice()
+    .sort((entryA, entryB) => parseDateToMs(entryA?.joinedAt) - parseDateToMs(entryB?.joinedAt));
+
+  const currentEntryIndex = sameRoleEntries.findIndex((entry) => (
+    entry?.queueId === currentEntry?.queueId
+    || (entry?.userId === currentUserId && parseDateToMs(entry?.joinedAt) === parseDateToMs(currentEntry?.joinedAt))
+  ));
+  const yourPosition = currentEntryIndex >= 0 ? currentEntryIndex + 1 : 1;
+
+  let estimatedWaitMinutes = null;
+  if (currentRolePreference === 'tester') {
+    if (compatiblePlayers.length > 0) {
+      estimatedWaitMinutes = Math.max(1, Math.ceil(yourPosition / compatiblePlayers.length) * 2);
+    }
+  } else if (compatibleTesters.length > 0) {
+    estimatedWaitMinutes = Math.max(1, Math.ceil(yourPosition / compatibleTesters.length) * 2);
+  }
+
+  return {
+    rolePreference: currentRolePreference,
+    compatiblePlayers: compatiblePlayers.length,
+    compatibleTesters: compatibleTesters.length,
+    yourPosition,
+    estimatedWaitMinutes
+  };
+}
+
+function canUserBeAssignedPlayer(profile = {}, gamemode) {
+  return getQueueCooldownState(profile, gamemode).allowed;
+}
+
+function resolveQueuedRoleAssignment(entryA, entryB, profileA = {}, profileB = {}, gamemode = null) {
+  const entryAEligible = isQueueEntryTesterEligible(entryA, profileA);
+  const entryBEligible = isQueueEntryTesterEligible(entryB, profileB);
+  const entryACanBePlayer = canUserBeAssignedPlayer(profileA, gamemode);
+  const entryBCanBePlayer = canUserBeAssignedPlayer(profileB, gamemode);
+  const gamemodeLabel = String(gamemode || 'this gamemode').trim().toUpperCase();
+
+  if (!entryAEligible && !entryBEligible) {
+    return null;
+  }
+
+  if (entryAEligible && !entryBEligible) {
+    if (!entryBCanBePlayer) {
+      return null;
+    }
+
+    return {
+      player: entryB,
+      tester: entryA,
+      assignmentType: 'single_tier_tester',
+      explanation: `${entryA.minecraftUsername || 'The assigned tester'} was chosen as the tier tester because only they have the Tier Tester role.`,
+      playerReason: `${entryB.minecraftUsername || 'This player'} stayed in the player slot because the other queued participant is the only Tier Tester.`,
+      testerReason: `${entryA.minecraftUsername || 'This player'} was assigned as the tier tester because they are the only Tier Tester in this pairing.`
+    };
+  }
+
+  if (!entryAEligible && entryBEligible) {
+    if (!entryACanBePlayer) {
+      return null;
+    }
+
+    return {
+      player: entryA,
+      tester: entryB,
+      assignmentType: 'single_tier_tester',
+      explanation: `${entryB.minecraftUsername || 'The assigned tester'} was chosen as the tier tester because only they have the Tier Tester role.`,
+      playerReason: `${entryA.minecraftUsername || 'This player'} stayed in the player slot because the other queued participant is the only Tier Tester.`,
+      testerReason: `${entryB.minecraftUsername || 'This player'} was assigned as the tier tester because they are the only Tier Tester in this pairing.`
+    };
+  }
+
+  if (!entryACanBePlayer && !entryBCanBePlayer) {
+    return null;
+  }
+
+  if (!entryACanBePlayer && entryBCanBePlayer) {
+    return {
+      player: entryB,
+      tester: entryA,
+      assignmentType: 'dual_tier_tester_cooldown_priority',
+      explanation: `${entryA.minecraftUsername || 'One queued user'} was kept as the tier tester because they are on ${gamemodeLabel} cooldown, so ${entryB.minecraftUsername || 'the other queued user'} must take the player slot.`,
+      playerReason: `${entryB.minecraftUsername || 'This player'} was assigned as the player because the other queued Tier Tester is still on ${gamemodeLabel} cooldown.`,
+      testerReason: `${entryA.minecraftUsername || 'This player'} was assigned as the tier tester because they are still on ${gamemodeLabel} cooldown and cannot take the player slot.`
+    };
+  }
+
+  if (entryACanBePlayer && !entryBCanBePlayer) {
+    return {
+      player: entryA,
+      tester: entryB,
+      assignmentType: 'dual_tier_tester_cooldown_priority',
+      explanation: `${entryB.minecraftUsername || 'One queued user'} was kept as the tier tester because they are on ${gamemodeLabel} cooldown, so ${entryA.minecraftUsername || 'the other queued user'} must take the player slot.`,
+      playerReason: `${entryA.minecraftUsername || 'This player'} was assigned as the player because the other queued Tier Tester is still on ${gamemodeLabel} cooldown.`,
+      testerReason: `${entryB.minecraftUsername || 'This player'} was assigned as the tier tester because they are still on ${gamemodeLabel} cooldown and cannot take the player slot.`
+    };
+  }
+
+  const randomizeEntryAAsTester = Math.random() >= 0.5;
+  const tester = randomizeEntryAAsTester ? entryA : entryB;
+  const player = randomizeEntryAAsTester ? entryB : entryA;
+
+  return {
+    player,
+    tester,
+    assignmentType: 'dual_tier_tester_random',
+    explanation: 'Both queued players have the Tier Tester role, so the system randomly assigned one as tester and one as player.',
+    playerReason: `${player.minecraftUsername || 'This player'} was randomly assigned as the player because both queued users are Tier Testers.`,
+    testerReason: `${tester.minecraftUsername || 'This player'} was randomly assigned as the tester because both queued users are Tier Testers.`,
+    randomized: true
+  };
+}
+
+function getSharedQueueSelections(entryA = {}, entryB = {}) {
+  const gamemodesA = getQueueGamemodeList(entryA);
+  const gamemodesB = new Set(getQueueGamemodeList(entryB));
+  const regionsA = getQueueRegionList(entryA);
+  const regionsB = new Set(getQueueRegionList(entryB));
+  const sharedSelections = [];
+
+  for (const gamemode of gamemodesA) {
+    if (!gamemodesB.has(gamemode)) continue;
+    for (const region of regionsA) {
+      if (regionsB.has(region)) {
+        sharedSelections.push({ gamemode, region });
+      }
+    }
+  }
+
+  return sharedSelections;
+}
+
+function findSharedQueueSelections(entryA = {}, entryB = {}) {
+  return getSharedQueueSelections(entryA, entryB)[0] || null;
+}
+
+async function clearUserQueueEntries(userId) {
+  if (!userId) return 0;
+
+  const queueRef = db.ref('queue');
+  const queueSnapshot = await queueRef.orderByChild('userId').equalTo(userId).once('value');
+  if (!queueSnapshot.exists()) return 0;
+
+  const updates = {};
+  let removedCount = 0;
+  queueSnapshot.forEach((child) => {
+    updates[child.key] = null;
+    removedCount++;
+  });
+
+  await queueRef.update(updates);
+  return removedCount;
+}
+
 function isFeatureTemporarilyUnblocked(tempUnblock, restrictionKey) {
   if (!tempUnblock || !restrictionKey) return false;
   const now = Date.now();
@@ -772,6 +1628,109 @@ function normalizeRestrictions(rawRestrictions = {}) {
   return normalized;
 }
 
+function blacklistEntryMatchesIdentity(entry, identity = {}) {
+  if (!entry || !identity) return false;
+
+  const entryUserId = String(entry.userId || '').trim();
+  const entryUsername = normalizeMinecraftUsername(entry.username);
+  const entryUuid = normalizeMinecraftUUID(entry.minecraftUUID || entry.uuid);
+  const identityUserId = String(identity.userId || '').trim();
+  const identityUsername = normalizeMinecraftUsername(identity.username);
+  const identityUuid = normalizeMinecraftUUID(identity.uuid || identity.minecraftUUID);
+
+  return Boolean(
+    (entryUserId && identityUserId && entryUserId === identityUserId) ||
+    (entryUsername && identityUsername && entryUsername === identityUsername) ||
+    (entryUuid && identityUuid && entryUuid === identityUuid)
+  );
+}
+
+async function findActiveBlacklistEntry(identity = {}) {
+  const blacklistSnapshot = await db.ref('blacklist').once('value');
+  const blacklist = blacklistSnapshot.val() || {};
+
+  for (const [id, entry] of Object.entries(blacklist)) {
+    if (!isBlacklistEntryActive(entry)) continue;
+    if (!blacklistEntryMatchesIdentity(entry, identity)) continue;
+    return { id, ...entry };
+  }
+
+  return null;
+}
+
+async function ensureMinecraftUuidLinkedForUser(userId, profileInput = null) {
+  try {
+    if (!userId) return profileInput || null;
+
+    const userRef = db.ref(`users/${userId}`);
+    const profile = profileInput || (await userRef.once('value')).val() || null;
+    if (!profile) return null;
+
+    const currentUsername = String(profile.minecraftUsername || '').trim();
+    const currentUuid = normalizeMinecraftUUID(profile.minecraftUUID);
+    if (!currentUsername || currentUuid) {
+      return profile;
+    }
+
+    const mojangProfile = await fetchMojangProfile(currentUsername).catch(() => null);
+    if (!mojangProfile?.uuid) {
+      return profile;
+    }
+
+    const resolvedUuid = normalizeMinecraftUUID(mojangProfile.uuid);
+    if (!resolvedUuid) {
+      return profile;
+    }
+
+    const canonicalUsername = mojangProfile.username || currentUsername;
+    const updates = {
+      minecraftUUID: resolvedUuid,
+      pendingMinecraftUUID: null,
+      updatedAt: new Date().toISOString()
+    };
+
+    if (canonicalUsername !== currentUsername) {
+      updates.minecraftUsername = canonicalUsername;
+    }
+
+    await userRef.update(updates);
+
+    const playersRef = db.ref('players');
+    const playersSnapshot = await playersRef.once('value');
+    const players = playersSnapshot.val() || {};
+    const normalizedCurrent = normalizeMinecraftUsername(currentUsername);
+    const normalizedCanonical = normalizeMinecraftUsername(canonicalUsername);
+
+    for (const [playerId, player] of Object.entries(players)) {
+      const normalizedPlayerUsername = normalizeMinecraftUsername(player?.username);
+      const matchesUser = (player?.userId && player.userId === userId)
+        || (normalizedPlayerUsername && (normalizedPlayerUsername === normalizedCurrent || normalizedPlayerUsername === normalizedCanonical));
+
+      if (!matchesUser) continue;
+
+      const playerUpdates = {
+        minecraftUUID: resolvedUuid,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (canonicalUsername && player?.username !== canonicalUsername) {
+        playerUpdates.username = canonicalUsername;
+      }
+
+      await playersRef.child(playerId).update(playerUpdates);
+    }
+
+    return {
+      ...profile,
+      ...updates,
+      minecraftUsername: canonicalUsername
+    };
+  } catch (error) {
+    console.warn('Unable to auto-link Minecraft UUID for user:', userId, error?.message || error);
+    return profileInput || null;
+  }
+}
+
 async function getUserModerationState(userId, profileInput = null) {
   try {
     if (!userId) {
@@ -784,6 +1743,7 @@ async function getUserModerationState(userId, profileInput = null) {
 
     const profile = profileInput || (await db.ref(`users/${userId}`).once('value')).val() || {};
     const username = String(profile.minecraftUsername || '').toLowerCase();
+  const minecraftUUID = normalizeMinecraftUUID(profile.minecraftUUID);
 
     const [blacklistSnapshot, tempUnblockSnapshot] = await Promise.all([
       db.ref('blacklist').once('value'),
@@ -795,8 +1755,11 @@ async function getUserModerationState(userId, profileInput = null) {
 
     let activeBlacklistEntry = null;
     for (const [id, entry] of Object.entries(blacklist)) {
-      const entryUsername = String(entry?.username || '').toLowerCase();
-      const matchesUser = (entry?.userId && entry.userId === userId) || (username && entryUsername === username);
+      const matchesUser = blacklistEntryMatchesIdentity(entry, {
+        userId,
+        username,
+        uuid: minecraftUUID
+      });
       if (!matchesUser || !isBlacklistEntryActive(entry)) continue;
       activeBlacklistEntry = { id, ...entry };
       break;
@@ -850,14 +1813,8 @@ async function getUserModerationState(userId, profileInput = null) {
  */
 async function isUsernameBlacklisted(username) {
   try {
-    const blacklistRef = db.ref('blacklist');
-    const blacklistSnapshot = await blacklistRef.once('value');
-    const blacklist = blacklistSnapshot.val() || {};
-    
-    const normalizedUsername = username.toLowerCase();
-    return Object.values(blacklist).some(entry => 
-      entry.username?.toLowerCase() === normalizedUsername && isBlacklistEntryActive(entry)
-    );
+    const entry = await findActiveBlacklistEntry({ username });
+    return Boolean(entry);
   } catch (error) {
     console.error('Error checking blacklist:', error);
     return false;
@@ -1823,7 +2780,10 @@ async function checkAndTerminateBlacklistedMatches() {
  */
 function generateAltGroupId(primaryAccount, suspiciousAccounts) {
   // Create a consistent group ID based on all account UIDs
-  const allUids = [primaryAccount, ...suspiciousAccounts.map(acc => acc.uid)].sort();
+  const allUids = [
+    String(primaryAccount || '').trim(),
+    ...normalizeSuspiciousAccountsList(suspiciousAccounts).map(acc => acc.uid)
+  ].filter(Boolean).sort();
   return allUids.join('_');
 }
 
@@ -1832,7 +2792,13 @@ function generateAltGroupId(primaryAccount, suspiciousAccounts) {
  */
 async function createConsolidatedAltReport(primaryAccount, suspiciousAccounts, clientIP, detectionReason, type) {
   try {
-    const groupId = generateAltGroupId(primaryAccount, suspiciousAccounts);
+    const normalizedPrimaryAccount = String(primaryAccount || '').trim();
+    const normalizedSuspiciousAccounts = normalizeSuspiciousAccountsList(suspiciousAccounts);
+    const groupId = generateAltGroupId(normalizedPrimaryAccount, normalizedSuspiciousAccounts);
+
+    if (!normalizedPrimaryAccount || !groupId) {
+      return null;
+    }
 
     // Check if report already exists for this group
     const reportsRef = db.ref('altReports');
@@ -1848,9 +2814,11 @@ async function createConsolidatedAltReport(primaryAccount, suspiciousAccounts, c
       reportRef = db.ref(`altReports/${reportId}`);
 
       const existingReport = existingReports[reportId];
+      const existingSuspicious = normalizeSuspiciousAccountsList(existingReport.suspiciousAccounts);
+      const mergedSuspicious = normalizeSuspiciousAccountsList([...existingSuspicious, ...normalizedSuspiciousAccounts]);
       reportData = {
         ...existingReport,
-        suspiciousAccounts: [...new Set([...existingReport.suspiciousAccounts, ...suspiciousAccounts])],
+        suspiciousAccounts: mergedSuspicious,
         flagCount: (existingReport.flagCount || 1) + 1,
         lastFlaggedAt: new Date().toISOString(),
         lastDetectionReason: detectionReason,
@@ -1862,8 +2830,8 @@ async function createConsolidatedAltReport(primaryAccount, suspiciousAccounts, c
       reportRef = db.ref('altReports').push();
       reportData = {
         groupId,
-        primaryAccount,
-        suspiciousAccounts,
+        primaryAccount: normalizedPrimaryAccount,
+        suspiciousAccounts: normalizedSuspiciousAccounts,
         flagCount: 1,
         detectionReason,
         clientIP,
@@ -1876,7 +2844,7 @@ async function createConsolidatedAltReport(primaryAccount, suspiciousAccounts, c
       };
     }
 
-    await reportRef.set(reportData);
+    await reportRef.set(sanitizeFirebaseValue(reportData));
     return { reportId: reportRef.key, isNew: !existingReports, flagCount: reportData.flagCount };
 
   } catch (error) {
@@ -1910,8 +2878,10 @@ function getClientIP(req) {
  */
 async function detectAltAccount(email, clientIP, minecraftUsername = null) {
   try {
-    const usersRef = db.ref('users');
-    const usersSnapshot = await usersRef.once('value');
+    const [usersSnapshot, staffRoles] = await Promise.all([
+      db.ref('users').once('value'),
+      getAllStaffRoles().catch(() => ({}))
+    ]);
     const allUsers = usersSnapshot.val() || {};
 
     const suspiciousAccounts = [];
@@ -2202,6 +3172,8 @@ app.get('/api/users/me', verifyAuthAndNotBanned, async (req, res) => {
         message: 'User profile not found'
       });
     }
+
+    const resolvedProfile = await ensureMinecraftUuidLinkedForUser(req.user.uid, profile) || profile;
     
     let playerData = null;
     try {
@@ -2211,10 +3183,10 @@ app.get('/api/users/me', verifyAuthAndNotBanned, async (req, res) => {
         .equalTo(req.user.uid)
         .once('value');
 
-      if (!playerSnapshot.exists() && profile.minecraftUsername) {
+      if (!playerSnapshot.exists() && resolvedProfile.minecraftUsername) {
         playerSnapshot = await playersRef
           .orderByChild('username')
-          .equalTo(profile.minecraftUsername)
+          .equalTo(resolvedProfile.minecraftUsername)
           .once('value');
       }
 
@@ -2227,14 +3199,26 @@ app.get('/api/users/me', verifyAuthAndNotBanned, async (req, res) => {
       console.warn('Could not enrich /api/users/me with player ratings:', playerLookupError.message);
     }
 
-    const moderation = await getUserModerationState(req.user.uid, profile);
-    const warnings = Array.isArray(profile.warnings) ? profile.warnings : [];
+    const [moderation, staffRoles] = await Promise.all([
+      getUserModerationState(req.user.uid, resolvedProfile),
+      getAllStaffRoles().catch(() => ({}))
+    ]);
+    const staffRole = resolveStaffRoleForProfile(resolvedProfile, staffRoles);
+    const adminRole = getAdminRole(resolvedProfile, req.user.email || resolvedProfile.email || '');
+    const adminCapabilities = adminRole ? getAdminCapabilities(adminRole) : [];
+    const warnings = Array.isArray(resolvedProfile.warnings) ? resolvedProfile.warnings : [];
     const activeWarnings = warnings.filter(w => w && w.acknowledged !== true);
 
     res.json({
-      ...profile,
-      gamemodeRatings: playerData?.gamemodeRatings || profile.gamemodeRatings || {},
-      overallRating: playerData?.overallRating ?? profile.overallRating ?? 0,
+      ...resolvedProfile,
+      adminContext: adminRole ? {
+        role: adminRole,
+        capabilities: adminCapabilities,
+        isOwner: adminCapabilities.includes('*')
+      } : null,
+      staffRole,
+      gamemodeRatings: playerData?.gamemodeRatings || resolvedProfile.gamemodeRatings || {},
+      overallRating: playerData?.overallRating ?? resolvedProfile.overallRating ?? 0,
       blacklisted: moderation.blacklisted,
       warnings: activeWarnings,
       moderation: {
@@ -2466,14 +3450,34 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
       });
     }
 
-    // Block blacklisted usernames before linking to avoid blacklisting the account itself
-    const normalizedUsername = username.trim().toLowerCase();
-    const usernameBlocked = await isUsernameBlacklisted(normalizedUsername);
-    if (usernameBlocked) {
+    const mojangProfile = await fetchMojangProfile(username.trim()).catch((error) => {
+      throw Object.assign(new Error('Could not verify username with Mojang API. Please try again later.'), {
+        statusCode: 503,
+        errorCode: 'MOJANG_API_UNAVAILABLE',
+        cause: error
+      });
+    });
+
+    if (!mojangProfile) {
+      return res.status(404).json({
+        error: true,
+        code: 'USERNAME_NOT_FOUND',
+        message: 'Minecraft username was not found through the Mojang API.'
+      });
+    }
+
+    const normalizedUsername = normalizeMinecraftUsername(mojangProfile.username);
+    const mojangUuid = normalizeMinecraftUUID(mojangProfile.uuid);
+    const blacklistEntry = await findActiveBlacklistEntry({
+      userId: req.user.uid,
+      username: mojangProfile.username,
+      uuid: mojangUuid
+    });
+    if (blacklistEntry) {
       return res.status(403).json({
         error: true,
         code: 'USERNAME_BLACKLISTED',
-        message: 'This Minecraft username is blacklisted and cannot be linked to an account.'
+        message: 'This Minecraft account is blacklisted and cannot be linked to an account.'
       });
     }
 
@@ -2535,20 +3539,37 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
     const existingPlayers = existingPlayersSnapshot.val() || {};
 
     for (const [key, player] of Object.entries(existingPlayers)) {
-      if (player.username?.toLowerCase() === normalizedUsername && player.userId && player.userId !== req.user.uid) {
+      const playerUuid = normalizeMinecraftUUID(player.minecraftUUID);
+      if (((player.username?.toLowerCase() === normalizedUsername) || (playerUuid && playerUuid === mojangUuid)) && player.userId && player.userId !== req.user.uid) {
         return res.status(409).json({
           error: true,
           code: 'USERNAME_ALREADY_LINKED',
-          message: 'This Minecraft username is already linked to another account. Each username can only be linked to one account.'
+          message: 'This Minecraft account is already linked to another account. Each Minecraft account can only be linked once.'
+        });
+      }
+    }
+
+    const usersSnapshot = await db.ref('users').once('value');
+    const allUsers = usersSnapshot.val() || {};
+    for (const [otherUserId, otherUser] of Object.entries(allUsers)) {
+      if (otherUserId === req.user.uid) continue;
+      const otherUsername = normalizeMinecraftUsername(otherUser?.minecraftUsername);
+      const otherUuid = normalizeMinecraftUUID(otherUser?.minecraftUUID || otherUser?.pendingMinecraftUUID);
+      if ((otherUsername && otherUsername === normalizedUsername) || (otherUuid && otherUuid === mojangUuid)) {
+        return res.status(409).json({
+          error: true,
+          code: 'USERNAME_ALREADY_LINKED',
+          message: 'This Minecraft account is already linked to another account. Each Minecraft account can only be linked once.'
         });
       }
     }
 
     // Update user profile with pending verification
     await userRef.update({
-      minecraftUsername: username.trim(),
+      minecraftUsername: mojangProfile.username,
       region: region.trim(),
       minecraftVerified: false,
+      pendingMinecraftUUID: mojangUuid,
       updatedAt: new Date().toISOString()
     });
     
@@ -2558,7 +3579,8 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
     // Create pending verification entry (reuse existing pendingVerificationsRef)
     const verificationData = {
       userId: req.user.uid,
-      expectedUsername: username.trim(),
+      expectedUsername: mojangProfile.username,
+      expectedUUID: mojangUuid,
       region: region.trim(),
       verificationCode: verificationCode,
       playerUUID: null, // Will be set when player runs /link command
@@ -2572,14 +3594,16 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
       success: true,
       message: 'Minecraft username linking initiated. Please join any server with the MCLeaderboardsAuth plugin and run /link with your verification code to complete verification.',
       verificationCode: verificationCode,
+      username: mojangProfile.username,
+      uuid: mojangUuid,
       instructions: `Join one of our active servers (mc.sidastuff.com or spectorsmp.pineserver.xyz) and run the /link ${verificationCode} command to verify your account.`
     });
   } catch (error) {
     console.error('Error initiating Minecraft username linking:', error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       error: true,
-      code: 'SERVER_ERROR',
-      message: 'Error initiating Minecraft username linking'
+      code: error.errorCode || 'SERVER_ERROR',
+      message: error.message || 'Error initiating Minecraft username linking'
     });
   }
 });
@@ -2602,6 +3626,7 @@ let matchmakingJobRunning = false;
 let blacklistMatchJobRunning = false;
 let missedTimeoutsJobRunning = false;
 let securityMonitorJobRunning = false;
+let maintenanceJobRunning = false;
 
 // Memory optimization: Limit cache size and clear old entries
 setInterval(() => {
@@ -2650,7 +3675,7 @@ app.get('/api/players', async (req, res) => {
     }
     
     // Batch database queries in parallel
-    const [playersSnapshot, blacklistSnapshot, usersSnapshot] = await Promise.all([
+    const [playersSnapshot, blacklistSnapshot, usersSnapshot, staffRolesSnapshot] = await Promise.all([
       db.ref('players').once('value'),
       // Check blacklist cache
       (now - playersCache.blacklistUpdatedAt) < playersCache.blacklistTTL && playersCache.blacklist
@@ -2661,12 +3686,14 @@ app.get('/api/players', async (req, res) => {
             return snap;
           }),
       // Always load users (for retirement check AND role badge enrichment)
-      db.ref('users').once('value')
+      db.ref('users').once('value'),
+      db.ref('settings/staffRoles').once('value')
     ]);
     
     const players = playersSnapshot.val() || {};
     const blacklist = blacklistSnapshot.val() || {};
     const users = usersSnapshot.val() || {};
+    const staffRoles = staffRolesSnapshot.val() || {};
     
     const blacklistedUsernames = new Set(
       Object.values(blacklist)
@@ -2679,6 +3706,8 @@ app.get('/api/players', async (req, res) => {
     // The RTDB key IS the Firebase UID — do not rely on user.uid / user.userId fields
     const retirementMap = {};
     const userRoleMap = {};
+    const userPlusMap = {};
+    const userStaffRoleMap = {};
     Object.entries(users).forEach(([uid, user]) => {
       if (!user) return;
       if (user.admin === true || user.tester === true || user.adminRole) {
@@ -2689,6 +3718,13 @@ app.get('/api/players', async (req, res) => {
       }
       if (user.retiredGamemodes) {
         retirementMap[uid] = user.retiredGamemodes;
+      }
+      if (user.plus) {
+        userPlusMap[uid] = user.plus;
+      }
+      const resolvedStaffRole = resolveStaffRoleForProfile(user, staffRoles);
+      if (resolvedStaffRole) {
+        userStaffRoleMap[uid] = resolvedStaffRole;
       }
     });
     
@@ -2712,6 +3748,12 @@ app.get('/api/players', async (req, res) => {
       return {
         id: key,
         ...player,
+        plus: (() => {
+          if (player.plus && (player.plus.active === true || player.plus.gradient || player.plus.showBadge !== undefined)) {
+            return player.plus;
+          }
+          return player.userId ? (userPlusMap[player.userId] || player.plus || null) : (player.plus || null);
+        })(),
         blacklisted: isBlacklisted,
         overallRating,
         gamemodeRatings: isBlacklisted ? {} : (player.gamemodeRatings || {}),
@@ -2725,7 +3767,8 @@ app.get('/api/players', async (req, res) => {
             admin: fromRoles.admin || fromUser.admin === true,
             tester: fromRoles.tester || fromUser.tester === true
           };
-        })()
+        })(),
+        verifiedStaffRole: player.userId ? (userStaffRoleMap[player.userId] || null) : null
       };
     });
     
@@ -2932,11 +3975,22 @@ app.get('/api/players/username/:username', async (req, res) => {
     }
     
     // Search for player by username (case-insensitive)
+    const normalizedQuery = normalizeMinecraftUsername(username);
     const playersRef = db.ref('players');
-    const snapshot = await playersRef.orderByChild('username').equalTo(username).once('value');
-    const players = snapshot.val();
-    
-    if (!players) {
+    const snapshot = await playersRef.once('value');
+    const players = snapshot.val() || {};
+
+    let playerId = null;
+    let player = null;
+    for (const [id, candidate] of Object.entries(players)) {
+      if (normalizeMinecraftUsername(candidate?.username) === normalizedQuery) {
+        playerId = id;
+        player = candidate;
+        break;
+      }
+    }
+
+    if (!playerId || !player) {
       return res.status(404).json({
         error: true,
         code: 'NOT_FOUND',
@@ -2944,23 +3998,40 @@ app.get('/api/players/username/:username', async (req, res) => {
       });
     }
     
-    // Get the first (and should be only) player
-    const playerId = Object.keys(players)[0];
-    const player = players[playerId];
-    
-    // Check if player is blacklisted
-    const blacklistRef = db.ref('blacklist');
-    const blacklistSnapshot = await blacklistRef.once('value');
-    const blacklist = blacklistSnapshot.val() || {};
-    const isBlacklisted = Object.values(blacklist).some(entry => 
-      entry.username && entry.username.toLowerCase() === username.toLowerCase()
-    );
+    const [staffRoles, usersSnapshot] = await Promise.all([
+      getAllStaffRoles().catch(() => ({})),
+      db.ref('users').once('value')
+    ]);
+    const allUsers = usersSnapshot.val() || {};
+
+    let userProfile = null;
+    if (player.userId && allUsers[player.userId]) {
+      userProfile = allUsers[player.userId];
+    } else {
+      const normalizedPlayerUsername = normalizeMinecraftUsername(player.username);
+      const userEntry = Object.values(allUsers).find((candidate) => normalizeMinecraftUsername(candidate?.minecraftUsername) === normalizedPlayerUsername);
+      userProfile = userEntry || null;
+    }
+
+    const resolvedStaffRole = userProfile ? resolveStaffRoleForProfile(userProfile, staffRoles) : null;
+    const verifiedRoles = {
+      admin: Boolean(userProfile?.admin === true || userProfile?.adminRole),
+      tester: Boolean(userProfile?.tester === true)
+    };
+    const plus = userProfile?.plus || player.plus || null;
+
+    const isBlacklisted = Boolean(await findActiveBlacklistEntry({
+      username: player.username,
+      uuid: player.minecraftUUID
+    }));
     
     // If blacklisted, return minimal info
     if (isBlacklisted) {
       return res.json({
         uuid: player.minecraftUUID || playerId,
         name: player.username,
+        username: player.username,
+        userId: player.userId || null,
         blacklisted: true,
         rankings: {},
         region: player.region || 'Unknown',
@@ -2969,7 +4040,11 @@ app.get('/api/players/username/:username', async (req, res) => {
         overallRating: 0,
         globalRank: null,
         badges: [],
-        combat_master: false
+        combat_master: false,
+        plus,
+        verifiedRoles,
+        staffRole: resolvedStaffRole,
+        retiredGamemodes: userProfile?.retiredGamemodes || {}
       });
     }
     
@@ -3002,6 +4077,8 @@ app.get('/api/players/username/:username', async (req, res) => {
     const response = {
       uuid: player.minecraftUUID || playerId,
       name: player.username,
+      username: player.username,
+      userId: player.userId || null,
       rankings: {},
       region: player.region || 'Unknown',
       points: 0, // Deprecated - use overallRating instead
@@ -3010,7 +4087,11 @@ app.get('/api/players/username/:username', async (req, res) => {
       globalRank: globalRank,
       blacklisted: false,
       badges: [],
-      combat_master: false
+      combat_master: false,
+      plus,
+      verifiedRoles,
+      staffRole: resolvedStaffRole,
+      retiredGamemodes: userProfile?.retiredGamemodes || {}
     };
     
     // Convert gamemode ratings to rankings format
@@ -3153,16 +4234,16 @@ app.post('/api/auth/check-ban', async (req, res) => {
 async function logAdminAction(req, adminUid, action, targetUserId = null, details = {}) {
   try {
     const auditLogRef = db.ref('adminAuditLog');
-    const logEntry = {
+    const logEntry = sanitizeFirebaseValue({
       id: Date.now().toString(),
       timestamp: new Date().toISOString(),
       adminUid: adminUid,
       action: action,
       targetUserId: targetUserId,
-      details: details,
+      details: details || {},
       ipAddress: getClientIP(req),
       userAgent: req.headers['user-agent'] || 'Unknown'
-    };
+    });
 
     await auditLogRef.push(logEntry);
     logger.audit('Admin action recorded', { adminUid, action, targetUserId });
@@ -3568,6 +4649,7 @@ app.post('/api/auth/cleanup-minecraft', verifyAuth, async (req, res) => {
       minecraftVerified: false,
       region: null,
       minecraftUUID: null,
+      pendingMinecraftUUID: null,
       verifiedAt: null
     });
 
@@ -3633,8 +4715,9 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
     }
 
     const { playerUUID, playerName, serverName, verificationCode } = req.body;
+    const normalizedPlayerUUID = normalizeMinecraftUUID(playerUUID);
 
-    if (!playerUUID || !playerName || !serverName || !verificationCode) {
+    if (!normalizedPlayerUUID || !playerName || !serverName || !verificationCode) {
       return res.status(400).json({
         error: true,
         code: 'MISSING_DATA',
@@ -3660,7 +4743,15 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
         // Found code, now check if username matches expected username for this user
         // Support both old playerName field and new expectedUsername field for backward compatibility
         const expectedUsername = verification.expectedUsername || verification.playerName;
-        if (expectedUsername === playerName) {
+        if (normalizeMinecraftUsername(expectedUsername) === normalizeMinecraftUsername(playerName)) {
+          const expectedUUID = normalizeMinecraftUUID(verification.expectedUUID);
+          if (expectedUUID && expectedUUID !== normalizedPlayerUUID) {
+            return res.status(400).json({
+              error: true,
+              code: 'UUID_MISMATCH',
+              message: 'This verification code is bound to a different Minecraft account UUID.'
+            });
+          }
           verificationKey = key;
           userId = verification.userId;
           break;
@@ -3689,7 +4780,7 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
 
     // Update the pending verification with the player's UUID for future reference
     await pendingVerificationsRef.child(verificationKey).update({
-      playerUUID: playerUUID
+      playerUUID: normalizedPlayerUUID
     });
 
     // Update user profile with verified status
@@ -3701,7 +4792,8 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
 
     await userRef.update({
       minecraftVerified: true,
-      minecraftUUID: playerUUID,
+      minecraftUUID: normalizedPlayerUUID,
+      pendingMinecraftUUID: null,
       usernameLocked: true, // Lock username changes once verified
       verifiedAt: new Date().toISOString()
     });
@@ -3720,7 +4812,8 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
 
     // Find existing player by normalized username
     for (const [key, player] of Object.entries(existingPlayers)) {
-      if (player.username?.toLowerCase() === normalizedUsername) {
+      const playerUuid = normalizeMinecraftUUID(player.minecraftUUID);
+      if (player.username?.toLowerCase() === normalizedUsername || (playerUuid && playerUuid === normalizedPlayerUUID)) {
         playerKey = key;
         break;
       }
@@ -3728,6 +4821,7 @@ app.post('/api/auth/verify-minecraft', async (req, res) => {
 
     const playerData = {
       username: playerName.trim(),
+      minecraftUUID: normalizedPlayerUUID,
       userId: userId,
       region: userRegion, // Use the user's actual region
       blacklisted: false,
@@ -3774,7 +4868,7 @@ app.post('/api/auth/login', verifyAuth, checkBanned, async (req, res) => {
 
     // Get current user profile
     const userSnapshot = await userRef.once('value');
-    const userProfile = userSnapshot.val();
+    let userProfile = userSnapshot.val();
 
     if (!userProfile) {
       return res.status(404).json({
@@ -3783,6 +4877,8 @@ app.post('/api/auth/login', verifyAuth, checkBanned, async (req, res) => {
         message: 'User profile not found'
       });
     }
+
+    userProfile = await ensureMinecraftUuidLinkedForUser(req.user.uid, userProfile) || userProfile;
 
     // Check for alt accounts on login
     const altDetection = await detectAltAccount(req.user.email, realClientIP, userProfile.minecraftUsername);
@@ -3854,9 +4950,12 @@ app.post('/api/auth/login', verifyAuth, checkBanned, async (req, res) => {
  */
 app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimiter, async (req, res) => {
   // Check for bot activity (ToS Section 4)
+  const { gamemodes: requestedGamemodes, regions: requestedRegions } = normalizeQueueSelections(req.body);
   const botCheck = await detectBotActivity(req.user.uid, 'queue_join', {
-    gamemode: req.body.gamemode,
-    region: req.body.region
+    gamemodes: requestedGamemodes,
+    regions: requestedRegions,
+    gamemode: requestedGamemodes[0] || req.body.gamemode,
+    region: requestedRegions[0] || req.body.region
   });
   
   if (botCheck.suspicious && botCheck.severity === 'high') {
@@ -3868,14 +4967,14 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
   }
 
   // Extract and sanitize inputs for error logging
-    const { gamemode, region, serverIP } = req.body;
-  const sanitizedGamemode = gamemode?.toString().trim();
-  const sanitizedRegion = region?.toString().trim();
+  const { serverIP } = req.body;
+  const selectedGamemodes = requestedGamemodes;
+  const selectedRegions = requestedRegions;
   const sanitizedServerIP = serverIP?.toString().trim();
     
   try {
 
-    if (!sanitizedGamemode || !sanitizedRegion || !sanitizedServerIP) {
+    if (!selectedGamemodes.length || !selectedRegions.length || !sanitizedServerIP) {
       return res.status(400).json({
         error: true,
         code: 'VALIDATION_ERROR',
@@ -3883,16 +4982,17 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       });
     }
 
-    // Validate server IP is whitelisted
-    const whitelistedServersRef = db.ref('whitelistedServers');
-    const whitelistedServersSnapshot = await whitelistedServersRef.once('value');
-    const whitelistedServers = whitelistedServersSnapshot.val() || {};
-    
-    const isWhitelisted = Object.values(whitelistedServers).some(server => 
-      server.ip && server.ip.toLowerCase() === sanitizedServerIP.toLowerCase()
-    );
-    
-    if (!isWhitelisted) {
+    const invalidRegions = selectedRegions.filter((region) => !ALLOWED_REGIONS.has(region));
+    if (invalidRegions.length > 0) {
+      return res.status(400).json({
+        error: true,
+        code: 'VALIDATION_ERROR',
+        message: `Invalid region selection: ${invalidRegions.join(', ')}`
+      });
+    }
+
+    const resolvedServerIP = await getCanonicalWhitelistedServerIP(sanitizedServerIP);
+    if (!resolvedServerIP) {
       return res.status(400).json({
         error: true,
         code: 'SERVER_NOT_WHITELISTED',
@@ -3900,15 +5000,14 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       });
     }
 
-    // Validate gamemode exists
-    const validGamemode = CONFIG.GAMEMODES.find(g => g.id === sanitizedGamemode);
-    console.log('Validating gamemode:', sanitizedGamemode, 'found:', !!validGamemode);
-    if (!validGamemode) {
-      console.log('Available gamemodes:', CONFIG.GAMEMODES.map(g => g.id));
+    // Validate selected gamemodes
+    const configuredGamemodes = new Set((CONFIG.GAMEMODES || []).map((g) => g.id).filter(Boolean));
+    const invalidGamemodes = selectedGamemodes.filter((gamemode) => !configuredGamemodes.has(gamemode));
+    if (invalidGamemodes.length > 0) {
       return res.status(400).json({
         error: true,
         code: 'VALIDATION_ERROR',
-        message: `Invalid gamemode: ${sanitizedGamemode}`
+        message: `Invalid gamemode selection: ${invalidGamemodes.join(', ')}`
       });
     }
     
@@ -3927,57 +5026,15 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       });
     }
 
-    // Check if gamemode is retired
-    if (isUserRetiredFromGamemode(userProfile, sanitizedGamemode)) {
+    // Check if any selected gamemode is retired for this user
+    const retiredSelections = selectedGamemodes.filter((gamemode) => isUserRetiredFromGamemode(userProfile, gamemode));
+    if (retiredSelections.length > 0) {
       return res.status(403).json({
         error: true,
         code: 'GAMEMODE_RETIRED',
-        message: 'You have retired from this gamemode and cannot join the queue'
+        message: `You have retired from: ${retiredSelections.map((gm) => gm.toUpperCase()).join(', ')}`
       });
     }
-
-    // Check if testers are available for this specific gamemode and region
-    const testerAvailabilityRef = db.ref('testerAvailability');
-    const testerAvailabilitySnapshot = await testerAvailabilityRef.once('value');
-    const testerAvailability = testerAvailabilitySnapshot.val() || {};
-
-    // Get all players for region info
-    const playersRef = db.ref('players');
-    const playersSnapshot = await playersRef.once('value');
-    const allPlayers = playersSnapshot.val() || {};
-    const playerByUserId = new Map(
-      Object.values(allPlayers)
-        .filter(p => p?.userId)
-        .map(p => [p.userId, p])
-    );
-
-    // Load active matches once to avoid N+1 reads in tester availability loop
-    const activeMatchesRef = db.ref('matches');
-    const activeMatchesSnapshot = await activeMatchesRef
-      .orderByChild('status')
-      .equalTo('active')
-      .once('value');
-    const activeMatchesForTesterAvailability = activeMatchesSnapshot.val() || {};
-    const busyTesterIds = new Set(
-      Object.values(activeMatchesForTesterAvailability)
-        .map(match => match?.testerId)
-        .filter(Boolean)
-    );
-
-    // Check for available testers in the same gamemode and region
-    let availableTestersCount = 0;
-    for (const [userId, availability] of Object.entries(testerAvailability)) {
-      const testerPlayer = playerByUserId.get(userId);
-      const fallbackRegion = testerPlayer?.region || null;
-      if (!availabilityMatchesGamemodeRegion(availability, sanitizedGamemode, sanitizedRegion, fallbackRegion)) continue;
-
-      // Check if tester is not in an active match
-      if (busyTesterIds.has(userId)) continue;
-
-      availableTestersCount++;
-    }
-
-    // (No testers available is allowed — player stays in queue until one becomes available)
 
     // Check if player has skill level for this gamemode - REQUIRED before queuing
     const playersRefForQueue = db.ref('players');
@@ -3992,15 +5049,12 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       playerData = players[playerId];
     }
     
-    console.log('Checking skill level for gamemode:', sanitizedGamemode, 'player ratings:', playerData?.gamemodeRatings);
-    
-    // If player doesn't exist or doesn't have rating for this gamemode, reject queue join
-    if (!playerData || !playerData.gamemodeRatings || !playerData.gamemodeRatings[sanitizedGamemode]) {
-      console.log('Skill level missing for gamemode:', sanitizedGamemode, 'rejecting queue join');
+    const missingRatings = selectedGamemodes.filter((gamemode) => !playerData?.gamemodeRatings?.[gamemode]);
+    if (missingRatings.length > 0) {
       return res.status(400).json({
         error: true,
         code: 'SKILL_LEVEL_REQUIRED',
-        message: `You need to set your skill level for ${sanitizedGamemode.toUpperCase()} before queuing. Complete onboarding or update your skill levels in Account settings.`
+        message: `Set your skill level first for: ${missingRatings.map((gm) => gm.toUpperCase()).join(', ')}`
       });
     }
     
@@ -4045,22 +5099,18 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       });
     }
 
-    // Check if user has cooldown for this gamemode.
+    // Check if user has cooldown for any selected gamemode.
     // Testers and admins are exempt – they can run unlimited matches.
     const isTesterOrAdmin = !!(userProfile.tester === true || userProfile.admin === true || userProfile.adminRole);
     if (!isTesterOrAdmin) {
-      const lastTested = userProfile.lastTested || {};
-      if (lastTested[sanitizedGamemode]) {
-        const lastTestedTime = new Date(lastTested[sanitizedGamemode]);
-        const elapsed = new Date() - lastTestedTime;
-        const cooldownMs = 60 * 60 * 1000; // 1 hour per gamemode
-
-        if (elapsed < cooldownMs) {
-          const remainingMinutes = Math.ceil((cooldownMs - elapsed) / (60 * 1000));
+      for (const gamemode of selectedGamemodes) {
+        const cooldownState = getQueueCooldownState(userProfile, gamemode);
+        if (!cooldownState.allowed) {
+          const remainingMinutes = Math.ceil(cooldownState.remainingMs / (60 * 1000));
           return res.status(400).json({
             error: true,
             code: 'COOLDOWN_ACTIVE',
-            message: `You must wait ${remainingMinutes} more minute${remainingMinutes === 1 ? '' : 's'} before queuing for ${sanitizedGamemode.toUpperCase()}. You can queue for other gamemodes in the meantime.`
+            message: `${cooldownState.reason} You can queue for ${gamemode.toUpperCase()} again in about ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`
           });
         }
       }
@@ -4068,16 +5118,17 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
     
     // Create queue entry
     const newQueueRef = queueRef.push();
-    const queueEntry = {
+    const queueEntry = buildQueueEntry({
       queueId: newQueueRef.key,
       userId: req.user.uid,
       minecraftUsername: userProfile.minecraftUsername,
-      gamemode: sanitizedGamemode,
-      region: sanitizedRegion,
-      serverIP: sanitizedServerIP,
-      status: 'waiting',
-      joinedAt: new Date().toISOString()
-    };
+      gamemodes: selectedGamemodes,
+      regions: selectedRegions,
+      serverIP: resolvedServerIP,
+      rolePreference: 'player',
+      testerEligible: hasTierTesterQueueRole(userProfile),
+      source: 'player_queue'
+    });
     
     await newQueueRef.set(queueEntry);
     
@@ -4100,7 +5151,7 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
         success: true,
         queueId: newQueueRef.key,
         matched: false,
-        message: 'Added to queue. Waiting for available tester...'
+        message: 'Added to queue. Waiting for a compatible match...'
       });
     }
   } catch (error) {
@@ -4109,8 +5160,8 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
       message: error.message,
       stack: error.stack,
       userId: req.user?.uid,
-      gamemode: sanitizedGamemode,
-      region: sanitizedRegion,
+      gamemodes: selectedGamemodes,
+      regions: selectedRegions,
       serverIP: sanitizedServerIP
     });
     res.status(500).json({
@@ -4127,79 +5178,76 @@ app.post('/api/queue/join', verifyAuthAndNotBanned, requireRecaptcha, queueLimit
  */
 app.get('/api/queue/stats', verifyAuthAndNotBanned, async (req, res) => {
   try {
-    // Get all queue entries
-    const queueRef = db.ref('queue');
-    const queueSnapshot = await queueRef.once('value');
+    const [queueSnapshot, activeMatchesSnapshot] = await Promise.all([
+      db.ref('queue').once('value'),
+      db.ref('matches').orderByChild('status').equalTo('active').once('value')
+    ]);
+
     const queueEntries = queueSnapshot.val() || {};
-
-    // Get all tester availabilities
-    const availabilityRef = db.ref('testerAvailability');
-    const availabilitySnapshot = await availabilityRef.once('value');
-    const testerAvailabilities = availabilitySnapshot.val() || {};
-
-    // Get all players for region info
-    const playersRef = db.ref('players');
-    const playersSnapshot = await playersRef.once('value');
-    const allPlayers = playersSnapshot.val() || {};
-
-    // Get active matches to exclude busy testers
-    const activeMatchesRef = db.ref('matches');
-    const activeMatchesSnapshot = await activeMatchesRef
-      .orderByChild('status')
-      .equalTo('active')
-      .once('value');
     const activeMatches = activeMatchesSnapshot.val() || {};
+
+    const busyUserIds = new Set();
+    Object.values(activeMatches).forEach((match) => {
+      if (!match || match.finalized) return;
+      if (match.playerId) busyUserIds.add(match.playerId);
+      if (match.testerId) busyUserIds.add(match.testerId);
+    });
+
+    const queueList = Object.values(queueEntries).filter((entry) => (
+      entry?.userId
+      && !busyUserIds.has(entry.userId)
+      && getQueueGamemodeList(entry).length > 0
+      && getQueueRegionList(entry).length > 0
+      && !isQueueEntryExpired(entry)
+    ));
 
     // Count players queued by gamemode and region
     const playersQueued = {};
-    Object.values(queueEntries).forEach(entry => {
-      const gamemode = entry.gamemode;
-      const region = entry.region;
+    queueList.forEach(entry => {
+      const gamemodes = getQueueGamemodeList(entry);
+      const regions = getQueueRegionList(entry);
+      if (!gamemodes.length || !regions.length) return;
 
-      if (!playersQueued[gamemode]) {
-        playersQueued[gamemode] = {};
-      }
-      if (!playersQueued[gamemode][region]) {
-        playersQueued[gamemode][region] = 0;
-      }
-      playersQueued[gamemode][region]++;
+      gamemodes.forEach((gamemode) => {
+        if (!playersQueued[gamemode]) {
+          playersQueued[gamemode] = {};
+        }
+        regions.forEach((region) => {
+          if (!playersQueued[gamemode][region]) {
+            playersQueued[gamemode][region] = 0;
+          }
+          playersQueued[gamemode][region]++;
+        });
+      });
     });
 
-    // Count available testers by gamemode and region
     const testersAvailable = {};
-    for (const [userId, availability] of Object.entries(testerAvailabilities)) {
-      if (!availability?.available) continue;
+    queueList.forEach((entry) => {
+      if (!isQueueEntryTesterEligible(entry)) return;
+      const selectedGamemodes = getQueueGamemodeList(entry);
+      const selectedRegions = getQueueRegionList(entry);
+      selectedGamemodes.forEach((selectedGamemode) => {
+        if (!testersAvailable[selectedGamemode]) {
+          testersAvailable[selectedGamemode] = {};
+        }
 
-      // Check if tester is not in an active match
-      const isInActiveMatch = Object.values(activeMatches).some(match =>
-        match.testerId === userId
-      );
-      if (isInActiveMatch) continue;
-
-      const testerPlayer = Object.values(allPlayers).find(p => p.userId === userId);
-      const fallbackRegion = testerPlayer?.region || null;
-      const gamemodeList = getAvailabilityGamemodeList(availability);
-      const regionList = getAvailabilityRegionList(availability, fallbackRegion);
-
-      gamemodeList.forEach((selectedGamemode) => {
-        regionList.forEach((selectedRegion) => {
-          if (!testersAvailable[selectedGamemode]) {
-            testersAvailable[selectedGamemode] = {};
-          }
+        selectedRegions.forEach((selectedRegion) => {
           if (!testersAvailable[selectedGamemode][selectedRegion]) {
             testersAvailable[selectedGamemode][selectedRegion] = 0;
           }
           testersAvailable[selectedGamemode][selectedRegion]++;
         });
       });
-    }
+    });
+
+    const totalAvailableTesters = queueList.filter((entry) => isQueueEntryTesterEligible(entry)).length;
 
     res.json({
       success: true,
       playersQueued,
       testersAvailable,
-      totalQueued: Object.values(queueEntries).length,
-      totalAvailableTesters: Object.keys(testerAvailabilities).length
+      totalQueued: queueList.length,
+      totalAvailableTesters
     });
   } catch (error) {
     console.error('Error getting queue stats:', error);
@@ -4242,53 +5290,55 @@ app.get('/api/dashboard/gamemode-stats', verifyAuthAndNotBanned, async (req, res
       });
     }
 
-    // Read queue + tester availability + active matches + players (for region info)
-    const [queueSnapshot, availabilitySnapshot, activeMatchesSnapshot, playersSnapshot] = await Promise.all([
+    const [queueSnapshot, activeMatchesSnapshot] = await Promise.all([
       db.ref('queue').once('value'),
-      db.ref('testerAvailability').once('value'),
-      db.ref('matches').orderByChild('status').equalTo('active').once('value'),
-      db.ref('players').once('value')
+      db.ref('matches').orderByChild('status').equalTo('active').once('value')
     ]);
 
     const queueEntries = queueSnapshot.val() || {};
-    const testerAvailabilities = availabilitySnapshot.val() || {};
     const activeMatches = activeMatchesSnapshot.val() || {};
-    const allPlayers = playersSnapshot.val() || {};
 
-    // Build a quick lookup of busy testers (currently in an active match)
-    const busyTesterIds = new Set();
+    // Build a quick lookup of busy users (currently in an active match)
+    const busyUserIds = new Set();
     Object.values(activeMatches).forEach(match => {
-      if (match?.testerId) busyTesterIds.add(match.testerId);
+      if (!match || match.finalized) return;
+      if (match.playerId) busyUserIds.add(match.playerId);
+      if (match.testerId) busyUserIds.add(match.testerId);
     });
+
+    const queueList = Object.values(queueEntries).filter((entry) => (
+      entry?.userId
+      && !busyUserIds.has(entry.userId)
+      && !isQueueEntryExpired(entry)
+    ));
 
     // Count players queued by gamemode (filter by region if specified)
     const playersQueuedByGamemode = {};
-    Object.values(queueEntries).forEach(entry => {
-      const gm = entry?.gamemode;
-      if (!gm) return;
-      
-      // Filter by region if specified
-      if (regionFilter && entry?.region !== regionFilter) return;
-      
-      playersQueuedByGamemode[gm] = (playersQueuedByGamemode[gm] || 0) + 1;
+    queueList.forEach(entry => {
+      const gamemodes = getQueueGamemodeList(entry);
+      const regions = getQueueRegionList(entry);
+      if (!gamemodes.length || !regions.length) return;
+
+      const regionMatches = !regionFilter || regions.includes(regionFilter);
+      if (!regionMatches) return;
+
+      gamemodes.forEach((gm) => {
+        playersQueuedByGamemode[gm] = (playersQueuedByGamemode[gm] || 0) + 1;
+      });
     });
 
-    // Count available testers by gamemode (exclude expired + busy, filter by region if specified)
     const testersAvailableByGamemode = {};
-    for (const [userId, availability] of Object.entries(testerAvailabilities)) {
-      if (!availability?.available) continue;
-      if (busyTesterIds.has(userId)) continue;
+    queueList.forEach((entry) => {
+      if (!isQueueEntryTesterEligible(entry)) return;
+      const gamemodes = getQueueGamemodeList(entry);
+      const regions = getQueueRegionList(entry);
+      if (!gamemodes.length || !regions.length) return;
+      if (regionFilter && !regions.includes(regionFilter)) return;
 
-      const player = Object.values(allPlayers).find((p) => p.userId === userId);
-      const fallbackRegion = player?.region || null;
-      const regionList = getAvailabilityRegionList(availability, fallbackRegion);
-      if (regionFilter && !regionList.includes(regionFilter)) continue;
-
-      const gmList = getAvailabilityGamemodeList(availability);
-      gmList.forEach((gm) => {
+      gamemodes.forEach((gm) => {
         testersAvailableByGamemode[gm] = (testersAvailableByGamemode[gm] || 0) + 1;
       });
-    }
+    });
 
     // Count active matches by gamemode (filter by region if specified)
     const activeMatchesByGamemode = {};
@@ -4348,28 +5398,24 @@ app.get('/api/user/cooldowns', verifyAuthAndNotBanned, async (req, res) => {
     const userRef = db.ref(`users/${req.user.uid}`);
     const userSnapshot = await userRef.once('value');
     const userData = userSnapshot.val() || {};
-
-    const lastTested = userData.lastTested || {};
     const cooldowns = [];
-    const now = new Date();
 
     // Check each gamemode for active cooldowns
     const gamemodes = ['vanilla', 'uhc', 'pot', 'nethop', 'smp', 'sword', 'axe', 'mace'];
 
     gamemodes.forEach(gamemode => {
-      if (lastTested[gamemode]) {
-        const lastTestedTime = new Date(lastTested[gamemode]);
-        const elapsed = now - lastTestedTime;
-        const cooldownMs = 60 * 60 * 1000; // 1 hour
-        const remainingMs = cooldownMs - elapsed;
-
-        if (remainingMs > 0) {
-          cooldowns.push({
-            gamemode,
-            lastTested: lastTested[gamemode],
-            remainingMs
-          });
-        }
+      const cooldownState = getQueueCooldownState(userData, gamemode);
+      if (!cooldownState.allowed) {
+        const startedAtMs = parseDateToMs(cooldownState.startedAt);
+        cooldowns.push({
+          gamemode,
+          type: cooldownState.type,
+          reason: cooldownState.reason,
+          startedAt: cooldownState.startedAt,
+          remainingMs: cooldownState.remainingMs,
+          expiresAt: startedAtMs ? new Date(startedAtMs + QUEUE_COOLDOWN_MS).toISOString() : null,
+          eventLabel: cooldownState.type === 'testing' ? 'Recently tested' : 'Recently completed a match'
+        });
       }
     });
 
@@ -4392,25 +5438,16 @@ app.get('/api/user/cooldowns', verifyAuthAndNotBanned, async (req, res) => {
  */
 app.post('/api/queue/leave', verifyAuthAndNotBanned, requireRecaptcha, queueLimiter, async (req, res) => {
   try {
-    const queueRef = db.ref('queue');
-    const queueSnapshot = await queueRef.orderByChild('userId').equalTo(req.user.uid).once('value');
-    
-    if (!queueSnapshot.exists()) {
+    const removedCount = await clearUserQueueEntries(req.user.uid);
+
+    if (removedCount === 0) {
       return res.status(404).json({
         error: true,
         code: 'NOT_IN_QUEUE',
         message: 'You are not in the queue'
       });
     }
-    
-    // Remove all queue entries for this user
-    const updates = {};
-    queueSnapshot.forEach(child => {
-      updates[child.key] = null;
-    });
-    
-    await queueRef.update(updates);
-    
+
     res.json({ success: true, message: 'Left queue successfully' });
   } catch (error) {
     console.error('Error leaving queue:', error);
@@ -4437,8 +5474,9 @@ app.get('/api/queue/status', verifyAuthAndNotBanned, async (req, res) => {
     const queueEntry = queueSnapshot.val();
     const entryKey = Object.keys(queueEntry)[0];
     const entry = queueEntry[entryKey];
+    const queueSummary = await buildQueueStatusSummary(entry, req.user.uid);
     
-    res.json({ inQueue: true, queueEntry: entry });
+    res.json({ inQueue: true, queueEntry: entry, queueSummary });
   } catch (error) {
     console.error('Error getting queue status:', error);
     res.status(500).json({
@@ -4499,6 +5537,140 @@ async function getPlayerRating(userId, gamemode) {
   }
 }
 
+const MATCH_START_TIMEOUT_MS = 5 * 60 * 1000;
+
+async function buildDrawRatingSnapshot(match) {
+  const [playerNewRating, testerNewRating] = await Promise.all([
+    getPlayerRating(match.playerId, match.gamemode),
+    getPlayerRating(match.testerId, match.gamemode)
+  ]);
+
+  return {
+    playerRatingChange: 0,
+    testerRatingChange: 0,
+    playerNewRating,
+    testerNewRating
+  };
+}
+
+async function finalizeMatchAsDrawWithoutScoring(matchId, match, { type = 'draw_vote', reason = 'Match ended as a draw without scoring.' } = {}) {
+  const matchRef = db.ref(`matches/${matchId}`);
+  const finalizedAt = new Date().toISOString();
+  const ratingChanges = await buildDrawRatingSnapshot(match);
+  const finalizationData = {
+    type,
+    reason,
+    playerScore: 0,
+    testerScore: 0,
+    playerUsername: match.playerUsername,
+    gamemode: match.gamemode,
+    ratingChanges
+  };
+
+  await matchRef.update({
+    finalized: true,
+    finalizedAt,
+    status: 'ended',
+    countdownStartedAt: null,
+    startCountdownHandled: true,
+    finalizationData
+  });
+
+  const playerRef = db.ref(`users/${match.playerId}`);
+  const playerSnap = await playerRef.once('value');
+  const playerData = playerSnap.val() || {};
+  const lastTested = playerData.lastTested || {};
+  lastTested[match.gamemode] = finalizedAt;
+  await playerRef.update({ lastTested });
+  await storeQueueCooldownTimestamps(match.playerId, match.gamemode);
+
+  await Promise.allSettled([
+    createNotification(match.playerId, {
+      type: 'match_finalized',
+      title: 'Match Ended (Draw)',
+      message: `Your ${match.gamemode} match ended as a draw. No rating change.`,
+      matchId,
+      gamemode: match.gamemode
+    }),
+    createNotification(match.testerId, {
+      type: 'match_finalized',
+      title: 'Match Ended (Draw)',
+      message: `Your ${match.gamemode} match ended as a draw. No rating change.`,
+      matchId,
+      gamemode: match.gamemode
+    })
+  ]);
+
+  fsWrite(`matchMetrics/${matchId}`, {
+    matchId,
+    playerId: match.playerId,
+    testerId: match.testerId,
+    gamemode: match.gamemode,
+    durationMs: new Date(finalizedAt).getTime() - new Date(match.createdAt).getTime(),
+    playerScore: 0,
+    testerScore: 0,
+    type,
+    reason,
+    createdAt: match.createdAt,
+    finalizedAt
+  }, false).catch(() => {});
+  computeAndStoreSecurityScore(match.playerId).catch(() => {});
+  computeAndStoreSecurityScore(match.testerId).catch(() => {});
+
+  await Promise.all([
+    requeueUserAfterFinalizedMatch(match, match.playerId, 'player'),
+    requeueUserAfterFinalizedMatch(match, match.testerId, 'tester')
+  ]);
+
+  return finalizationData;
+}
+
+async function handleMatchStartCountdownTimeout(matchId) {
+  try {
+    const matchRef = db.ref(`matches/${matchId}`);
+    const matchSnapshot = await matchRef.once('value');
+    const match = matchSnapshot.val();
+
+    if (!match || match.status !== 'active' || match.finalized || match.matchStarted || !match.countdownStartedAt) {
+      return;
+    }
+
+    const countdownStartedAt = new Date(match.countdownStartedAt).getTime();
+    if (Number.isNaN(countdownStartedAt) || (Date.now() - countdownStartedAt) < MATCH_START_TIMEOUT_MS) {
+      return;
+    }
+
+    const lockResult = await matchRef.child('startCountdownHandled').transaction((currentValue) => {
+      if (currentValue === true) {
+        return undefined;
+      }
+      return true;
+    });
+
+    if (!lockResult.committed) {
+      return;
+    }
+
+    console.log(`Match ${matchId}: Start countdown expired, finalizing as draw`);
+    await finalizeMatchAsDrawWithoutScoring(matchId, match, {
+      type: 'draw_timeout',
+      reason: 'Match was not marked as started within 5 minutes.'
+    });
+  } catch (error) {
+    console.error(`Error handling match start countdown timeout for match ${matchId}:`, error);
+  }
+}
+
+function scheduleMatchStartCountdownTimeout(matchId, delayMs = MATCH_START_TIMEOUT_MS) {
+  setTimeout(async () => {
+    try {
+      await handleMatchStartCountdownTimeout(matchId);
+    } catch (error) {
+      console.error(`Error in scheduled match start countdown timeout for match ${matchId}:`, error);
+    }
+  }, delayMs);
+}
+
 async function getPlayerGlicko2Data(userId, gamemode) {
   try {
     // Get Glicko-2 data from player record only
@@ -4524,36 +5696,14 @@ async function getPlayerGlicko2Data(userId, gamemode) {
  * Matchmaking algorithm
  */
 async function attemptMatchmaking() {
-  const gamemodes = ['vanilla', 'uhc', 'pot', 'nethop', 'smp', 'sword', 'axe', 'mace'];
-  
-  for (const gamemode of gamemodes) {
-    try {
-      await attemptMatchmakingForGamemode(gamemode);
-    } catch (error) {
-      console.error(`Matchmaking error for ${gamemode}:`, error);
-    }
-  }
-}
-
-/**
- * Attempt matchmaking for a specific gamemode
- */
-async function attemptMatchmakingForGamemode(gamemode) {
   const queueRef = db.ref('queue');
-  const queueSnapshot = await queueRef.orderByChild('gamemode').equalTo(gamemode).once('value');
-  
-  if (!queueSnapshot.exists()) {
-    return; // No one in queue for this gamemode
-  }
-  
-  const queueEntries = queueSnapshot.val();
-  let entries = Object.keys(queueEntries).map(key => ({
-    key,
-    ...queueEntries[key]
-  }));
+  const [queueSnapshot, activeMatchesSnapshot] = await Promise.all([
+    queueRef.once('value'),
+    db.ref('matches').orderByChild('status').equalTo('active').once('value')
+  ]);
 
-  // Guard: never consider users that are already in an active match.
-  const activeMatchesSnapshot = await db.ref('matches').orderByChild('status').equalTo('active').once('value');
+  if (!queueSnapshot.exists()) return;
+
   const activeMatches = activeMatchesSnapshot.val() || {};
   const busyUserIds = new Set();
   Object.values(activeMatches).forEach((m) => {
@@ -4561,91 +5711,115 @@ async function attemptMatchmakingForGamemode(gamemode) {
     if (m.playerId) busyUserIds.add(m.playerId);
     if (m.testerId) busyUserIds.add(m.testerId);
   });
-  entries = entries.filter((entry) => !busyUserIds.has(entry.userId));
-  if (entries.length < 2) {
-    return;
-  }
-  
-  const uniqueUserIds = [...new Set(entries.map(entry => entry.userId).filter(Boolean))];
+
+  let queueEntries = Object.keys(queueSnapshot.val() || {}).map((key) => ({ key, ...queueSnapshot.val()[key] }));
+  queueEntries = queueEntries
+    .filter((entry) => (
+      entry?.userId
+      && getQueueGamemodeList(entry).length > 0
+      && getQueueRegionList(entry).length > 0
+      && !busyUserIds.has(entry.userId)
+      && !isQueueEntryExpired(entry)
+    ))
+    .sort((a, b) => new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0));
+
+  if (queueEntries.length < 2) return;
+
+  const allUserIds = [...new Set(queueEntries.map((entry) => entry.userId))];
+
   const [userSnapshots, playerSnapshots] = await Promise.all([
-    Promise.all(uniqueUserIds.map(userId => db.ref(`users/${userId}`).once('value'))),
-    Promise.all(uniqueUserIds.map(userId => (
-      db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value')
-    )))
+    Promise.all(allUserIds.map((userId) => db.ref(`users/${userId}`).once('value'))),
+    Promise.all(allUserIds.map((userId) => db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value')))
   ]);
 
   const userProfilesById = new Map();
   const ratingsByUserId = new Map();
-  for (let i = 0; i < uniqueUserIds.length; i++) {
-    const userId = uniqueUserIds[i];
-    const userProfile = userSnapshots[i].val() || null;
-    userProfilesById.set(userId, userProfile);
-
+  for (let i = 0; i < allUserIds.length; i++) {
+    const userId = allUserIds[i];
+    userProfilesById.set(userId, userSnapshots[i].val() || null);
     const playerObj = playerSnapshots[i].val() || {};
     const playerData = Object.values(playerObj)[0];
-    ratingsByUserId.set(userId, playerData?.gamemodeRatings?.[gamemode] || 1000);
+    ratingsByUserId.set(userId, playerData?.gamemodeRatings || {});
   }
 
-  // Separate players and testers
-  const players = [];
-  const testers = [];
-  
-  for (const entry of entries) {
-    const userProfile = userProfilesById.get(entry.userId);
-    
-    if (userProfile && userProfile.tester) { // Changed from tierTester to tester
-      testers.push(entry);
-    } else {
-      players.push(entry);
-    }
-  }
-  
-  if (players.length === 0 || testers.length === 0) {
-    return; // Need both players and testers
-  }
+  const pairCandidates = [];
+  for (let i = 0; i < queueEntries.length; i++) {
+    const entryA = queueEntries[i];
+    const profileA = userProfilesById.get(entryA.userId) || {};
 
-  // Try to find the best match
-  const now = new Date();
-  let bestMatch = null;
-  let bestScore = Infinity;
-  
-  for (const player of players) {
-    const playerRating = ratingsByUserId.get(player.userId) || 1000;
+    for (let j = i + 1; j < queueEntries.length; j++) {
+      const entryB = queueEntries[j];
+      if (entryA.userId === entryB.userId) continue;
 
-    for (const tester of testers) {
-      // Skip if same person
-      if (player.userId === tester.userId) {
-        continue;
-      }
+      const profileB = userProfilesById.get(entryB.userId) || {};
+      const sharedSelections = getSharedQueueSelections(entryA, entryB);
+      if (!sharedSelections.length) continue;
 
-      const testerRating = ratingsByUserId.get(tester.userId) || 1000;
-      const matchScore = calculateMatchScore(playerRating, testerRating);
-      
-      // Check if both waited 5+ seconds
-      const playerWaitTime = now - new Date(player.joinedAt);
-      const testerWaitTime = now - new Date(tester.joinedAt);
-      
-      if (playerWaitTime < 5000 || testerWaitTime < 5000) {
-        continue;
-      }
-      
-      // Check overlap (both in queue together for 5+ seconds)
-      const overlapStart = new Date(Math.max(
-        new Date(player.joinedAt).getTime(),
-        new Date(tester.joinedAt).getTime()
-      ));
-      const overlapTime = now - overlapStart;
-      
-      if (overlapTime >= 5000 && matchScore < bestScore) {
-        bestMatch = { player, tester };
-        bestScore = matchScore;
+      for (const sharedSelection of sharedSelections) {
+        if (isUserRetiredFromGamemode(profileA, sharedSelection.gamemode)) continue;
+        if (isUserRetiredFromGamemode(profileB, sharedSelection.gamemode)) continue;
+
+        const assignment = resolveQueuedRoleAssignment(entryA, entryB, profileA, profileB, sharedSelection.gamemode);
+        if (!assignment) continue;
+
+        const ratingA = (ratingsByUserId.get(entryA.userId) || {})[sharedSelection.gamemode] || 1000;
+        const ratingB = (ratingsByUserId.get(entryB.userId) || {})[sharedSelection.gamemode] || 1000;
+        const score = calculateMatchScore(ratingA, ratingB);
+        pairCandidates.push({
+          entryA,
+          entryB,
+          assignment,
+          sharedSelection,
+          score,
+          oldestJoinedAtMs: Math.min(parseDateToMs(entryA.joinedAt), parseDateToMs(entryB.joinedAt)),
+          newestJoinedAtMs: Math.max(parseDateToMs(entryA.joinedAt), parseDateToMs(entryB.joinedAt))
+        });
       }
     }
   }
 
-  // Create the best match found
-  if (bestMatch) {
-    await createMatch(bestMatch.player, bestMatch.tester);
+  pairCandidates.sort((a, b) => {
+    if (a.score !== b.score) return a.score - b.score;
+    if (a.oldestJoinedAtMs !== b.oldestJoinedAtMs) return a.oldestJoinedAtMs - b.oldestJoinedAtMs;
+    return a.newestJoinedAtMs - b.newestJoinedAtMs;
+  });
+
+  const matchedUserIds = new Set();
+  for (const candidate of pairCandidates) {
+    const { entryA, entryB, assignment, sharedSelection } = candidate;
+    if (matchedUserIds.has(entryA.userId) || matchedUserIds.has(entryB.userId)) continue;
+
+    const assignedPlayer = {
+      ...assignment.player,
+      gamemode: sharedSelection.gamemode,
+      region: sharedSelection.region,
+      gamemodes: getQueueGamemodeList(assignment.player),
+      regions: getQueueRegionList(assignment.player),
+      serverIP: assignment.player.serverIP || assignment.tester.serverIP || null,
+      serverSelectionSource: assignment.player.serverIP ? 'player_queue' : (assignment.tester.serverIP ? 'tester_queue_fallback' : null),
+      roleAssignmentReason: assignment.playerReason,
+      roleAssignmentType: assignment.assignmentType,
+      assignmentExplanation: assignment.explanation
+    };
+    const assignedTester = {
+      ...assignment.tester,
+      gamemode: sharedSelection.gamemode,
+      region: sharedSelection.region,
+      gamemodes: getQueueGamemodeList(assignment.tester),
+      regions: getQueueRegionList(assignment.tester),
+      roleAssignmentReason: assignment.testerReason,
+      roleAssignmentType: assignment.assignmentType,
+      assignmentExplanation: assignment.explanation,
+      randomizedAssignment: assignment.randomized === true
+    };
+
+    if (!assignedPlayer.serverIP) continue;
+
+    const matchCreated = await createMatch(assignedPlayer, assignedTester);
+    if (!matchCreated) continue;
+
+    matchedUserIds.add(entryA.userId);
+    matchedUserIds.add(entryB.userId);
   }
 }
 
@@ -4656,19 +5830,31 @@ async function createMatch(player, tester, matchType = 'regular') {
   try {
     // FIX #3: Optimize player loading - use queries instead of loading all players
     // Get user profiles and player ratings in parallel
-    const [playerUserSnapshot, testerUserSnapshot, playerDataSnapshot] = await Promise.all([
+    const [playerUserSnapshot, testerUserSnapshot, playerDataSnapshot, testerDataSnapshot] = await Promise.all([
       db.ref(`users/${player.userId}`).once('value'),
       db.ref(`users/${tester.userId}`).once('value'),
-      db.ref('players').orderByChild('userId').equalTo(player.userId).limitToFirst(1).once('value')
+      db.ref('players').orderByChild('userId').equalTo(player.userId).limitToFirst(1).once('value'),
+      db.ref('players').orderByChild('userId').equalTo(tester.userId).limitToFirst(1).once('value')
     ]);
     
     const playerUser = playerUserSnapshot.val();
     const testerUser = testerUserSnapshot.val();
+    const playerCooldownState = getQueueCooldownState(playerUser || {}, player.gamemode);
+
+    if (!playerCooldownState.allowed) {
+      console.log(`Skipped match creation for ${player.userId} in ${player.gamemode}: assigned player is on cooldown.`);
+      return false;
+    }
     
     // Extract player data from query result
     const playerDataObj = playerDataSnapshot.val() || {};
     const playerData = Object.values(playerDataObj)[0];
     const playerCurrentRating = playerData?.gamemodeRatings?.[player.gamemode] || 1000;
+    const testerDataObj = testerDataSnapshot.val() || {};
+    const testerData = Object.values(testerDataObj)[0];
+    const playerVanillaRating = playerData?.gamemodeRatings?.vanilla || 1000;
+    const testerVanillaRating = testerData?.gamemodeRatings?.vanilla || 1000;
+    const totemDrain = player.gamemode === 'vanilla' && playerVanillaRating > 1700 && testerVanillaRating > 1700 ? 8 : 14;
     
     // FIX #1: Use Firebase transaction to prevent race conditions in match creation
     const matchesRef = db.ref('matches');
@@ -4689,16 +5875,48 @@ async function createMatch(player, tester, matchType = 'regular') {
       testerEmail: testerUser.email,
       gamemode: player.gamemode,
       firstTo,
+      totemDrain,
       region: player.region,
       serverIP: player.serverIP,
       status: 'active',
-      matchType: 'regular',
+      matchType,
       playerCurrentRating,
       createdAt: now.toISOString(),
       finalized: false,
+      matchStarted: false,
+      matchStartedAt: null,
+      countdownStartedAt: null,
+      startCountdownHandled: false,
       chat: {},
       participants: {},
       presence: {},
+      playerQueueSelections: {
+        gamemodes: getQueueGamemodeList(player),
+        regions: getQueueRegionList(player)
+      },
+      testerQueueSelections: {
+        gamemodes: Array.isArray(tester.gamemodes) ? tester.gamemodes.filter(Boolean) : (tester.gamemode ? [tester.gamemode] : []),
+        regions: Array.isArray(tester.regions) ? tester.regions.filter(Boolean) : (tester.region ? [tester.region] : [])
+      },
+      queueMeta: {
+        playerJoinedQueueAt: player.joinedAt || null,
+        testerJoinedQueueAt: tester.joinedAt || null,
+        playerQueueSource: player.queueSource || null,
+        testerQueueSource: tester.queueSource || null,
+        serverSelectionSource: player.serverSelectionSource || null,
+        createdFromQueue: true
+      },
+      roleAssignment: {
+        type: tester.roleAssignmentType || player.roleAssignmentType || null,
+        explanation: tester.assignmentExplanation || player.assignmentExplanation || null,
+        playerReason: player.roleAssignmentReason || null,
+        testerReason: tester.roleAssignmentReason || null,
+        randomized: tester.randomizedAssignment === true
+      },
+      participantRoles: {
+        [player.userId]: 'player',
+        [tester.userId]: 'tester'
+      },
       pagestats: {
         playerJoined: false,
         testerJoined: false,
@@ -4720,14 +5938,15 @@ async function createMatch(player, tester, matchType = 'regular') {
     
     try {
       // Verify queue entries still exist before creating match (prevents duplicate matches)
-      const [playerQueueSnapshot, testerQueueSnapshot] = await Promise.all([
-        queueRef.child(player.key).once('value'),
-        queueRef.child(tester.key).once('value')
-      ]);
-      
-      if (!playerQueueSnapshot.exists() || !testerQueueSnapshot.exists()) {
+      const playerQueueSnapshot = await queueRef.child(player.key).once('value');
+      let testerQueueSnapshot = null;
+      if (tester.key) {
+        testerQueueSnapshot = await queueRef.child(tester.key).once('value');
+      }
+
+      if (!playerQueueSnapshot.exists() || (tester.key && !testerQueueSnapshot?.exists())) {
         console.log(`Queue entries no longer exist for match creation (race condition prevented)`);
-        return; // Another process already matched these players
+        return false; // Another process already matched these players
       }
 
       // Final guard: ensure neither user is already in any active match.
@@ -4740,15 +5959,14 @@ async function createMatch(player, tester, matchType = 'regular') {
           queueRef.child(tester.key).remove().catch(() => {})
         ]);
         console.log(`Skipped duplicate match creation for ${player.userId}/${tester.userId}: already active in another match`);
-        return;
+        return false;
       }
       
       // Atomically create match and remove queue entries
       await newMatchRef.set(match);
       await Promise.all([
-        queueRef.child(player.key).remove(),
-        queueRef.child(tester.key).remove(),
-        db.ref(`testerAvailability/${tester.userId}`).remove()
+        clearUserQueueEntries(player.userId),
+        clearUserQueueEntries(tester.userId)
       ]);
       
       console.log(`✅ Match created atomically: ${matchId} between ${player.minecraftUsername} and ${tester.minecraftUsername}`);
@@ -4771,6 +5989,7 @@ async function createMatch(player, tester, matchType = 'regular') {
     }, INACTIVITY_TIMEOUT_MS);
 
     console.log(`Match created: ${matchId} between ${player.minecraftUsername} and ${tester.minecraftUsername} (3-minute timer set)`);
+    return true;
   } catch (error) {
     console.error('Error creating match:', error);
     throw error;
@@ -5241,6 +6460,47 @@ async function getRecentPlayerReportsForUser(userId, lookbackMs = 24 * 60 * 60 *
     .sort((a, b) => parseDateToMs(a.createdAt) - parseDateToMs(b.createdAt));
 }
 
+function normalizeReportedPlayerKey(reportedPlayer, reportedUUID = null) {
+  const normalizedUuid = String(reportedUUID || '').trim().toLowerCase();
+  if (normalizedUuid) return `uuid:${normalizedUuid}`;
+
+  const normalizedName = String(reportedPlayer || '').trim().toLowerCase();
+  return normalizedName ? `name:${normalizedName}` : '';
+}
+
+async function findExistingPlayerReportForTarget(userId, reportedPlayer, reportedUUID = null) {
+  const reportedPlayerKey = normalizeReportedPlayerKey(reportedPlayer, reportedUUID);
+  if (!reportedPlayerKey) return null;
+
+  const userReportsSnapshot = await db.ref(`playerReportsByUser/${userId}`).once('value');
+  const indexedReports = Object.values(userReportsSnapshot.val() || {});
+  const indexedMatch = indexedReports.find((report) => {
+    const existingKey = String(report?.reportedPlayerKey || normalizeReportedPlayerKey(report?.reportedPlayer, report?.reportedUUID || null));
+    return existingKey === reportedPlayerKey;
+  });
+
+  if (indexedMatch) {
+    return indexedMatch;
+  }
+
+  const reportsSnapshot = await db.ref('playerReports').orderByChild('reporterId').equalTo(userId).once('value');
+  const reports = Object.values(reportsSnapshot.val() || {});
+  return reports.find((report) => {
+    const existingKey = normalizeReportedPlayerKey(report?.reportedPlayer, report?.reportedUUID || null);
+    return existingKey === reportedPlayerKey;
+  }) || null;
+}
+
+async function getStaffReporterIds() {
+  const usersSnapshot = await db.ref('users').once('value');
+  const users = usersSnapshot.val() || {};
+  return new Set(
+    Object.entries(users)
+      .filter(([, user]) => String(user?.staffRoleId || '').trim().length > 0)
+      .map(([uid]) => uid)
+  );
+}
+
 /**
  * POST /api/submit-player-report - Submit a player report
  */
@@ -5285,6 +6545,26 @@ app.post('/api/submit-player-report', verifyAuthAndNotBanned, requireRecaptcha, 
       }
     }).slice(0, 5);
 
+    const reportedPlayerKey = normalizeReportedPlayerKey(reportedPlayer, reportedUUID);
+    if (!reportedPlayerKey) {
+      return res.status(400).json({
+        error: true,
+        code: 'INVALID_REPORTED_PLAYER',
+        message: 'A valid reported player identifier is required'
+      });
+    }
+
+    const existingReport = await findExistingPlayerReportForTarget(req.user.uid, reportedPlayer, reportedUUID || null);
+    if (existingReport) {
+      return res.status(409).json({
+        error: true,
+        code: 'DUPLICATE_REPORT',
+        message: 'You have already submitted a report for this player.',
+        existingReportId: existingReport.id || null,
+        existingStatus: existingReport.status || null
+      });
+    }
+
     // Rate limit: max 5 reports per user in 24 hours (user-scoped query only)
     const reportsRef = db.ref('playerReports');
     const reportsLast24h = await getRecentPlayerReportsForUser(req.user.uid, 24 * 60 * 60 * 1000);
@@ -5312,6 +6592,7 @@ app.post('/api/submit-player-report', verifyAuthAndNotBanned, requireRecaptcha, 
       reporterEmail: req.user.email,
       reportedPlayer: reportedPlayer,
       reportedUUID: reportedUUID || null,
+      reportedPlayerKey,
       category: category,
       matchId: matchId || null,
       description: description,
@@ -5331,7 +6612,9 @@ app.post('/api/submit-player-report', verifyAuthAndNotBanned, requireRecaptcha, 
       createdAt: report.createdAt,
       status: report.status,
       category: report.category,
-      reportedPlayer: report.reportedPlayer
+      reportedPlayer: report.reportedPlayer,
+      reportedUUID: report.reportedUUID,
+      reportedPlayerKey: report.reportedPlayerKey
     });
 
     // Log admin action
@@ -5893,8 +7176,15 @@ app.get('/api/admin/reports/user', verifyAuthAndNotBanned, verifyAdmin, async (r
       filteredReports = filteredReports.filter(r => r.status === status);
     }
 
+    const staffReporterIds = await getStaffReporterIds();
+
     // Sort by newest first and limit results
-    filteredReports.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    filteredReports.sort((a, b) => {
+      const aStaff = staffReporterIds.has(String(a?.reporterId || '')) ? 1 : 0;
+      const bStaff = staffReporterIds.has(String(b?.reporterId || '')) ? 1 : 0;
+      if (aStaff !== bStaff) return bStaff - aStaff;
+      return parseDateToMs(b?.createdAt) - parseDateToMs(a?.createdAt);
+    });
     filteredReports = filteredReports.slice(0, maxLimit);
 
     res.json({
@@ -5975,7 +7265,14 @@ app.get('/api/admin/reports/messages', verifyAuthAndNotBanned, verifyAdmin, asyn
       filteredReports = filteredReports.filter((report) => report.status === status);
     }
 
-    filteredReports.sort((a, b) => parseDateToMs(b.createdAt) - parseDateToMs(a.createdAt));
+    const staffReporterIds = await getStaffReporterIds();
+
+    filteredReports.sort((a, b) => {
+      const aStaff = staffReporterIds.has(String(a?.reporterId || '')) ? 1 : 0;
+      const bStaff = staffReporterIds.has(String(b?.reporterId || '')) ? 1 : 0;
+      if (aStaff !== bStaff) return bStaff - aStaff;
+      return parseDateToMs(b.createdAt) - parseDateToMs(a.createdAt);
+    });
     filteredReports = filteredReports.slice(0, maxLimit);
 
     res.json({
@@ -6069,7 +7366,13 @@ app.get('/api/admin/reports/noshow', verifyAuthAndNotBanned, verifyAdmin, async 
     }
 
     // Sort by newest first
-    filteredReports.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    const staffReporterIds = await getStaffReporterIds();
+    filteredReports.sort((a, b) => {
+      const aStaff = staffReporterIds.has(String(a?.reporterId || a?.reportedByUserId || '')) ? 1 : 0;
+      const bStaff = staffReporterIds.has(String(b?.reporterId || b?.reportedByUserId || '')) ? 1 : 0;
+      if (aStaff !== bStaff) return bStaff - aStaff;
+      return parseDateToMs(b?.createdAt) - parseDateToMs(a?.createdAt);
+    });
 
     res.json({
       success: true,
@@ -6382,18 +7685,47 @@ app.post('/api/tester/availability', verifyAuthAndNotBanned, verifyTester, requi
 
       // Testers can join any queue regardless of rating
 
-      // Set availability (all testers are now regular in Elo system)
-      const availabilityRef = db.ref(`testerAvailability/${req.user.uid}`);
-      await availabilityRef.set({
+      const sanitizedServerIP = String(req.body?.serverIP || '').trim();
+      if (!sanitizedServerIP) {
+        return res.status(400).json({
+          error: true,
+          code: 'VALIDATION_ERROR',
+          message: 'serverIP is required'
+        });
+      }
+
+      const resolvedServerIP = await getCanonicalWhitelistedServerIP(sanitizedServerIP);
+      if (!resolvedServerIP) {
+        return res.status(400).json({
+          error: true,
+          code: 'SERVER_NOT_WHITELISTED',
+          message: 'The server IP you entered is not whitelisted. Please select a whitelisted server or contact an admin.'
+        });
+      }
+
+      const queueRef = db.ref('queue');
+      const existingQueueSnapshot = await queueRef.orderByChild('userId').equalTo(req.user.uid).once('value');
+      if (existingQueueSnapshot.exists()) {
+        return res.status(400).json({
+          error: true,
+          code: 'ALREADY_IN_QUEUE',
+          message: 'You are already in the queue'
+        });
+      }
+
+      const newQueueRef = queueRef.push();
+      await newQueueRef.set(buildQueueEntry({
+        queueId: newQueueRef.key,
         userId: req.user.uid,
-        available: true,
+        minecraftUsername: userProfile.minecraftUsername,
         gamemodes,
         regions,
-        gamemode,
-        region,
-        availableAt: new Date().toISOString(),
-        timeoutAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString() // 3 hours from now
-      });
+        serverIP: resolvedServerIP,
+        rolePreference: 'tester',
+        testerEligible: true,
+        source: 'tester_dashboard',
+        timeoutAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString()
+      }));
 
       // Notify users who have selected this gamemode for tester availability notifications
       const usersRef = db.ref('users');
@@ -6421,25 +7753,12 @@ app.post('/api/tester/availability', verifyAuthAndNotBanned, verifyTester, requi
 
       res.json({
         success: true,
-        message: 'Availability set as tester'
+        message: 'Joined the queue as a tier tester'
       });
     } else {
-      // Remove availability
-      const availabilityRef = db.ref(`testerAvailability/${req.user.uid}`);
-      await availabilityRef.remove();
+      await clearUserQueueEntries(req.user.uid);
       
-      // Leave queue
-      const queueRef = db.ref('queue');
-      const queueSnapshot = await queueRef.orderByChild('userId').equalTo(req.user.uid).once('value');
-      if (queueSnapshot.exists()) {
-        const updates = {};
-        queueSnapshot.forEach(child => {
-          updates[child.key] = null;
-        });
-        await queueRef.update(updates);
-      }
-      
-      res.json({ success: true, message: 'Availability removed' });
+      res.json({ success: true, message: 'Removed from queue' });
     }
   } catch (error) {
     console.error('Error setting tier tester availability:', error);
@@ -6456,9 +7775,9 @@ app.post('/api/tester/availability', verifyAuthAndNotBanned, verifyTester, requi
  */
 app.get('/api/tester/availability', verifyAuthAndNotBanned, verifyTester, async (req, res) => {
   try {
-    const availabilityRef = db.ref(`testerAvailability/${req.user.uid}`);
-    const snapshot = await availabilityRef.once('value');
-    const availability = snapshot.val();
+    const snapshot = await db.ref('queue').orderByChild('userId').equalTo(req.user.uid).once('value');
+    const queueEntries = Object.values(snapshot.val() || {});
+    const availability = queueEntries.find((entry) => entry?.queueSource === 'tester_dashboard' && !isQueueEntryExpired(entry)) || null;
     
     res.json({ available: availability !== null, availability: availability || null });
   } catch (error) {
@@ -6710,6 +8029,7 @@ app.post('/api/match/:matchId/pagestats', verifyAuth, async (req, res) => {
     }
     
     const pagestatsRef = matchRef.child('pagestats');
+    const previouslyBothJoined = !!(match.pagestats?.playerJoined && match.pagestats?.testerJoined);
     const pagestats = {
       playerJoined: isPlayer ? true : (match.pagestats?.playerJoined || false),
       testerJoined: !isPlayer ? true : (match.pagestats?.testerJoined || false),
@@ -6745,6 +8065,15 @@ app.post('/api/match/:matchId/pagestats', verifyAuth, async (req, res) => {
         }
       }, PLAYER_JOIN_TIMEOUT_MS);
     }
+
+    if (pagestats.playerJoined && pagestats.testerJoined && !previouslyBothJoined && !match.matchStarted && !match.countdownStartedAt) {
+      const countdownStartedAt = new Date().toISOString();
+      await matchRef.update({
+        countdownStartedAt,
+        startCountdownHandled: false
+      });
+      scheduleMatchStartCountdownTimeout(matchId);
+    }
     
     res.json({ success: true, pagestats });
   } catch (error) {
@@ -6753,6 +8082,103 @@ app.post('/api/match/:matchId/pagestats', verifyAuth, async (req, res) => {
       error: true,
       code: 'SERVER_ERROR',
       message: 'Error updating page stats'
+    });
+  }
+});
+
+/**
+ * POST /api/match/:matchId/started - Mark match as started
+ */
+app.post('/api/match/:matchId/started', verifyAuth, async (req, res) => {
+  try {
+    const { matchId } = req.params;
+    const matchRef = db.ref(`matches/${matchId}`);
+    const snapshot = await matchRef.once('value');
+    const match = snapshot.val();
+
+    if (!match) {
+      return res.status(404).json({
+        error: true,
+        code: 'NOT_FOUND',
+        message: 'Match not found'
+      });
+    }
+
+    if (match.playerId !== req.user.uid && match.testerId !== req.user.uid) {
+      return res.status(403).json({
+        error: true,
+        code: 'PERMISSION_DENIED',
+        message: 'You are not a participant in this match'
+      });
+    }
+
+    if (match.testerId !== req.user.uid) {
+      return res.status(403).json({
+        error: true,
+        code: 'TESTER_ONLY_ACTION',
+        message: 'Only the tier tester can mark the match as started'
+      });
+    }
+
+    const playerJoined = match.pagestats?.playerJoined || false;
+    const testerJoined = match.pagestats?.testerJoined || false;
+    if (!playerJoined || !testerJoined) {
+      return res.status(400).json({
+        error: true,
+        code: 'NOT_READY',
+        message: 'Both players must join before starting the match'
+      });
+    }
+
+    if (match.matchStarted) {
+      return res.status(400).json({
+        error: true,
+        code: 'ALREADY_STARTED',
+        message: 'Match has already started'
+      });
+    }
+
+    if (match.countdownStartedAt) {
+      const countdownExpiresAt = new Date(match.countdownStartedAt).getTime() + MATCH_START_TIMEOUT_MS;
+      if (!Number.isNaN(countdownExpiresAt) && Date.now() >= countdownExpiresAt) {
+        return res.status(400).json({
+          error: true,
+          code: 'START_COUNTDOWN_EXPIRED',
+          message: 'The 5 minute start window expired. This match is being finalized as a draw.'
+        });
+      }
+    }
+
+    const playerUserSnapshot = await db.ref(`users/${match.playerId}`).once('value');
+    const playerUserProfile = playerUserSnapshot.val() || {};
+    const playerCooldownState = getQueueCooldownState(playerUserProfile, match.gamemode);
+    if (!playerCooldownState.allowed) {
+      return res.status(400).json({
+        error: true,
+        code: 'PLAYER_COOLDOWN_ACTIVE',
+        message: `The player is still on cooldown for ${match.gamemode.toUpperCase()} and cannot start this match yet.`
+      });
+    }
+
+    await matchRef.update({
+      matchStarted: true,
+      matchStartedAt: new Date().toISOString(),
+      countdownStartedAt: null,
+      startCountdownHandled: true
+    });
+
+    await Promise.all([
+      clearUserQueueEntries(match.playerId),
+      clearUserQueueEntries(match.testerId)
+    ]);
+
+    res.json({ success: true, message: 'Match marked as started' });
+  } catch (error) {
+    console.error('Error marking match as started:', error);
+    res.status(500).json({
+      error: true,
+      code: 'SERVER_ERROR',
+      message: 'Error marking match as started'
     });
   }
 });
@@ -6854,6 +8280,56 @@ app.post('/api/match/:matchId/message', verifyAuth, requireRecaptcha, messageLim
       error: true,
       code: 'SERVER_ERROR',
       message: 'Error sending message'
+    });
+  }
+});
+
+/**
+ * GET /api/match/:matchId/messages - Get chat messages
+ */
+app.get('/api/match/:matchId/messages', verifyAuthAndNotBanned, async (req, res) => {
+  try {
+    const { matchId } = req.params;
+    const matchRef = db.ref(`matches/${matchId}`);
+    const snapshot = await matchRef.once('value');
+    const match = snapshot.val();
+
+    if (!match) {
+      return res.status(404).json({
+        error: true,
+        code: 'NOT_FOUND',
+        message: 'Match not found'
+      });
+    }
+
+    if (match.playerId !== req.user.uid && match.testerId !== req.user.uid) {
+      const userRef = db.ref(`users/${req.user.uid}`);
+      const userSnapshot = await userRef.once('value');
+      const userProfile = userSnapshot.val() || {};
+      const isAdminUser = Boolean(userProfile.admin === true || typeof userProfile.adminRole === 'string');
+      if (!isAdminUser) {
+        return res.status(403).json({
+          error: true,
+          code: 'PERMISSION_DENIED',
+          message: 'Access denied'
+        });
+      }
+    }
+
+    const messages = Object.entries(match.chat || {})
+      .map(([messageId, message]) => ({
+        ...(message || {}),
+        messageId
+      }))
+      .sort((a, b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+
+    res.json({ success: true, messages });
+  } catch (error) {
+    console.error('Error fetching chat messages:', error);
+    res.status(500).json({
+      error: true,
+      code: 'SERVER_ERROR',
+      message: 'Error fetching chat messages'
     });
   }
 });
@@ -6971,64 +8447,10 @@ app.post('/api/match/:matchId/draw-vote', verifyAuthAndNotBanned, async (req, re
 
     // Both agreed — finalize as draw without scoring
     if (playerAgreed && testerAgreed && !updatedMatch.finalized) {
-      const finalizationData = {
+      await finalizeMatchAsDrawWithoutScoring(matchId, updatedMatch, {
         type: 'draw_vote',
-        playerScore: 0,
-        testerScore: 0,
-        playerUsername: updatedMatch.playerUsername,
-        gamemode: updatedMatch.gamemode,
-        ratingChanges: {
-          playerRatingChange: 0,
-          testerRatingChange: 0,
-          playerNewRating: updatedMatch.playerRating ?? 0,
-          testerNewRating: updatedMatch.testerRating ?? 0
-        }
-      };
-
-      await matchRef.update({
-        finalized: true,
-        finalizedAt: new Date().toISOString(),
-        status: 'ended',
-        finalizationData
+        reason: 'Both participants agreed to end match without scoring.'
       });
-
-      // Update player's lastTested cooldown timestamp
-      const playerRef = db.ref(`users/${updatedMatch.playerId}`);
-      const playerSnap = await playerRef.once('value');
-      const playerData = playerSnap.val() || {};
-      const lastTested = playerData.lastTested || {};
-      lastTested[updatedMatch.gamemode] = new Date().toISOString();
-      await playerRef.update({ lastTested });
-
-      // Notify player
-      await createNotification(updatedMatch.playerId, {
-        type: 'match_finalized',
-        title: 'Match Ended (Draw)',
-        message: `Your ${updatedMatch.gamemode} match ended as a draw. No rating change.`,
-        matchId,
-        gamemode: updatedMatch.gamemode
-      });
-
-      // Write Firestore metrics and recompute security (non-blocking)
-      fsWrite(`matchMetrics/${matchId}`, {
-        matchId,
-        playerId: updatedMatch.playerId,
-        testerId: updatedMatch.testerId,
-        gamemode: updatedMatch.gamemode,
-        durationMs: new Date().getTime() - new Date(updatedMatch.createdAt).getTime(),
-        playerScore: 0,
-        testerScore: 0,
-        type: 'draw_vote',
-        createdAt: updatedMatch.createdAt,
-        finalizedAt: new Date().toISOString()
-      }, false).catch(() => {});
-      computeAndStoreSecurityScore(updatedMatch.playerId).catch(() => {});
-      computeAndStoreSecurityScore(updatedMatch.testerId).catch(() => {});
-
-      await Promise.all([
-        requeueUserAfterFinalizedMatch(updatedMatch, updatedMatch.playerId, 'player'),
-        requeueUserAfterFinalizedMatch(updatedMatch, updatedMatch.testerId, 'tester')
-      ]);
     }
 
     res.json({
@@ -7479,8 +8901,18 @@ async function checkMissedTimeouts() {
     
     for (const matchId in matches) {
       const match = matches[matchId];
+
+      if (!match.finalized && !match.matchStarted && match.countdownStartedAt) {
+        const countdownExpiresAt = new Date(match.countdownStartedAt).getTime() + MATCH_START_TIMEOUT_MS;
+        if (!Number.isNaN(countdownExpiresAt) && now > countdownExpiresAt) {
+          console.log(`⏰ Found expired match start countdown ${matchId} (expired ${Math.round((now - countdownExpiresAt) / 1000)}s ago)`);
+          await handleMatchStartCountdownTimeout(matchId);
+          handledCount++;
+          continue;
+        }
+      }
       
-      // Skip if already finalized or timeout already handled
+      // Skip if already finalized or join timeout already handled
       if (match.finalized || match.timeoutHandled) continue;
       
       // Check if match has expired
@@ -7746,6 +9178,21 @@ async function updatePlayerRating(userId, gamemode, ratingChange, newRating, new
   }
 }
 
+async function storeQueueCooldownTimestamps(userId, gamemode, timestamp = new Date().toISOString()) {
+  if (!userId || !gamemode) return;
+
+  const userRef = db.ref(`users/${userId}`);
+  const userSnapshot = await userRef.once('value');
+  const userProfile = userSnapshot.val() || {};
+  const lastQueueJoins = userProfile.lastQueueJoins || {};
+  const lastTestCompletions = userProfile.lastTestCompletions || {};
+
+  lastQueueJoins[gamemode] = timestamp;
+  lastTestCompletions[gamemode] = timestamp;
+
+  await userRef.update({ lastQueueJoins, lastTestCompletions });
+}
+
 /**
  * Handle match finalization with Glicko-2 calculations
  */
@@ -7874,6 +9321,7 @@ async function handleManualFinalization(match, result) {
   // Update ratings using centralized function
   await updatePlayerRating(match.playerId, match.gamemode, playerResult.ratingChange, playerResult.newRating, playerResult.newRD, playerResult.newVolatility);
   await updatePlayerRating(match.testerId, match.gamemode, testerResult.ratingChange, testerResult.newRating, testerResult.newRD, testerResult.newVolatility);
+  await storeQueueCooldownTimestamps(match.playerId, match.gamemode);
 
   // Return rating changes and title changes for API response
   return {
@@ -7886,22 +9334,6 @@ async function handleManualFinalization(match, result) {
       tester: testerTitleChanged ? { oldTitle: testerOldTitle, newTitle: testerNewTitle } : null
     }
   };
-
-
-  // Set cooldowns for the player after match finalization
-  const playerUserRef = db.ref(`users/${match.playerId}`);
-  const playerUserSnapshot = await playerUserRef.once('value');
-  const playerUserProfile = playerUserSnapshot.val() || {};
-
-  // Regular queue cooldown (existing)
-  const lastQueueJoins = playerUserProfile.lastQueueJoins || {};
-  lastQueueJoins[match.gamemode] = new Date().toISOString();
-
-  // 48-hour testing cooldown for the tested player
-  const lastTestCompletions = playerUserProfile.lastTestCompletions || {};
-  lastTestCompletions[match.gamemode] = new Date().toISOString();
-
-  await playerUserRef.update({ lastQueueJoins, lastTestCompletions });
 }
 
 /**
@@ -8059,62 +9491,13 @@ async function containsProfanity(text) {
  * Create a notification for a user
  */
 async function createNotification(userId, notificationData) {
-  try {
-    // Get user notification settings
-    const userRef = db.ref(`users/${userId}`);
-    const userSnapshot = await userRef.once('value');
-    const userProfile = userSnapshot.val() || {};
-    const notifySettings = userProfile.notificationSettings || {};
-
-    // Check if notification type is enabled
-    let shouldNotify = false;
-    if (notificationData.type === 'match_created') {
-      shouldNotify = notifySettings.notifyMatchCreated !== false; // Default true
-    } else if (notificationData.type === 'match_finalized') {
-      shouldNotify = notifySettings.notifyMatchFinalized !== false; // Default true
-    } else if (notificationData.type === 'tester_available') {
-      const selectedGamemodes = notifySettings.testerAvailabilityGamemodes || [];
-      shouldNotify = selectedGamemodes.includes(notificationData.gamemode);
-    }
-
-    if (!shouldNotify) {
-      return; // User has disabled this notification type
-    }
-
-    // Create notification in Firebase
-    const notificationsRef = db.ref(`notifications/${userId}`);
-    const newNotificationRef = notificationsRef.push();
-    await newNotificationRef.set({
-      ...notificationData,
-      read: false,
-      createdAt: new Date().toISOString()
-    });
-
-    // Keep only last 100 notifications per user
-    const notificationsSnapshot = await notificationsRef.once('value');
-    const notifications = notificationsSnapshot.val() || {};
-    const notificationKeys = Object.keys(notifications);
-    
-    if (notificationKeys.length > 100) {
-      // Sort by createdAt and remove oldest
-      const sorted = notificationKeys
-        .map(key => ({ key, createdAt: notifications[key].createdAt }))
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      
-      const toRemove = sorted.slice(0, notificationKeys.length - 100);
-      for (const item of toRemove) {
-        await notificationsRef.child(item.key).remove();
-      }
-    }
-  } catch (error) {
-    console.error('Error creating notification:', error);
-  }
+  return null;
 }
 
 // Re-queue user into the same gamemode/region after finalization when they opted in.
 async function requeueUserAfterFinalizedMatch(match, userId, role = 'player') {
   try {
-    if (!match || !userId || !match.gamemode || !match.region) return;
+    if (!match || !userId) return;
 
     const userSnap = await db.ref(`users/${userId}`).once('value');
     const userProfile = userSnap.val() || {};
@@ -8126,42 +9509,26 @@ async function requeueUserAfterFinalizedMatch(match, userId, role = 'player') {
     const hasActive = Object.values(activeMatches).some((m) => !m?.finalized && (m.playerId === userId || m.testerId === userId));
     if (hasActive) return;
 
-    // Clear any stale queue entries for this user first.
     const queueRef = db.ref('queue');
-    const queueSnap = await queueRef.orderByChild('userId').equalTo(userId).once('value');
-    if (queueSnap.exists()) {
-      const updates = {};
-      queueSnap.forEach((child) => {
-        updates[child.key] = null;
-      });
-      await queueRef.update(updates);
-    }
+    await clearUserQueueEntries(userId);
 
     const isTesterLike = !!(userProfile.tester === true || userProfile.admin === true || userProfile.adminRole);
+    const queueSelections = role === 'tester'
+      ? (match.testerQueueSelections || {})
+      : (match.playerQueueSelections || {});
+    const selectedGamemodes = Array.isArray(queueSelections.gamemodes) && queueSelections.gamemodes.length > 0
+      ? queueSelections.gamemodes.filter(Boolean)
+      : (match.gamemode ? [match.gamemode] : []);
+    const selectedRegions = Array.isArray(queueSelections.regions) && queueSelections.regions.length > 0
+      ? queueSelections.regions.filter(Boolean)
+      : (match.region ? [match.region] : []);
+    if (!selectedGamemodes.length || !selectedRegions.length) return;
 
-    // Tester/admin users are re-added to tester availability in the same gamemode + region.
-    if (role === 'tester' && isTesterLike) {
-      await db.ref(`testerAvailability/${userId}`).set({
-        userId,
-        available: true,
-        gamemodes: [match.gamemode],
-        regions: [match.region],
-        gamemode: match.gamemode,
-        region: match.region,
-        availableAt: new Date().toISOString(),
-        timeoutAt: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString()
-      });
-      return;
-    }
-
-    // For players, respect cooldown and only enqueue if we have the same server IP available.
     if (!match.serverIP) return;
 
     if (!isTesterLike) {
-      const lastTested = userProfile.lastTested || {};
-      const lastTestedTime = lastTested[match.gamemode] ? new Date(lastTested[match.gamemode]).getTime() : 0;
-      const cooldownMs = 60 * 60 * 1000;
-      if (lastTestedTime && (Date.now() - lastTestedTime) < cooldownMs) return;
+      const blockedGamemode = selectedGamemodes.find((gamemode) => !getQueueCooldownState(userProfile, gamemode).allowed);
+      if (blockedGamemode) return;
     }
 
     const playersSnap = await db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value');
@@ -8171,16 +9538,18 @@ async function requeueUserAfterFinalizedMatch(match, userId, role = 'player') {
     if (!username) return;
 
     const newQueueRef = queueRef.push();
-    await newQueueRef.set({
+    await newQueueRef.set(buildQueueEntry({
       queueId: newQueueRef.key,
       userId,
       minecraftUsername: username,
-      gamemode: match.gamemode,
-      region: match.region,
+      gamemodes: selectedGamemodes,
+      regions: selectedRegions,
       serverIP: match.serverIP,
-      status: 'waiting',
-      joinedAt: new Date().toISOString()
-    });
+      rolePreference: role === 'tester' ? 'tester' : 'player',
+      testerEligible: isTesterLike,
+      source: role === 'tester' ? 'tester_dashboard' : 'match_requeue',
+      timeoutAt: role === 'tester' ? new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString() : null
+    }));
   } catch (error) {
     console.error('Error re-queueing user after finalized match:', error);
   }
@@ -8309,6 +9678,49 @@ app.post('/api/match/:matchId/abort', verifyAuth, async (req, res) => {
       message: 'Error aborting match'
     });
   }
+});
+
+function sanitizeEvidenceLinksList(rawLinks = []) {
+  const links = Array.isArray(rawLinks) ? rawLinks : [];
+  return links
+    .map((link) => String(link || '').trim())
+    .filter(Boolean)
+    .filter((link) => {
+      try {
+        const parsed = new URL(link);
+        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+      } catch (_) {
+        return false;
+      }
+    })
+    .slice(0, 8);
+}
+
+function createDisputeHistoryEntry({ type, actorId, actorRole, note = '', metadata = {} }) {
+  return {
+    type,
+    actorId: actorId || null,
+    actorRole: actorRole || 'system',
+    note: String(note || '').trim(),
+    metadata: metadata || {},
+    timestamp: new Date().toISOString()
+  };
+}
+
+app.post('/api/match/:matchId/disputes', verifyAuthAndNotBanned, requireRecaptcha, async (_req, res) => {
+  return res.status(410).json({
+    error: true,
+    code: 'MATCH_DISPUTES_REMOVED',
+    message: 'Match disputes were removed. Use the Report Player page or Support form instead.'
+  });
+});
+
+app.get('/api/match/:matchId/disputes', verifyAuth, async (_req, res) => {
+  return res.status(410).json({
+    error: true,
+    code: 'MATCH_DISPUTES_REMOVED',
+    message: 'Match disputes were removed. Use the Report Player page or Support form instead.'
+  });
 });
 
 // ===== Skill Level Management Routes =====
@@ -8566,237 +9978,25 @@ app.get('/api/onboarding/status', verifyAuth, async (req, res) => {
  */
 async function attemptImmediateMatchmaking(queueEntry, playerProfile) {
   try {
-    console.log('Attempting immediate matchmaking for player:', queueEntry.minecraftUsername, 'in gamemode:', queueEntry.gamemode);
+    await attemptMatchmaking();
 
-    // Check total active matches limit (100 across all gamemodes)
-    const activeMatchesRef = db.ref('matches');
-    const activeMatchesSnapshot = await activeMatchesRef
-      .orderByChild('status')
-      .equalTo('active')
-      .once('value');
+    const activeMatchSnapshot = await db.ref('matches').orderByChild('status').equalTo('active').once('value');
+    const activeMatches = activeMatchSnapshot.val() || {};
+    const activeMatch = Object.values(activeMatches).find((match) => (
+      match && !match.finalized && (match.playerId === queueEntry.userId || match.testerId === queueEntry.userId)
+    ));
 
-    const activeMatches = activeMatchesSnapshot.val() || {};
-    const activeMatchCount = Object.keys(activeMatches).length;
-
-    const busyUserIds = new Set();
-    Object.values(activeMatches).forEach((m) => {
-      if (!m || m.finalized) return;
-      if (m.playerId) busyUserIds.add(m.playerId);
-      if (m.testerId) busyUserIds.add(m.testerId);
-    });
-
-    if (busyUserIds.has(queueEntry.userId)) {
-      console.log(`Skipping immediate matchmaking: ${queueEntry.userId} already has an active match`);
-      await db.ref(`queue/${queueEntry.queueId}`).remove().catch(() => {});
+    if (!activeMatch) {
       return null;
     }
 
-    if (activeMatchCount >= 100) {
-      console.log(`Match limit reached: ${activeMatchCount}/100 active matches. Cannot create new match.`);
-      return null;
-    }
-
-    // Get player rating
-    const playerRating = playerProfile.gamemodeRatings?.[queueEntry.gamemode] || 1000;
-
-    // Get available testers from testerAvailability database
-    const availabilityRef = db.ref('testerAvailability');
-    const availabilitySnapshot = await availabilityRef.once('value');
-    const testerAvailabilities = availabilitySnapshot.val() || {};
-    
-    // OPTIMIZED: Don't load all players - only get tester user IDs from availability
-    // Then fetch only those specific player records
-    const testerUserIds = Object.keys(testerAvailabilities).filter(userId => {
-      const availability = testerAvailabilities[userId];
-      return availabilityMatchesGamemodeRegion(availability, queueEntry.gamemode, queueEntry.region, null);
-    });
-    
-    if (testerUserIds.length === 0) {
-      return null;
-    }
-    
-    // Batch fetch only tester player records (much faster than loading all players)
-    const playerPromises = testerUserIds.map(userId => 
-      db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value')
-    );
-    const playerSnapshots = await Promise.all(playerPromises);
-    
-    // Build map of userId -> player
-    const testerPlayersMap = {};
-    playerSnapshots.forEach(snapshot => {
-      if (snapshot.exists()) {
-        const playerData = snapshot.val();
-        const playerKey = Object.keys(playerData)[0];
-        const player = playerData[playerKey];
-        if (player && player.userId) {
-          testerPlayersMap[player.userId] = { ...player, id: playerKey };
-        }
-      }
-    });
-
-    // Find available testers in this gamemode and region
-    const availableTesters = [];
-
-    // Batch check user profiles and active matches for all testers at once
-    const userProfilePromises = testerUserIds.map(userId => 
-      db.ref(`users/${userId}`).once('value')
-    );
-    const userProfiles = await Promise.all(userProfilePromises);
-    
-    // Build set of busy tester IDs from active matches (already loaded above)
-    const busyTesterIds = new Set();
-    Object.values(activeMatches).forEach(match => {
-      if (match?.testerId) busyTesterIds.add(match.testerId);
-    });
-    
-    // Process available testers
-    for (let i = 0; i < testerUserIds.length; i++) {
-      const userId = testerUserIds[i];
-      if (userId === queueEntry.userId) continue; // Skip self
-      
-      const testerPlayer = testerPlayersMap[userId];
-      if (!testerPlayer) continue;
-      
-      const userProfile = userProfiles[i].val();
-      if (!userProfile || !userProfile.tester) continue;
-      
-      // Skip if tester is busy
-      if (busyTesterIds.has(userId)) continue;
-      
-      const availability = testerAvailabilities[userId];
-      if (availabilityMatchesGamemodeRegion(availability, queueEntry.gamemode, queueEntry.region, testerPlayer.region || null)) {
-        availableTesters.push(testerPlayer);
-      }
-    }
-
-    if (availableTesters.length === 0) {
-      console.log('No available testers found in region:', queueEntry.region);
-      return null;
-    }
-
-    // Calculate rating differences and find closest match
-    let bestMatch = null;
-    let smallestDifference = Infinity;
-
-    for (const tester of availableTesters) {
-      // Skip if this is the same player
-      if (tester.userId === queueEntry.userId) continue;
-      if (busyUserIds.has(tester.userId)) continue;
-
-      const testerRating = tester.gamemodeRatings?.[queueEntry.gamemode] || 1000;
-      const ratingDifference = Math.abs(playerRating - testerRating);
-
-      if (ratingDifference < smallestDifference) {
-        smallestDifference = ratingDifference;
-        bestMatch = tester;
-      }
-    }
-
-    if (!bestMatch) {
-      console.log('No suitable tester match found');
-      return null;
-    }
-
-    console.log('Found best tester match:', bestMatch.username, 'rating:', bestMatch.gamemodeRatings?.[queueEntry.gamemode] || 1000, 'difference:', smallestDifference);
-
-    // Create match between player and tester
-    const matchesRef = db.ref('matches');
-    const newMatchRef = matchesRef.push();
-    const matchId = newMatchRef.key;
-
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + 3 * 60 * 1000);
-    const firstTo = getFirstToForGamemode(queueEntry.gamemode);
-    
-    const match = {
-      matchId,
-      playerId: queueEntry.userId,
-      playerUsername: queueEntry.minecraftUsername,
-      playerEmail: playerProfile.email || '',
-      testerId: bestMatch.userId,
-      testerUsername: bestMatch.username,
-      testerEmail: '', // Could be populated from user profile if needed
-      gamemode: queueEntry.gamemode,
-      firstTo,
-      region: queueEntry.region,
-      serverIP: queueEntry.serverIP,
-      matchType: 'regular',
-      testerType: 'matched',
-      playerCurrentRating: playerRating,
-      testerCurrentRating: bestMatch.gamemodeRatings?.[queueEntry.gamemode] || 1000,
-      status: 'active',
-      createdAt: now.toISOString(),
-      finalized: false,
-      chat: {},
-      participants: {},
-      presence: {},
-      pagestats: {
-        playerJoined: false,
-        testerJoined: false,
-        lastUpdate: null
-      },
-      joinTimeout: {
-        startedAt: now.toISOString(),
-        timeoutMinutes: 3,
-        expiresAt: expiresAt.toISOString()
-      },
-      // FIX #2: Store timeout info for persistence across server restarts
-      timeoutScheduled: true,
-      timeoutHandled: false
-    };
-
-    // FIX #1: Verify tester is still available before creating match (prevent race condition)
-    const testerAvailabilitySnapshot = await db.ref(`testerAvailability/${bestMatch.userId}`).once('value');
-    if (!testerAvailabilitySnapshot.exists()) {
-      console.log(`Tester ${bestMatch.username} no longer available (race condition prevented)`);
-      return null; // Another process already matched this tester
-    }
-
-    // Final guard before commit: no second active match for either participant.
-    const latestActiveSnapshot = await db.ref('matches').orderByChild('status').equalTo('active').once('value');
-    const latestActive = latestActiveSnapshot.val() || {};
-    const hasConflict = Object.values(latestActive).some((m) => !m?.finalized && (m.playerId === queueEntry.userId || m.testerId === queueEntry.userId || m.playerId === bestMatch.userId || m.testerId === bestMatch.userId));
-    if (hasConflict) {
-      await db.ref(`queue/${queueEntry.queueId}`).remove().catch(() => {});
-      console.log(`Skipping immediate matchmaking due to active-match conflict for ${queueEntry.userId}/${bestMatch.userId}`);
-      return null;
-    }
-
-    // FIX #2: Set up 3-minute inactivity timer with persistence tracking
-    const INACTIVITY_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
-    setTimeout(async () => {
-      try {
-        console.log(`⏰ Checking inactivity for match ${matchId} after 3 minutes...`);
-        await handleMatchInactivity(matchId);
-      } catch (error) {
-        console.error(`❌ Error handling inactivity for match ${matchId}:`, error);
-      }
-    }, INACTIVITY_TIMEOUT_MS);
-
-    // FIX #1: Atomically create match and remove tester availability
-    await newMatchRef.set(match);
-    await db.ref(`testerAvailability/${bestMatch.userId}`).remove();
-    
-    console.log(`✅ Match created via immediate matchmaking: ${matchId} between ${queueEntry.minecraftUsername} and ${bestMatch.username}`);
-
-    // Remove player from queue since match was created
-    await db.ref(`queue/${queueEntry.queueId}`).remove();
-
-    // Create notification for player if enabled
-    await createNotification(queueEntry.userId, {
-      type: 'match_created',
-      title: 'Match Found!',
-      message: `You've been matched with ${bestMatch.username} for ${queueEntry.gamemode}`,
-      matchId: matchId,
-      gamemode: queueEntry.gamemode
-    });
-
-    console.log('Match created successfully:', matchId, 'between', queueEntry.minecraftUsername, 'and', bestMatch.username);
+    const otherUsername = activeMatch.playerId === queueEntry.userId
+      ? activeMatch.testerUsername
+      : activeMatch.playerUsername;
 
     return {
-      matchId,
-      testerUsername: bestMatch.username,
-      ratingDifference: smallestDifference
+      matchId: activeMatch.matchId,
+      testerUsername: otherUsername || 'Opponent'
     };
 
   } catch (error) {
@@ -9162,47 +10362,47 @@ app.post('/api/onboarding/complete', verifyAuth, async (req, res) => {
  */
 app.get('/api/dashboard/stats', verifyAuthAndNotBanned, async (req, res) => {
   try {
-    // Get queue statistics
-    const queueRef = db.ref('queue');
-    const queueSnapshot = await queueRef.once('value');
+    // Get queue and active match data
+    const [queueSnapshot, matchesSnapshot] = await Promise.all([
+      db.ref('queue').once('value'),
+      db.ref('matches').orderByChild('status').equalTo('active').once('value')
+    ]);
+
     const queueData = queueSnapshot.val() || {};
-
-    // Count players queued by gamemode
-    const playersQueued = {};
-    const tierTestersQueued = {};
-
-    Object.values(queueData).forEach(entry => {
-      if (entry.status === 'waiting') {
-        // Check if this is a tier tester (has tierTester role)
-        // For now, we'll assume regular players. Tier testers would be identified differently
-        const gamemode = entry.gamemode;
-        if (!playersQueued[gamemode]) playersQueued[gamemode] = 0;
-        playersQueued[gamemode]++;
-
-        // Note: In a full implementation, you'd check user roles to distinguish tier testers
-        // For this basic version, we'll show all queued players as regular players
-      }
-    });
-
-    // Get active matches count
-    const matchesRef = db.ref('matches');
-    const matchesSnapshot = await matchesRef.orderByChild('status').equalTo('active').once('value');
     const activeMatches = matchesSnapshot.val() || {};
     const activeMatchesCount = Object.keys(activeMatches).length;
 
-    // Get tier tester availability
-    const availabilityRef = db.ref('testerAvailability');
-    const availabilitySnapshot = await availabilityRef.once('value');
-    const availabilityData = availabilitySnapshot.val() || {};
+    const busyUserIds = new Set();
+    Object.values(activeMatches).forEach((match) => {
+      if (!match || match.finalized) return;
+      if (match.playerId) busyUserIds.add(match.playerId);
+      if (match.testerId) busyUserIds.add(match.testerId);
+    });
 
-    // Count testers available by gamemode
+    const queueList = Object.values(queueData).filter((entry) => (
+      entry?.status === 'waiting' && entry?.userId && !busyUserIds.has(entry.userId)
+    ));
+
+    const uniqueUserIds = [...new Set(queueList.map((entry) => entry.userId))];
+    const userSnapshots = await Promise.all(uniqueUserIds.map((userId) => db.ref(`users/${userId}`).once('value')));
+    const isTesterByUserId = new Map();
+    for (let i = 0; i < uniqueUserIds.length; i++) {
+      const profile = userSnapshots[i].val() || {};
+      isTesterByUserId.set(uniqueUserIds[i], profile.tester === true);
+    }
+
+    const playersQueued = {};
     const testersAvailable = {};
-    Object.values(availabilityData).forEach((availability) => {
-      if (!availability?.available) return;
-      const gamemodeList = getAvailabilityGamemodeList(availability);
-      gamemodeList.forEach((selectedGamemode) => {
-        if (!testersAvailable[selectedGamemode]) testersAvailable[selectedGamemode] = 0;
-        testersAvailable[selectedGamemode]++;
+    queueList.forEach((entry) => {
+      const gamemodes = getQueueGamemodeList(entry);
+      const isTester = isTesterByUserId.get(entry.userId) === true;
+      gamemodes.forEach((gamemode) => {
+        if (!playersQueued[gamemode]) playersQueued[gamemode] = 0;
+        playersQueued[gamemode]++;
+        if (isTester) {
+          if (!testersAvailable[gamemode]) testersAvailable[gamemode] = 0;
+          testersAvailable[gamemode]++;
+        }
       });
     });
 
@@ -9229,167 +10429,32 @@ app.get('/api/dashboard/stats', verifyAuthAndNotBanned, async (req, res) => {
  * POST /api/notifications/test - Send a test notification
  */
 app.post('/api/notifications/test', verifyAuth, requireRecaptcha, async (req, res) => {
-  try {
-    const { type, message } = req.body;
-    
-    const testNotification = {
-      type: type || 'test',
-      title: 'Test Notification',
-      message: message || 'This is a test notification to verify your settings are working.',
-      read: false,
-      createdAt: new Date().toISOString()
-    };
-
-    // Create notification in Firebase
-    const notificationsRef = db.ref(`notifications/${req.user.uid}`);
-    const newNotificationRef = notificationsRef.push();
-    await newNotificationRef.set(testNotification);
-
-    // Keep only last 100 notifications per user
-    const notificationsSnapshot = await notificationsRef.once('value');
-    const notifications = notificationsSnapshot.val() || {};
-    const notificationKeys = Object.keys(notifications);
-    
-    if (notificationKeys.length > 100) {
-      // Sort by createdAt and remove oldest
-      const sorted = notificationKeys
-        .map(key => ({ key, createdAt: notifications[key].createdAt }))
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      
-      const toRemove = sorted.slice(0, notificationKeys.length - 100);
-      for (const item of toRemove) {
-        await notificationsRef.child(item.key).remove();
-      }
-    }
-
-    res.json({
-      success: true,
-      message: 'Test notification sent',
-      notification: testNotification
-    });
-  } catch (error) {
-    console.error('Error sending test notification:', error);
-    res.status(500).json({
-      error: true,
-      code: 'SERVER_ERROR',
-      message: 'Error sending test notification'
-    });
-  }
+  res.status(410).json({
+    error: true,
+    code: 'NOTIFICATION_SYSTEM_REMOVED',
+    message: 'The notification system has been removed.'
+  });
 });
 
 /**
  * GET /api/notifications - Get notifications for current user
  */
 app.get('/api/notifications', verifyAuth, async (req, res) => {
-  try {
-    const { limit: safeLimit } = parsePaginationParams(req.query, 20, 50);
-    const unreadOnly = parseBooleanParam(req.query.unreadOnly, false);
-
-    const notificationsRef = db.ref(`notifications/${req.user.uid}`);
-    const snapshot = await notificationsRef.once('value');
-    const data = snapshot.val() || {};
-
-    let notifications = Object.entries(data).map(([id, value]) => ({
-      id,
-      ...value
-    }));
-
-    if (unreadOnly) {
-      notifications = notifications.filter((n) => n.read !== true);
-    }
-
-    notifications.sort((a, b) => parseDateToMs(b.createdAt) - parseDateToMs(a.createdAt));
-    notifications = notifications.slice(0, safeLimit);
-
-    res.json({
-      success: true,
-      notifications,
-      total: notifications.length
-    });
-  } catch (error) {
-    console.error('Error fetching notifications:', error);
-    res.status(500).json({
-      error: true,
-      code: 'SERVER_ERROR',
-      message: 'Error fetching notifications'
-    });
-  }
+  res.json({ success: true, notifications: [], total: 0, removed: true });
 });
 
 /**
  * POST /api/notifications/:id/read - Mark a notification as read
  */
 app.post('/api/notifications/:id/read', verifyAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!id) {
-      return res.status(400).json({
-        error: true,
-        code: 'VALIDATION_ERROR',
-        message: 'Notification id is required'
-      });
-    }
-
-    const notificationRef = db.ref(`notifications/${req.user.uid}/${id}`);
-    const snapshot = await notificationRef.once('value');
-    if (!snapshot.exists()) {
-      return res.status(404).json({
-        error: true,
-        code: 'NOT_FOUND',
-        message: 'Notification not found'
-      });
-    }
-
-    await notificationRef.update({
-      read: true,
-      readAt: new Date().toISOString()
-    });
-
-    res.json({ success: true, message: 'Notification marked as read' });
-  } catch (error) {
-    console.error('Error marking notification as read:', error);
-    res.status(500).json({
-      error: true,
-      code: 'SERVER_ERROR',
-      message: 'Error updating notification'
-    });
-  }
+  res.json({ success: true, removed: true });
 });
 
 /**
  * DELETE /api/notifications/:id - Delete a notification
  */
 app.delete('/api/notifications/:id', verifyAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!id) {
-      return res.status(400).json({
-        error: true,
-        code: 'VALIDATION_ERROR',
-        message: 'Notification id is required'
-      });
-    }
-
-    const notificationRef = db.ref(`notifications/${req.user.uid}/${id}`);
-    const snapshot = await notificationRef.once('value');
-    if (!snapshot.exists()) {
-      return res.status(404).json({
-        error: true,
-        code: 'NOT_FOUND',
-        message: 'Notification not found'
-      });
-    }
-
-    await notificationRef.remove();
-    res.json({ success: true, message: 'Notification deleted' });
-  } catch (error) {
-    console.error('Error deleting notification:', error);
-    res.status(500).json({
-      error: true,
-      code: 'SERVER_ERROR',
-      message: 'Error deleting notification'
-    });
-  }
+  res.json({ success: true, removed: true });
 });
 
 // ===== Plus Membership Routes =====
@@ -9401,6 +10466,24 @@ function normalizeMinecraftUsername(username) {
 function normalizeSixDigitCode(code) {
   const normalized = String(code || '').trim();
   return /^\d{6}$/.test(normalized) ? normalized : null;
+}
+
+function isPlusCodeExpired(codeEntry) {
+  if (!codeEntry || codeEntry.neverExpires === true || codeEntry.source === 'easter_egg') {
+    return false;
+  }
+
+  const expiresAtMs = parseDateToMs(codeEntry.expiresAt);
+  return Boolean(expiresAtMs && expiresAtMs <= Date.now());
+}
+
+function isPlusCodeRedeemableByUser(codeEntry, userId) {
+  if (!codeEntry) return false;
+  if (codeEntry.active === false || codeEntry.removedAt) return false;
+  if (isPlusCodeExpired(codeEntry)) return false;
+  if (codeEntry.used === true) return false;
+  if (codeEntry.assignedUserId && codeEntry.assignedUserId !== userId) return false;
+  return true;
 }
 
 function normalizePuzzleAnswer(answer) {
@@ -9481,6 +10564,24 @@ async function findPlayerByUsername(username) {
   return null;
 }
 
+async function findPlayerByMinecraftIdentity({ username, uuid } = {}) {
+  const normalizedUsername = normalizeMinecraftUsername(username);
+  const normalizedUuid = normalizeMinecraftUUID(uuid);
+  const playersRef = db.ref('players');
+  const snap = await playersRef.once('value');
+  const players = snap.val() || {};
+
+  for (const [playerId, player] of Object.entries(players)) {
+    const playerUsername = normalizeMinecraftUsername(player.username);
+    const playerUuid = normalizeMinecraftUUID(player.minecraftUUID);
+    if ((normalizedUsername && playerUsername === normalizedUsername) || (normalizedUuid && playerUuid === normalizedUuid)) {
+      return { playerId, playerRef: playersRef.child(playerId), player };
+    }
+  }
+
+  return null;
+}
+
 async function syncPlusToPlayerForUser(userId) {
   const userRef = db.ref(`users/${userId}`);
   const userSnap = await userRef.once('value');
@@ -9488,9 +10589,10 @@ async function syncPlusToPlayerForUser(userId) {
   if (!user) return { synced: false, reason: 'USER_NOT_FOUND' };
 
   const username = user.minecraftUsername;
-  if (!username) return { synced: false, reason: 'USERNAME_NOT_LINKED' };
+  const minecraftUUID = normalizeMinecraftUUID(user.minecraftUUID);
+  if (!username && !minecraftUUID) return { synced: false, reason: 'USERNAME_NOT_LINKED' };
 
-  const playerMatch = await findPlayerByUsername(username);
+  const playerMatch = await findPlayerByMinecraftIdentity({ username, uuid: minecraftUUID });
   if (!playerMatch) return { synced: false, reason: 'PLAYER_NOT_FOUND' };
 
   const plus = user.plus || {};
@@ -9634,8 +10736,26 @@ app.post('/api/plus/redeem-code', verifyAuth, requireRecaptcha, async (req, res)
         message: 'This code is no longer active.'
       });
     }
+
+    if (isPlusCodeExpired(codeData)) {
+      return res.status(410).json({
+        error: true,
+        code: 'CODE_EXPIRED',
+        message: 'This code has expired.'
+      });
+    }
     
     if (codeData.used === true) {
+      if (codeData.usedBy === userId) {
+        const userSnapshot = await db.ref(`users/${userId}`).once('value');
+        return res.json({
+          success: true,
+          message: 'Code was already redeemed on this account.',
+          plus: userSnapshot.val()?.plus || null,
+          code,
+          alreadyRedeemed: true
+        });
+      }
       return res.status(409).json({
         error: true,
         code: 'CODE_ALREADY_USED',
@@ -9651,11 +10771,10 @@ app.post('/api/plus/redeem-code', verifyAuth, requireRecaptcha, async (req, res)
       });
     }
 
-    // Now mark code as used in a transaction
-    const txResult = await codeRef.transaction((current) => {
-      if (!current) return; // Code was deleted between check and transaction
-      if (current.used === true) return; // Already used, abort transaction
-      
+    const reserveCodeForUser = async () => codeRef.transaction((current) => {
+      if (!current) return;
+      if (!isPlusCodeRedeemableByUser(current, userId)) return;
+
       return {
         ...current,
         used: true,
@@ -9666,20 +10785,58 @@ app.post('/api/plus/redeem-code', verifyAuth, requireRecaptcha, async (req, res)
       };
     });
 
+    // Reserve the code for this user before granting Plus.
+    let txResult = await reserveCodeForUser();
+    let latestSnapshot = await codeRef.once('value');
+    let latestCode = latestSnapshot.val() || null;
+
     if (!txResult.committed) {
-      return res.status(400).json({
-        error: true,
-        code: 'REDEMPTION_FAILED',
-        message: 'This code was already redeemed or is no longer available.'
-      });
+      const pendingSelfReservation = latestCode?.used === true && latestCode.usedBy === userId && latestCode.redeemedPending === true;
+
+      if (!pendingSelfReservation && isPlusCodeRedeemableByUser(latestCode, userId)) {
+        txResult = await reserveCodeForUser();
+        latestSnapshot = await codeRef.once('value');
+        latestCode = latestSnapshot.val() || null;
+      }
+
+      if (latestCode?.used === true && latestCode.usedBy === userId) {
+        if (latestCode.redeemedPending === true) {
+          // A previous reservation succeeded for this same user but the response path did not complete.
+        } else {
+          const userSnapshot = await db.ref(`users/${userId}`).once('value');
+          return res.json({
+            success: true,
+            message: 'Code was already redeemed on this account.',
+            plus: userSnapshot.val()?.plus || null,
+            code,
+            alreadyRedeemed: true
+          });
+        }
+      }
+
+      if (!txResult.committed && !(latestCode?.used === true && latestCode.usedBy === userId && latestCode.redeemedPending === true)) {
+        return res.status(400).json({
+          error: true,
+          code: 'REDEMPTION_FAILED',
+          message: 'This code was already redeemed or is no longer available.'
+        });
+      }
     }
 
-    const yearsInt = Math.max(1, Math.min(5, parseInt(codeData.years || 1, 10) || 1));
-    const plus = await grantPlusToUser(userId, yearsInt, codeData.createdBy || 'system/code-redeem');
+    const reservedCode = latestCode || codeData;
+    const yearsInt = Math.max(1, Math.min(5, parseInt(reservedCode.years || 1, 10) || 1));
+
+    let plus;
+    if (reservedCode.redeemedPending === true && reservedCode.redeemedPlusExpiresAt) {
+      const userSnapshot = await db.ref(`users/${userId}`).once('value');
+      plus = userSnapshot.val()?.plus || null;
+    } else {
+      plus = await grantPlusToUser(userId, yearsInt, reservedCode.createdBy || 'system/code-redeem');
+    }
 
     await codeRef.update({
       redeemedPending: false,
-      redeemedPlusExpiresAt: plus.expiresAt || null
+      redeemedPlusExpiresAt: plus?.expiresAt || reservedCode.redeemedPlusExpiresAt || null
     });
 
     res.json({
@@ -9847,6 +11004,8 @@ app.post('/api/easter-egg/claim-reward', verifyAuthAndNotBanned, requireRecaptch
       code: rewardCode,
       years: 1,
       source: 'easter_egg',
+      neverExpires: true,
+      expiresAt: null,
       assignedUserId: req.user.uid,
       assignedEmail: req.user.email || null,
       note: 'Easter egg completion reward',
@@ -10695,11 +11854,408 @@ app.delete('/api/admin/security-logs/:logId', verifyAuth, verifyAdmin, async (re
   }
 });
 
+function appendTimelineEvent(events, event) {
+  const timestampMs = parseDateToMs(event?.timestamp);
+  if (!timestampMs) return;
+  events.push({
+    id: `${event.type || 'event'}_${events.length}_${timestampMs}`,
+    type: event.type || 'event',
+    timestamp: event.timestamp,
+    title: event.title || 'Event',
+    description: event.description || '',
+    metadata: event.metadata || {}
+  });
+}
+
+function buildQueueInspectorResult(entryA, entryB, profileA = {}, profileB = {}, activeMatches = []) {
+  const result = {
+    canMatch: false,
+    blockers: [],
+    sharedSelections: getSharedQueueSelections(entryA || {}, entryB || {}),
+    previews: []
+  };
+
+  if (!entryA || !entryB) {
+    result.blockers.push('Both users must have an active queue entry.');
+    return result;
+  }
+
+  if (entryA.userId === entryB.userId) {
+    result.blockers.push('A user cannot be matched against themselves.');
+    return result;
+  }
+
+  if (isQueueEntryExpired(entryA) || isQueueEntryExpired(entryB)) {
+    result.blockers.push('One or both queue entries are expired.');
+  }
+
+  const activeConflict = activeMatches.find((match) => (
+    match && !match.finalized && (
+      match.playerId === entryA.userId || match.testerId === entryA.userId ||
+      match.playerId === entryB.userId || match.testerId === entryB.userId
+    )
+  ));
+  if (activeConflict) {
+    result.blockers.push('One or both users already have an active match.');
+  }
+
+  if (!isQueueEntryTesterEligible(entryA, profileA) && !isQueueEntryTesterEligible(entryB, profileB)) {
+    result.blockers.push('At least one queued user must be tester-eligible.');
+  }
+
+  if (!result.sharedSelections.length) {
+    result.blockers.push('The queue entries do not share a compatible gamemode and region.');
+    return result;
+  }
+
+  result.previews = result.sharedSelections.map((selection) => {
+    const preview = {
+      gamemode: selection.gamemode,
+      region: selection.region,
+      canMatch: true,
+      reasons: [],
+      assignment: null
+    };
+
+    if (isUserRetiredFromGamemode(profileA, selection.gamemode)) {
+      preview.canMatch = false;
+      preview.reasons.push(`${entryA.minecraftUsername || 'User A'} is retired from ${selection.gamemode.toUpperCase()}.`);
+    }
+
+    if (isUserRetiredFromGamemode(profileB, selection.gamemode)) {
+      preview.canMatch = false;
+      preview.reasons.push(`${entryB.minecraftUsername || 'User B'} is retired from ${selection.gamemode.toUpperCase()}.`);
+    }
+
+    const assignment = resolveQueuedRoleAssignment(entryA, entryB, profileA, profileB, selection.gamemode);
+    if (!assignment) {
+      preview.canMatch = false;
+      preview.reasons.push('Role assignment failed because neither user can legally fill the player slot for this gamemode.');
+    } else {
+      const serverIP = assignment.player?.serverIP || assignment.tester?.serverIP || null;
+      if (!serverIP) {
+        preview.canMatch = false;
+        preview.reasons.push('No valid server IP is available for the assigned player.');
+      }
+      preview.assignment = assignment ? {
+        type: assignment.assignmentType,
+        playerUserId: assignment.player?.userId || null,
+        playerUsername: assignment.player?.minecraftUsername || null,
+        testerUserId: assignment.tester?.userId || null,
+        testerUsername: assignment.tester?.minecraftUsername || null,
+        explanation: assignment.explanation || ''
+      } : null;
+    }
+
+    return preview;
+  });
+
+  result.canMatch = result.previews.some((preview) => preview.canMatch);
+  if (!result.canMatch && result.previews.length > 0 && result.blockers.length === 0) {
+    result.blockers.push('The pair shares selections, but every compatible combination has a legal blocker.');
+  }
+
+  return result;
+}
+
+app.get('/api/admin/queue-inspector', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'queue:inspect') && !adminHasCapability(req, 'matches:view')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Queue inspection capability required' });
+    }
+
+    const leftUserId = String(req.query.leftUserId || '').trim();
+    const rightUserId = String(req.query.rightUserId || '').trim();
+    if (!leftUserId || !rightUserId) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'leftUserId and rightUserId are required' });
+    }
+
+    const [leftQueueSnapshot, rightQueueSnapshot, leftUserSnapshot, rightUserSnapshot, activeMatchesSnapshot] = await Promise.all([
+      db.ref('queue').orderByChild('userId').equalTo(leftUserId).once('value'),
+      db.ref('queue').orderByChild('userId').equalTo(rightUserId).once('value'),
+      db.ref(`users/${leftUserId}`).once('value'),
+      db.ref(`users/${rightUserId}`).once('value'),
+      db.ref('matches').orderByChild('status').equalTo('active').once('value')
+    ]);
+
+    const leftEntry = Object.values(leftQueueSnapshot.val() || {})[0] || null;
+    const rightEntry = Object.values(rightQueueSnapshot.val() || {})[0] || null;
+    const leftProfile = leftUserSnapshot.val() || {};
+    const rightProfile = rightUserSnapshot.val() || {};
+    const activeMatches = Object.values(activeMatchesSnapshot.val() || {});
+    const analysis = buildQueueInspectorResult(leftEntry, rightEntry, leftProfile, rightProfile, activeMatches);
+
+    res.json({
+      success: true,
+      left: leftEntry ? { ...leftEntry, profile: { minecraftUsername: leftProfile.minecraftUsername || null, adminRole: leftProfile.adminRole || null, tester: leftProfile.tester === true } } : null,
+      right: rightEntry ? { ...rightEntry, profile: { minecraftUsername: rightProfile.minecraftUsername || null, adminRole: rightProfile.adminRole || null, tester: rightProfile.tester === true } } : null,
+      analysis
+    });
+  } catch (error) {
+    console.error('Error inspecting queue pair:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error inspecting queue pair' });
+  }
+});
+
+app.get('/api/admin/disputes', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'disputes:manage') && !adminHasCapability(req, 'reports:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Dispute management capability required' });
+    }
+
+    const statusFilter = String(req.query.status || '').trim().toLowerCase();
+    const matchIdFilter = String(req.query.matchId || '').trim();
+    const userIdFilter = String(req.query.userId || '').trim();
+    const disputesSnapshot = await db.ref('matchDisputes').once('value');
+    let disputes = Object.values(disputesSnapshot.val() || {});
+
+    if (statusFilter) {
+      disputes = disputes.filter((dispute) => String(dispute?.status || '').toLowerCase() === statusFilter);
+    }
+    if (matchIdFilter) {
+      disputes = disputes.filter((dispute) => dispute?.matchId === matchIdFilter);
+    }
+    if (userIdFilter) {
+      disputes = disputes.filter((dispute) => dispute?.reporterId === userIdFilter || dispute?.opponentId === userIdFilter);
+    }
+
+    disputes.sort((a, b) => parseDateToMs(b?.updatedAt) - parseDateToMs(a?.updatedAt));
+    res.json({ success: true, disputes });
+  } catch (error) {
+    console.error('Error fetching admin disputes:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error fetching disputes' });
+  }
+});
+
+app.post('/api/admin/disputes/:disputeId/status', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'disputes:manage') && !adminHasCapability(req, 'reports:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Dispute management capability required' });
+    }
+
+    const { disputeId } = req.params;
+    const { status, note } = req.body || {};
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const allowedStatuses = new Set(['open', 'in_review', 'resolved', 'rejected']);
+    if (!allowedStatuses.has(normalizedStatus)) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Invalid dispute status' });
+    }
+
+    const disputeRef = db.ref(`matchDisputes/${disputeId}`);
+    const disputeSnapshot = await disputeRef.once('value');
+    const dispute = disputeSnapshot.val();
+    if (!dispute) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Dispute not found' });
+    }
+
+    const history = Array.isArray(dispute.history) ? dispute.history : [];
+    history.push(createDisputeHistoryEntry({
+      type: 'status_change',
+      actorId: req.user.uid,
+      actorRole: 'admin',
+      note: String(note || '').trim() || `Status changed to ${normalizedStatus}`,
+      metadata: { status: normalizedStatus }
+    }));
+
+    await disputeRef.update({
+      status: normalizedStatus,
+      resolutionNote: String(note || '').trim() || null,
+      resolvedBy: req.user.uid,
+      updatedAt: new Date().toISOString(),
+      history
+    });
+
+    await logAdminAction(req, req.user.uid, 'UPDATE_DISPUTE', disputeId, {
+      matchId: dispute.matchId,
+      status: normalizedStatus
+    });
+
+    res.json({ success: true, message: 'Dispute updated' });
+  } catch (error) {
+    console.error('Error updating dispute status:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error updating dispute' });
+  }
+});
+
+app.get('/api/admin/matches/:matchId/timeline', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'matches:view')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches view capability required' });
+    }
+
+    const { matchId } = req.params;
+    const [matchSnapshot, auditSnapshot, disputesSnapshot] = await Promise.all([
+      db.ref(`matches/${matchId}`).once('value'),
+      db.ref('adminAuditLog').once('value'),
+      db.ref('matchDisputes').once('value')
+    ]);
+
+    const match = matchSnapshot.val();
+    if (!match) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Match not found' });
+    }
+
+    const timeline = [];
+    const queueMeta = match.queueMeta || {};
+    const roleAssignment = match.roleAssignment || {};
+
+    if (queueMeta.playerJoinedQueueAt) {
+      appendTimelineEvent(timeline, {
+        type: 'queue_join',
+        timestamp: queueMeta.playerJoinedQueueAt,
+        title: 'Player Joined Queue',
+        description: `${match.playerUsername || 'Player'} entered the queue.`,
+        metadata: { role: 'player', source: queueMeta.playerQueueSource || null }
+      });
+    }
+    if (queueMeta.testerJoinedQueueAt) {
+      appendTimelineEvent(timeline, {
+        type: 'queue_join',
+        timestamp: queueMeta.testerJoinedQueueAt,
+        title: 'Tester Joined Queue',
+        description: `${match.testerUsername || 'Tester'} entered the queue.`,
+        metadata: { role: 'tester', source: queueMeta.testerQueueSource || null }
+      });
+    }
+
+    appendTimelineEvent(timeline, {
+      type: 'match_created',
+      timestamp: match.createdAt,
+      title: 'Match Created',
+      description: `Match created for ${match.gamemode?.toUpperCase() || 'unknown gamemode'} in ${match.region || 'unknown region'}.`,
+      metadata: {
+        serverIP: match.serverIP || null,
+        forceCreated: match.forceCreated === true
+      }
+    });
+
+    if (roleAssignment.explanation) {
+      appendTimelineEvent(timeline, {
+        type: 'role_assignment',
+        timestamp: match.createdAt,
+        title: 'Role Assignment',
+        description: roleAssignment.explanation,
+        metadata: {
+          type: roleAssignment.type || null,
+          randomized: roleAssignment.randomized === true,
+          serverSelectionSource: roleAssignment.serverSelectionSource || queueMeta.serverSelectionSource || null
+        }
+      });
+    }
+
+    if (match.participants?.[match.playerId]?.joinedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'page_join',
+        timestamp: match.participants[match.playerId].joinedAt,
+        title: 'Player Opened Match Page',
+        description: `${match.playerUsername || 'Player'} joined the match page.`
+      });
+    }
+    if (match.participants?.[match.testerId]?.joinedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'page_join',
+        timestamp: match.participants[match.testerId].joinedAt,
+        title: 'Tester Opened Match Page',
+        description: `${match.testerUsername || 'Tester'} joined the match page.`
+      });
+    }
+    if (match.countdownStartedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'countdown_started',
+        timestamp: match.countdownStartedAt,
+        title: 'Start Countdown Began',
+        description: 'Both participants were present, so the start countdown began.'
+      });
+    }
+    if (match.matchStartedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'match_started',
+        timestamp: match.matchStartedAt,
+        title: 'Match Started',
+        description: 'The match was marked as started.'
+      });
+    }
+    if (match.finalizedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'match_finalized',
+        timestamp: match.finalizedAt,
+        title: 'Match Finalized',
+        description: match.finalizationData?.type
+          ? `Finalized as ${String(match.finalizationData.type).replace(/_/g, ' ')}.`
+          : 'Match finalized.',
+        metadata: match.finalizationData || {}
+      });
+    }
+    if (match.revertedAt) {
+      appendTimelineEvent(timeline, {
+        type: 'match_reverted',
+        timestamp: match.revertedAt,
+        title: 'Ratings Reverted',
+        description: 'An admin reverted the rating changes for this match.',
+        metadata: { revertedBy: match.revertedBy || null }
+      });
+    }
+
+    const disputeList = Object.values(disputesSnapshot.val() || {}).filter((dispute) => dispute?.matchId === matchId);
+    disputeList.forEach((dispute) => {
+      appendTimelineEvent(timeline, {
+        type: 'dispute_created',
+        timestamp: dispute.createdAt,
+        title: 'Dispute Opened',
+        description: `${dispute.reporterUsername || 'A participant'} opened a dispute.`,
+        metadata: {
+          disputeId: dispute.disputeId,
+          status: dispute.status,
+          category: dispute.category
+        }
+      });
+
+      (Array.isArray(dispute.history) ? dispute.history : []).forEach((historyEntry) => {
+        appendTimelineEvent(timeline, {
+          type: `dispute_${historyEntry.type || 'update'}`,
+          timestamp: historyEntry.timestamp,
+          title: 'Dispute Update',
+          description: historyEntry.note || 'Dispute history updated.',
+          metadata: {
+            disputeId: dispute.disputeId,
+            actorId: historyEntry.actorId || null,
+            actorRole: historyEntry.actorRole || null,
+            status: historyEntry.metadata?.status || dispute.status
+          }
+        });
+      });
+    });
+
+    const auditEntries = Object.values(auditSnapshot.val() || {}).filter((entry) => (
+      entry?.targetUserId === matchId || entry?.details?.matchId === matchId
+    ));
+    auditEntries.forEach((entry) => {
+      appendTimelineEvent(timeline, {
+        type: 'admin_intervention',
+        timestamp: entry.timestamp,
+        title: `Admin Action: ${String(entry.action || 'UNKNOWN').replace(/_/g, ' ')}`,
+        description: `Admin ${entry.adminUid || 'unknown'} performed ${String(entry.action || 'an action').replace(/_/g, ' ').toLowerCase()}.`,
+        metadata: entry.details || {}
+      });
+    });
+
+    timeline.sort((a, b) => parseDateToMs(a.timestamp) - parseDateToMs(b.timestamp));
+    res.json({ success: true, matchId, timeline });
+  } catch (error) {
+    console.error('Error fetching match timeline:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error fetching match timeline' });
+  }
+});
+
 /**
  * GET /api/admin/matches - Get matches with filters (Admin only)
  */
 app.get('/api/admin/matches', verifyAuth, verifyAdmin, async (req, res) => {
   try {
+    if (!adminHasCapability(req, 'matches:view')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches view capability required' });
+    }
+
     const { limit = 100, status, gamemode, search } = req.query;
 
     const matchesRef = db.ref('matches');
@@ -10754,6 +12310,10 @@ app.get('/api/admin/matches', verifyAuth, verifyAdmin, async (req, res) => {
  */
 app.delete('/api/admin/matches/:matchId', verifyAuth, verifyAdmin, async (req, res) => {
   try {
+    if (!adminHasCapability(req, 'matches:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches manage capability required' });
+    }
+
     const { matchId } = req.params;
     const matchRef = db.ref(`matches/${matchId}`);
     const snapshot = await matchRef.once('value');
@@ -10794,6 +12354,10 @@ app.delete('/api/admin/matches/:matchId', verifyAuth, verifyAdmin, async (req, r
  */
 app.post('/api/admin/matches/:matchId/revert', verifyAuth, verifyAdmin, async (req, res) => {
   try {
+    if (!adminHasCapability(req, 'matches:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches manage capability required' });
+    }
+
     const { matchId } = req.params;
 
     const matchRef = db.ref(`matches/${matchId}`);
@@ -10883,6 +12447,10 @@ app.post('/api/admin/matches/:matchId/revert', verifyAuth, verifyAdmin, async (r
  */
 app.post('/api/admin/matches/:matchId/finalize', verifyAuth, verifyAdmin, async (req, res) => {
   try {
+    if (!adminHasCapability(req, 'matches:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches manage capability required' });
+    }
+
     const { matchId } = req.params;
     const { playerScore, testerScore } = req.body;
 
@@ -11127,18 +12695,8 @@ app.get('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
     const blacklistRef = db.ref('blacklist');
     const snapshot = await blacklistRef.once('value');
     const blacklist = snapshot.val() || {};
-    
-    let blacklistArray = Object.keys(blacklist).map(key => {
-      const entry = blacklist[key] || {};
-      const expiresAtMs = parseDateToMs(entry.expiresAt);
-      return {
-        id: key,
-        ...entry,
-        active: isBlacklistEntryActive(entry),
-        temporary: Boolean(expiresAtMs),
-        expired: Boolean(expiresAtMs && expiresAtMs <= Date.now())
-      };
-    }).sort((a, b) => parseDateToMs(b.addedAt) - parseDateToMs(a.addedAt));
+
+    let blacklistArray = buildBlacklistEntries(blacklist);
 
     if (!includeExpired) {
       blacklistArray = blacklistArray.filter(entry => entry.active);
@@ -11178,6 +12736,46 @@ app.get('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
 });
 
 /**
+ * GET /api/public/blacklist - Public blacklist feed
+ */
+app.get('/api/public/blacklist', async (req, res) => {
+  try {
+    const { limit: safeLimit, page: safePage } = parsePaginationParams(req.query, 25, 100);
+    const includeExpired = parseBooleanParam(req.query.includeExpired, false);
+
+    const snapshot = await db.ref('blacklist').once('value');
+    const blacklist = snapshot.val() || {};
+    let blacklistArray = buildBlacklistEntries(blacklist);
+
+    if (!includeExpired) {
+      blacklistArray = blacklistArray.filter((entry) => entry.active);
+    }
+
+    const total = blacklistArray.length;
+    const start = (safePage - 1) * safeLimit;
+    const entries = blacklistArray.slice(start, start + safeLimit);
+
+    res.json({
+      success: true,
+      entries,
+      pagination: {
+        page: safePage,
+        limit: safeLimit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / safeLimit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching public blacklist:', error);
+    res.status(500).json({
+      error: true,
+      code: 'SERVER_ERROR',
+      message: 'Error fetching blacklist feed'
+    });
+  }
+});
+
+/**
  * POST /api/admin/blacklist - Add to blacklist
  */
 app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
@@ -11198,10 +12796,12 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
 
     let resolvedUsername = String(username || '').trim();
     let resolvedUserId = String(userId || '').trim() || null;
+    let resolvedMinecraftUUID = null;
     if (resolvedUserId && !resolvedUsername) {
       const userSnapshot = await db.ref(`users/${resolvedUserId}`).once('value');
       const userData = userSnapshot.val() || {};
       resolvedUsername = String(userData.minecraftUsername || '').trim();
+      resolvedMinecraftUUID = normalizeMinecraftUUID(userData.minecraftUUID || userData.pendingMinecraftUUID);
       if (!resolvedUsername) {
         return res.status(400).json({
           error: true,
@@ -11217,6 +12817,19 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
         code: 'VALIDATION_ERROR',
         message: 'username could not be resolved'
       });
+    }
+
+    if (resolvedUsername && !resolvedMinecraftUUID) {
+      const mojangProfile = await fetchMojangProfile(resolvedUsername).catch(() => null);
+      if (mojangProfile) {
+        resolvedUsername = mojangProfile.username;
+        resolvedMinecraftUUID = mojangProfile.uuid;
+      }
+    }
+
+    if (!resolvedMinecraftUUID && resolvedUserId) {
+      const playerMatch = await findPlayerByMinecraftIdentity({ username: resolvedUsername });
+      resolvedMinecraftUUID = normalizeMinecraftUUID(playerMatch?.player?.minecraftUUID);
     }
 
     // Check for profanity in reason if provided
@@ -11254,6 +12867,7 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
     const payload = {
       username: resolvedUsername,
       userId: resolvedUserId,
+      minecraftUUID: resolvedMinecraftUUID,
       reason: reason || 'No reason provided',
       addedAt: new Date().toISOString(),
       addedBy: req.user.uid,
@@ -11267,6 +12881,7 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
       const historyRef = db.ref(`users/${resolvedUserId}/moderationHistory`).push();
       await historyRef.set({
         type: 'blacklist_added',
+        minecraftUUID: resolvedMinecraftUUID,
         reason: payload.reason,
         temporary: Boolean(expiresAt),
         expiresAt,
@@ -11278,6 +12893,7 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
 
     await logAdminAction(req, req.user.uid, 'BLACKLIST_ADD', resolvedUserId, {
       username: resolvedUsername,
+      minecraftUUID: resolvedMinecraftUUID,
       reason: payload.reason,
       expiresAt,
       disabledFunctions: normalizedDisabledFunctions
@@ -11515,6 +13131,220 @@ app.post('/api/admin/users/:id/admin', adminLimiter, verifyAuth, verifyAdmin, as
       code: 'SERVER_ERROR',
       message: 'Error setting admin status'
     });
+  }
+});
+
+/**
+ * GET /api/admin/staff-roles - List staff roles
+ */
+app.get('/api/admin/staff-roles', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'settings:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Settings manage capability required' });
+    }
+
+    const roles = await getAllStaffRoles();
+    const roleList = Object.entries(roles).map(([id, role]) => {
+      const iconConfig = buildStaffRoleIconConfig(role);
+      return {
+        id,
+        name: role.name || id,
+        color: role.color || '#38bdf8',
+        iconType: iconConfig.iconType,
+        iconValue: iconConfig.iconValue,
+        iconUrl: iconConfig.iconUrl,
+        iconClass: iconConfig.iconClass,
+        iconLabel: iconConfig.iconLabel,
+        dashboardActions: Array.isArray(role.dashboardActions) ? role.dashboardActions : []
+      };
+    });
+
+    roleList.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    res.json({
+      success: true,
+      roles: roleList,
+      actionCatalog: Object.entries(STAFF_DASHBOARD_ACTION_DEFINITIONS)
+        .filter(([, action]) => action.legacy !== true)
+        .map(([id, action]) => ({ id, label: action.label, icon: action.icon })),
+      badgePresets: Object.entries(STAFF_ROLE_ICON_PRESETS).map(([id, preset]) => ({
+        id,
+        label: preset.label,
+        iconClass: preset.iconClass
+      }))
+    });
+  } catch (error) {
+    console.error('Error listing staff roles:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error listing staff roles' });
+  }
+});
+
+/**
+ * POST /api/admin/staff-roles - Create a staff role
+ */
+app.post('/api/admin/staff-roles', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'settings:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Settings manage capability required' });
+    }
+
+    const payload = sanitizeStaffRolePayload(req.body || {});
+    if (!payload.valid) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Role name must be at least 2 characters.' });
+    }
+
+    const requestedId = sanitizeStaffRoleId(req.body?.id || payload.data.name);
+    if (!requestedId) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Invalid role id.' });
+    }
+
+    const roleRef = db.ref(`settings/staffRoles/${requestedId}`);
+    const existing = await roleRef.once('value');
+    if (existing.exists()) {
+      return res.status(409).json({ error: true, code: 'ALREADY_EXISTS', message: 'A role with this id already exists.' });
+    }
+
+    await roleRef.set({
+      ...payload.data,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: req.user.uid
+    });
+
+    res.json({ success: true, roleId: requestedId, role: { id: requestedId, ...payload.data, ...buildStaffRoleIconConfig(payload.data) } });
+  } catch (error) {
+    console.error('Error creating staff role:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error creating staff role' });
+  }
+});
+
+/**
+ * PUT /api/admin/staff-roles/:roleId - Update a staff role
+ */
+app.put('/api/admin/staff-roles/:roleId', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'settings:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Settings manage capability required' });
+    }
+
+    const roleId = sanitizeStaffRoleId(req.params.roleId);
+    if (!roleId) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Invalid role id.' });
+    }
+
+    const roleRef = db.ref(`settings/staffRoles/${roleId}`);
+    const existingSnapshot = await roleRef.once('value');
+    if (!existingSnapshot.exists()) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Role not found.' });
+    }
+
+    const payload = sanitizeStaffRolePayload(req.body || {});
+    if (!payload.valid) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Role name must be at least 2 characters.' });
+    }
+
+    await roleRef.update({
+      ...payload.data,
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.user.uid
+    });
+
+    playersCache.data = null;
+    playersCache.updatedAt = 0;
+
+    res.json({ success: true, role: { id: roleId, ...payload.data, ...buildStaffRoleIconConfig(payload.data) } });
+  } catch (error) {
+    console.error('Error updating staff role:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error updating staff role' });
+  }
+});
+
+/**
+ * DELETE /api/admin/staff-roles/:roleId - Remove a staff role
+ */
+app.delete('/api/admin/staff-roles/:roleId', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'settings:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Settings manage capability required' });
+    }
+
+    const roleId = sanitizeStaffRoleId(req.params.roleId);
+    if (!roleId) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Invalid role id.' });
+    }
+
+    const roleRef = db.ref(`settings/staffRoles/${roleId}`);
+    const existingSnapshot = await roleRef.once('value');
+    if (!existingSnapshot.exists()) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Role not found.' });
+    }
+
+    await roleRef.remove();
+
+    const usersSnapshot = await db.ref('users').once('value');
+    const users = usersSnapshot.val() || {};
+    const updates = {};
+    Object.entries(users).forEach(([uid, user]) => {
+      if (String(user?.staffRoleId || '') === roleId) {
+        updates[`${uid}/staffRoleId`] = null;
+        updates[`${uid}/updatedAt`] = new Date().toISOString();
+      }
+    });
+    if (Object.keys(updates).length > 0) {
+      await db.ref('users').update(updates);
+    }
+
+    playersCache.data = null;
+    playersCache.updatedAt = 0;
+
+    res.json({ success: true, message: 'Role removed.' });
+  } catch (error) {
+    console.error('Error deleting staff role:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error deleting staff role' });
+  }
+});
+
+/**
+ * POST /api/admin/users/:id/staff-role - Assign or clear staff role
+ */
+app.post('/api/admin/users/:id/staff-role', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'users:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Users manage capability required' });
+    }
+
+    const { id } = req.params;
+    const roleIdRaw = req.body?.roleId;
+    const roleId = roleIdRaw === null || roleIdRaw === '' ? null : sanitizeStaffRoleId(roleIdRaw);
+
+    if (roleIdRaw !== null && roleIdRaw !== '' && !roleId) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Invalid staff role id.' });
+    }
+
+    if (roleId) {
+      const roleExists = await db.ref(`settings/staffRoles/${roleId}`).once('value');
+      if (!roleExists.exists()) {
+        return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Staff role not found.' });
+      }
+    }
+
+    const userRef = db.ref(`users/${id}`);
+    const userSnapshot = await userRef.once('value');
+    if (!userSnapshot.exists()) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'User not found.' });
+    }
+
+    await userRef.update({
+      staffRoleId: roleId,
+      updatedAt: new Date().toISOString()
+    });
+
+    playersCache.data = null;
+    playersCache.updatedAt = 0;
+
+    res.json({ success: true, message: roleId ? 'Staff role assigned.' : 'Staff role cleared.', roleId });
+  } catch (error) {
+    console.error('Error assigning staff role:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error assigning staff role' });
   }
 });
 
@@ -11954,6 +13784,10 @@ app.post('/api/admin/players/force-auth-unlink', adminLimiter, verifyAuth, verif
  */
 app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
   try {
+    if (!adminHasCapability(req, 'matches:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Matches manage capability required' });
+    }
+
     const { testerUserId, playerUserId, playerId, gamemode, region, serverIP } = req.body;
 
     if (!testerUserId || !gamemode) {
@@ -12032,6 +13866,14 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
       });
     }
 
+    if (resolvedPlayerUserId === testerUserId) {
+      return res.status(400).json({
+        error: true,
+        code: 'VALIDATION_ERROR',
+        message: 'Player and tester must be different users'
+      });
+    }
+
     // Get player user profile
     const playerUserRef = db.ref(`users/${resolvedPlayerUserId}`);
     const playerUserSnapshot = await playerUserRef.once('value');
@@ -12042,6 +13884,33 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
         error: true,
         code: 'NOT_FOUND',
         message: 'Player user not found'
+      });
+    }
+
+    const activeMatchSnapshot = await db.ref('matches').orderByChild('status').equalTo('active').once('value');
+    const activeMatches = activeMatchSnapshot.val() || {};
+    const conflictingMatch = Object.values(activeMatches).find((match) => (
+      match && !match.finalized && (
+        match.playerId === testerUserId
+        || match.testerId === testerUserId
+        || match.playerId === resolvedPlayerUserId
+        || match.testerId === resolvedPlayerUserId
+      )
+    ));
+    if (conflictingMatch) {
+      return res.status(400).json({
+        error: true,
+        code: 'ACTIVE_MATCH_EXISTS',
+        message: 'Player or tester already has an active match'
+      });
+    }
+
+    const resolvedServer = await getUserPreferredServerIP(resolvedPlayerUserId, serverIP);
+    if (!resolvedServer.serverIP) {
+      return res.status(400).json({
+        error: true,
+        code: 'SERVER_NOT_WHITELISTED',
+        message: 'A whitelisted server IP is required. The player queue server is used when available.'
       });
     }
 
@@ -12077,7 +13946,7 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
       gamemode: gamemode,
       firstTo,
       region: region || 'NA',
-      serverIP: serverIP || 'play.example.com',
+      serverIP: resolvedServer.serverIP,
       status: 'active',
       matchType: 'regular',
       playerCurrentRating,
@@ -12096,6 +13965,27 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
         timeoutMinutes: 3,
         expiresAt: new Date(Date.now() + 3 * 60 * 1000).toISOString()
       },
+      queueMeta: {
+        playerJoinedQueueAt: null,
+        testerJoinedQueueAt: null,
+        playerQueueSource: null,
+        testerQueueSource: null,
+        serverSelectionSource: resolvedServer.source,
+        createdFromQueue: false,
+        requestedServerIP: String(serverIP || '').trim() || null,
+        resolvedServerIP: resolvedServer.serverIP
+      },
+      roleAssignment: {
+        type: 'admin_force_test',
+        explanation: resolvedServer.source === 'player_queue'
+          ? 'This match was force-created by an admin, but the player queue server IP overrode the requested server.'
+          : 'This match was force-created by an admin.',
+        playerReason: 'Admin force-created this match.',
+        testerReason: 'Admin force-created this match.',
+        randomized: false,
+        debugLabel: resolvedServer.source === 'player_queue' ? 'Player Server Override' : 'Force Created',
+        serverSelectionSource: resolvedServer.source
+      },
       forceCreated: true,
       forceCreatedBy: req.user.uid
     };
@@ -12113,9 +14003,10 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
 
     await newMatchRef.set(match);
 
-    // Remove tester availability if they had one
-    const availabilityRef = db.ref(`testerAvailability/${testerUserId}`);
-    await availabilityRef.remove();
+    await Promise.all([
+      clearUserQueueEntries(testerUserId),
+      clearUserQueueEntries(resolvedPlayerUserId)
+    ]);
 
     await logAdminAction(req, req.user.uid, 'FORCE_TEST', matchId, {
       testerUserId,
@@ -12123,7 +14014,9 @@ app.post('/api/admin/players/force-test', adminLimiter, verifyAuth, verifyAdmin,
       playerId: playerId || null,
       gamemode,
       region: region || 'NA',
-      serverIP: serverIP || 'play.example.com',
+      requestedServerIP: String(serverIP || '').trim() || null,
+      resolvedServerIP: resolvedServer.serverIP,
+      serverSelectionSource: resolvedServer.source,
       matchId
     });
 
@@ -13706,7 +15599,7 @@ app.get('/api/admin/blacklist/search', verifyAuth, verifyAdmin, async (req, res)
 });
 
 // Search users
-app.get('/api/admin/users/search', verifyAuth, verifyAdmin, async (req, res) => {
+app.get('/api/admin/users/search', verifyAuth, verifyAdmin, adminSearchLimiter, async (req, res) => {
   try {
     if (!adminHasCapability(req, 'users:view')) {
       return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Users view capability required' });
@@ -13728,27 +15621,63 @@ app.get('/api/admin/users/search', verifyAuth, verifyAdmin, async (req, res) => 
     const usersRef = db.ref('users');
     const usersSnapshot = await usersRef.once('value');
     const allUsers = usersSnapshot.val() || {};
+  const staffRolesSnapshot = await db.ref('staffRoles').once('value');
+  const staffRoles = staffRolesSnapshot.val() || {};
+    const playersSnapshot = await db.ref('players').once('value');
+    const allPlayers = playersSnapshot.val() || {};
+
+    const playersByUserId = new Map();
+    const playersByUsername = new Map();
+    for (const [playerId, playerData] of Object.entries(allPlayers)) {
+      const normalizedPlayerUsername = normalizeMinecraftUsername(playerData?.username);
+      const playerRecord = {
+        id: playerId,
+        ...playerData
+      };
+
+      if (playerData?.userId && !playersByUserId.has(playerData.userId)) {
+        playersByUserId.set(playerData.userId, playerRecord);
+      }
+
+      if (normalizedPlayerUsername && !playersByUsername.has(normalizedPlayerUsername)) {
+        playersByUsername.set(normalizedPlayerUsername, playerRecord);
+      }
+    }
 
     const matchingUsers = [];
 
     const searchTermLower = safeSearchTerm.toLowerCase();
     for (const [firebaseUid, userData] of Object.entries(allUsers)) {
+      const normalizedUserUsername = normalizeMinecraftUsername(userData?.minecraftUsername);
+      const linkedPlayer = playersByUserId.get(firebaseUid)
+        || (normalizedUserUsername ? playersByUsername.get(normalizedUserUsername) : null)
+        || null;
+      const resolvedMinecraftUsername = linkedPlayer?.username || userData.minecraftUsername || null;
+
       // Check if search term matches email, Firebase UID, or Minecraft username
       const matchesSearch =
         userData.email?.toLowerCase().includes(searchTermLower) ||
         firebaseUid.toLowerCase().includes(searchTermLower) ||
-        userData.minecraftUsername?.toLowerCase().includes(searchTermLower);
+        userData.minecraftUsername?.toLowerCase().includes(searchTermLower) ||
+        linkedPlayer?.username?.toLowerCase().includes(searchTermLower) ||
+        String(linkedPlayer?.id || '').toLowerCase().includes(searchTermLower);
 
       if (matchesSearch) {
         const testerFlag = userData.tester || userData.tierTester || false;
         matchingUsers.push({
           id: firebaseUid,
           email: userData.email,
-          minecraftUsername: userData.minecraftUsername,
+          minecraftUsername: resolvedMinecraftUsername,
           admin: userData.admin || false,
           tester: testerFlag,
           tierTester: testerFlag,
-          banned: userData.banned || false
+          banned: userData.banned || false,
+          staffRoleId: userData.staffRoleId || null,
+          staffRole: resolveStaffRoleForProfile(userData, staffRoles),
+          linkedPlayerId: linkedPlayer?.id || null,
+          linkedPlayerUsername: linkedPlayer?.username || null,
+          linkedPlayerBlacklisted: linkedPlayer?.blacklisted || false,
+          linkedPlayerUserId: linkedPlayer?.userId || null
         });
       }
     }
@@ -13797,7 +15726,7 @@ app.get('/api/admin/users/search', verifyAuth, verifyAdmin, async (req, res) => 
 });
 
 // Search players
-app.get('/api/admin/players/search', verifyAuth, verifyAdmin, async (req, res) => {
+app.get('/api/admin/players/search', verifyAuth, verifyAdmin, adminSearchLimiter, async (req, res) => {
   try {
     if (!adminHasCapability(req, 'users:view')) {
       return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Users view capability required' });
@@ -13817,15 +15746,55 @@ app.get('/api/admin/players/search', verifyAuth, verifyAdmin, async (req, res) =
     const playersRef = db.ref('players');
     const playersSnapshot = await playersRef.once('value');
     const allPlayers = playersSnapshot.val() || {};
+  const staffRolesSnapshot = await db.ref('staffRoles').once('value');
+  const staffRoles = staffRolesSnapshot.val() || {};
+    const usersSnapshot = await db.ref('users').once('value');
+    const allUsers = usersSnapshot.val() || {};
+
+    const usersByMinecraftUsername = new Map();
+    for (const [firebaseUid, userData] of Object.entries(allUsers)) {
+      const normalizedUserUsername = normalizeMinecraftUsername(userData?.minecraftUsername);
+      if (normalizedUserUsername && !usersByMinecraftUsername.has(normalizedUserUsername)) {
+        usersByMinecraftUsername.set(normalizedUserUsername, {
+          id: firebaseUid,
+          profile: userData
+        });
+      }
+    }
 
     const matchingPlayers = [];
 
     const searchTermLower = safeSearchTerm.toLowerCase();
     for (const [playerId, playerData] of Object.entries(allPlayers)) {
-      if (playerData.username?.toLowerCase().includes(searchTermLower)) {
+      const normalizedPlayerUsername = normalizeMinecraftUsername(playerData?.username);
+      const matchedUserEntry = (playerData.userId && allUsers[playerData.userId])
+        ? { id: playerData.userId, profile: allUsers[playerData.userId] }
+        : (normalizedPlayerUsername ? usersByMinecraftUsername.get(normalizedPlayerUsername) : null);
+      const linkedUserId = matchedUserEntry?.id || playerData.userId || null;
+      const linkedUserProfile = matchedUserEntry?.profile || null;
+      const testerFlag = linkedUserProfile?.tester || linkedUserProfile?.tierTester || false;
+
+      const matchesSearch =
+        playerData.username?.toLowerCase().includes(searchTermLower) ||
+        playerId.toLowerCase().includes(searchTermLower) ||
+        String(playerData.userId || '').toLowerCase().includes(searchTermLower) ||
+        String(linkedUserId || '').toLowerCase().includes(searchTermLower) ||
+        linkedUserProfile?.email?.toLowerCase().includes(searchTermLower) ||
+        linkedUserProfile?.minecraftUsername?.toLowerCase().includes(searchTermLower);
+
+      if (matchesSearch) {
         matchingPlayers.push({
           id: playerId,
           username: playerData.username,
+          userId: linkedUserId,
+          email: linkedUserProfile?.email || null,
+          minecraftUsername: linkedUserProfile?.minecraftUsername || null,
+          admin: linkedUserProfile?.admin || false,
+          tester: testerFlag,
+          tierTester: testerFlag,
+          banned: linkedUserProfile?.banned || false,
+          staffRoleId: linkedUserProfile?.staffRoleId || null,
+          staffRole: linkedUserProfile ? resolveStaffRoleForProfile(linkedUserProfile, staffRoles) : null,
           totalPoints: playerData.totalPoints || 0,
           gamemodeTiers: playerData.gamemodeTiers || {},
           blacklisted: playerData.blacklisted || false,
@@ -14330,64 +16299,21 @@ app.post('/api/auth/verify-minecraft-username', usernameVerifyLimiter, async (re
       });
     }
 
-    // Call Mojang API to verify username exists
-    const mojangApiUrl = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`;
-    
-    return new Promise((resolve) => {
-      https.get(mojangApiUrl, (response) => {
-        let data = '';
-
-        response.on('data', (chunk) => {
-          data += chunk;
-        });
-
-        response.on('end', () => {
-          if (response.statusCode === 200) {
-            try {
-              const profile = JSON.parse(data);
-              resolve(res.json({
-                success: true,
-                valid: true,
-                message: 'Username verified',
-                uuid: profile.id,
-                username: profile.name // Return the correctly cased username
-              }));
-            } catch (parseError) {
-              console.error('Error parsing Mojang API response:', parseError);
-              resolve(res.status(500).json({
-                error: true,
-                code: 'API_ERROR',
-                message: 'Error verifying username with Mojang API',
-                valid: false
-              }));
-            }
-          } else if (response.statusCode === 204 || response.statusCode === 404) {
-            // Username not found
-            resolve(res.json({
-              success: true,
-              valid: false,
-              message: 'Username not found. Please check spelling or create a Minecraft account.'
-            }));
-          } else {
-            // Other error
-            console.error(`Mojang API returned status ${response.statusCode}`);
-            resolve(res.status(500).json({
-              error: true,
-              code: 'API_ERROR',
-              message: 'Error verifying username with Mojang API',
-              valid: false
-            }));
-          }
-        });
-      }).on('error', (error) => {
-        console.error('Error calling Mojang API:', error);
-        resolve(res.status(500).json({
-          error: true,
-          code: 'NETWORK_ERROR',
-          message: 'Could not connect to Mojang API. Please try again later.',
-          valid: false
-        }));
+    const profile = await fetchMojangProfile(username);
+    if (!profile) {
+      return res.json({
+        success: true,
+        valid: false,
+        message: 'Username not found. Please check spelling or create a Minecraft account.'
       });
+    }
+
+    return res.json({
+      success: true,
+      valid: true,
+      message: 'Username verified',
+      uuid: profile.uuid,
+      username: profile.username
     });
   } catch (error) {
     console.error('Error verifying Minecraft username:', error);
@@ -14570,7 +16496,7 @@ async function computeAndStoreSecurityScore(userId) {
 
   try {
     // Throttle: skip if score is fresh
-    const existing = await fsRead(`securityScores/${userId}`);
+    const existing = await readStoredSecurityScore(userId);
     if (existing && existing.lastComputed) {
       const age = Date.now() - new Date(existing.lastComputed).getTime();
       if (age < SECURITY_SCORE_CACHE_TTL_MS) return existing;
@@ -14736,8 +16662,9 @@ async function computeAndStoreSecurityScore(userId) {
       lastComputed: new Date().toISOString()
     };
 
-    // Persist to Firestore
-    await fsWrite(`securityScores/${userId}`, result, false);
+    // Persist to available storage. Firestore remains primary when configured,
+    // but RTDB is kept in sync so scores still exist in environments without Firestore.
+    await writeStoredSecurityScore(userId, result);
 
     return result;
   } catch (err) {
@@ -14752,20 +16679,28 @@ async function computeAndStoreSecurityScore(userId) {
 app.get('/api/admin/security-scores', verifyAuth, verifyAdmin, async (req, res) => {
   try {
     const limitVal = Math.min(parseInt(req.query.limit, 10) || 50, 200);
-    const startAfter = req.query.startAfter || null;
+    const startAfter = req.query.startAfter ? parseInt(req.query.startAfter, 10) : null;
     const riskFilter = req.query.riskLevel || null; // 'critical'|'high'|'medium'|'low'|'clean'
 
-    if (!fsdb) {
-      return res.status(503).json({ error: true, code: 'FIRESTORE_UNAVAILABLE', message: 'Firestore not configured' });
+    let scores = [];
+
+    if (fsdb) {
+      let query = fsdb.collection('securityScores').orderBy('score', 'desc');
+      if (riskFilter) query = query.where('riskLevel', '==', riskFilter);
+      if (Number.isFinite(startAfter)) query = query.startAfter(startAfter);
+      query = query.limit(limitVal);
+
+      const snap = await query.get();
+      scores = snap.docs.map((doc) => doc.data());
     }
 
-    let query = fsdb.collection('securityScores').orderBy('score', 'desc');
-    if (riskFilter) query = query.where('riskLevel', '==', riskFilter);
-    if (startAfter) query = query.startAfter(parseInt(startAfter, 10));
-    query = query.limit(limitVal);
-
-    const snap = await query.get();
-    const scores = snap.docs.map(d => d.data());
+    if (scores.length === 0) {
+      scores = await listStoredSecurityScores({
+        limit: limitVal,
+        riskLevel: riskFilter,
+        startAfter
+      });
+    }
 
     res.json({ scores, total: scores.length, limit: limitVal });
   } catch (err) {
@@ -14904,6 +16839,21 @@ app.listen(PORT, async () => {
       await cleanupExpiredPlusSubscriptions();
     } catch (error) {
       console.error('Error in Plus expiry cleanup:', error);
+    }
+  }, 48 * 60 * 60 * 1000);
+
+  setInterval(async () => {
+    if (maintenanceJobRunning) return;
+    maintenanceJobRunning = true;
+    try {
+      console.log('[MAINTENANCE] Running lightweight 48h Firebase maintenance...');
+      await cleanupRetiredNotificationData();
+      const backupResult = await createRealtimeDatabaseFirestoreBackup('scheduled');
+      console.log(`[MAINTENANCE] RTDB backup stored in Firestore as ${backupResult.backupId}`);
+    } catch (error) {
+      console.error('Error in 48h Firebase maintenance:', error);
+    } finally {
+      maintenanceJobRunning = false;
     }
   }, 48 * 60 * 60 * 1000);
 });

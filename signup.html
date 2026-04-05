@@ -12,7 +12,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 </head>
 <body>
@@ -181,6 +180,7 @@
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>
@@ -197,6 +197,74 @@
     <script src="js/firebase-auth-service.js"></script>
     <script src="js/auth-guard.js"></script>
     <script>
+        let signupSubmissionInFlight = false;
+        let googleSignupInFlight = false;
+        let cachedSignupClientIpPromise = null;
+
+        function fetchSignupClientIp() {
+            if (cachedSignupClientIpPromise) {
+                return cachedSignupClientIpPromise;
+            }
+
+            cachedSignupClientIpPromise = (async () => {
+                try {
+                    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+                    const timeoutId = controller ? setTimeout(() => controller.abort(), 2500) : null;
+                    const ipResponse = await fetch('https://api.ipify.org?format=json', controller ? { signal: controller.signal } : undefined);
+                    if (timeoutId) clearTimeout(timeoutId);
+                    if (!ipResponse.ok) {
+                        return 'unknown';
+                    }
+                    const ipData = await ipResponse.json();
+                    return ipData.ip || 'unknown';
+                } catch (ipError) {
+                    console.warn('Failed to get real IP:', ipError);
+                    return 'unknown';
+                }
+            })();
+
+            return cachedSignupClientIpPromise;
+        }
+
+        function setSignupUiState(isBusy, mode) {
+            const signupBtn = document.getElementById('signupBtn');
+            const googleBtn = document.getElementById('googleSignupBtn');
+            const form = document.getElementById('signupForm');
+
+            if (form) {
+                form.setAttribute('aria-busy', String(isBusy));
+            }
+
+            if (signupBtn) {
+                signupBtn.disabled = isBusy;
+                signupBtn.innerHTML = isBusy && mode === 'email'
+                    ? '<i class="fas fa-spinner fa-spin"></i> Creating account...'
+                    : '<i class="fas fa-user-plus"></i> Create Account';
+            }
+
+            if (googleBtn) {
+                googleBtn.disabled = isBusy;
+                googleBtn.innerHTML = isBusy && mode === 'google'
+                    ? '<i class="fas fa-spinner fa-spin"></i> Connecting...'
+                    : '<i class="fab fa-google"></i> Sign up with Google';
+            }
+        }
+
+        async function ensureApiTokenReady(maxAttempts = 40) {
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                const auth = firebase.auth();
+                const currentUser = auth.currentUser;
+                if (currentUser) {
+                    const token = await currentUser.getIdToken(attempt > 0);
+                    apiService.setToken(token);
+                    return token;
+                }
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            throw new Error('Authentication token was not ready in time. Please try again.');
+        }
+
         // Wait for Firebase to initialize, then verify guest status
         // Wait for deferred scripts to load
         window.addEventListener('DOMContentLoaded', async function() {
@@ -232,10 +300,16 @@
 
             const isGuest = await requireGuest();
             if (!isGuest) return; // Redirected to dashboard
+
+            fetchSignupClientIp().catch(() => 'unknown');
         });
         
         async function handleSignup(event) {
             event.preventDefault();
+
+            if (signupSubmissionInFlight || googleSignupInFlight) {
+                return;
+            }
 
             // Ensure Firebase is ready
             if (typeof firebase === 'undefined' || !firebase.auth) {
@@ -251,7 +325,6 @@
             const password = document.getElementById('password').value;
             const confirmPassword = document.getElementById('confirmPassword').value;
             const age = parseInt(document.getElementById('age').value);
-            const signupBtn = document.getElementById('signupBtn');
             
             
             if (password !== confirmPassword) {
@@ -272,46 +345,26 @@
                 return;
             }
             
-            signupBtn.disabled = true;
-            signupBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating account...';
+            signupSubmissionInFlight = true;
+            setSignupUiState(true, 'email');
             
             try {
-                // Get real IP address from external service
-                let clientIP = 'unknown';
-                try {
-                    const ipResponse = await fetch('https://api.ipify.org?format=json');
-                    if (ipResponse.ok) {
-                        const ipData = await ipResponse.json();
-                        clientIP = ipData.ip;
-                    }
-                } catch (ipError) {
-                    console.warn('Failed to get real IP:', ipError);
+                if (window.mclbLoadingOverlay) {
+                    window.mclbLoadingOverlay.updateStatus('Creating your account...', 88);
                 }
+
+                const clientIP = await fetchSignupClientIp();
 
                 // Create Firebase account
                 const user = await firebaseAuthService.signUp(email, password);
                 const firebaseUid = user.uid;
 
+                if (window.mclbLoadingOverlay) {
+                    window.mclbLoadingOverlay.updateStatus('Securing your session...', 92);
+                }
+
                 // Wait for Firebase token to be set
-                await new Promise((resolve) => {
-                    const checkToken = () => {
-                        // Get a fresh token directly from Firebase
-                        const auth = firebase.auth();
-                        const currentUser = auth.currentUser;
-                        if (currentUser) {
-                            currentUser.getIdToken().then(token => {
-                                apiService.setToken(token);
-                                resolve();
-                            }).catch(err => {
-                                console.error('Failed to get token:', err);
-                                setTimeout(checkToken, 100);
-                            });
-                        } else {
-                            setTimeout(checkToken, 100);
-                        }
-                    };
-                    checkToken();
-                });
+                await ensureApiTokenReady();
 
                 // Register with backend (includes alt detection)
                 const token = apiService.getToken();
@@ -351,7 +404,7 @@
                     timer: 1500,
                     showConfirmButton: false
                 }).then(() => {
-                    window.location.href = 'onboarding.html';
+                    window.location.replace('onboarding.html');
                 });
             } catch (error) {
                 // Handle backend error codes
@@ -490,14 +543,18 @@
                     confirmButtonText: 'OK'
                 });
             } finally {
-                signupBtn.disabled = false;
-                signupBtn.innerHTML = '<i class="fas fa-user-plus"></i> Create Account';
+                signupSubmissionInFlight = false;
+                setSignupUiState(false, 'email');
             }
         }
 
         // Google signup (requires age verification, same as email signup)
         async function handleGoogleSignup(event) {
             event.preventDefault();
+
+            if (signupSubmissionInFlight || googleSignupInFlight) {
+                return;
+            }
 
             // Ensure Firebase is ready
             if (typeof firebase === 'undefined' || !firebase.auth) {
@@ -510,7 +567,6 @@
             }
 
             const age = parseInt(document.getElementById('age').value);
-            const googleBtn = document.getElementById('googleSignupBtn');
 
             if (!age || Number.isNaN(age)) {
                 Swal.fire({
@@ -529,21 +585,15 @@
                 return;
             }
 
-            googleBtn.disabled = true;
-            googleBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting...';
+            googleSignupInFlight = true;
+            setSignupUiState(true, 'google');
 
             try {
-                // Get real IP address from external service
-                let clientIP = 'unknown';
-                try {
-                    const ipResponse = await fetch('https://api.ipify.org?format=json');
-                    if (ipResponse.ok) {
-                        const ipData = await ipResponse.json();
-                        clientIP = ipData.ip;
-                    }
-                } catch (ipError) {
-                    console.warn('Failed to get real IP:', ipError);
+                if (window.mclbLoadingOverlay) {
+                    window.mclbLoadingOverlay.updateStatus('Connecting to Google...', 88);
                 }
+
+                const clientIP = await fetchSignupClientIp();
 
                 await firebaseAuthService.signUpWithGoogle({ age, clientIP });
 
@@ -554,7 +604,7 @@
                     timer: 1500,
                     showConfirmButton: false
                 }).then(() => {
-                    window.location.href = 'onboarding.html';
+                    window.location.replace('onboarding.html');
                 });
             } catch (error) {
                 console.error('Google signup error:', error);
@@ -581,8 +631,8 @@
                     confirmButtonText: 'OK'
                 });
             } finally {
-                googleBtn.disabled = false;
-                googleBtn.innerHTML = '<i class="fab fa-google"></i> Sign up with Google';
+                googleSignupInFlight = false;
+                setSignupUiState(false, 'google');
             }
         }
     </script>

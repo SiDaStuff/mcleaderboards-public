@@ -136,6 +136,28 @@ function openReportPageForPlayer(playerName) {
   window.location.href = targetUrl;
 }
 
+function openNameMcProfile(playerUuid, playerUsername) {
+  const normalizedUuid = String(playerUuid || '').trim().replace(/-/g, '').toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(normalizedUuid)) {
+    window.open(`https://namemc.com/profile/${normalizedUuid}`, '_blank', 'noopener,noreferrer');
+    return;
+  }
+
+  const normalizedUsername = String(playerUsername || '').trim();
+  if (!normalizedUsername) {
+    Swal.fire({
+      icon: 'info',
+      title: 'Username Unavailable',
+      text: 'This player does not have a valid UUID or username available for NameMC.'
+    });
+    return;
+  }
+
+  // Requested fallback format when UUID is not linked.
+  const fallbackTarget = `${normalizedUsername}.1`;
+  window.open(`https://namemc.com/profile/${encodeURIComponent(fallbackTarget)}`, '_blank', 'noopener,noreferrer');
+}
+
 /**
  * Initialize leaderboard
  */
@@ -631,50 +653,41 @@ async function handleSearch() {
 
   const query = searchInput.value.trim();
   if (query) {
-    // Perform player lookup - search all players including those not in current leaderboard
+    // Always resolve from backend so searches are not limited by leaderboard page data.
     try {
-      // Use cached data if available and fresh, otherwise fetch
-      let allPlayersData = allPlayers;
-      const now = Date.now();
-      if (!allPlayersData.length || (now - lastPlayersLoadTime) > PLAYERS_CACHE_TTL) {
-        const response = await apiService.getPlayers();
-        allPlayersData = response.players || [];
-        allPlayers = allPlayersData;
-        lastPlayersLoadTime = now;
-      }
+      const usernameResponse = await apiService.getPlayerByUsername(query);
+      const mappedPlayer = {
+        username: usernameResponse.name || usernameResponse.username || query,
+        minecraftUUID: usernameResponse.uuid || null,
+        region: usernameResponse.region || 'N/A',
+        overallRating: usernameResponse.overallRating || usernameResponse.overall || 0,
+        rank: usernameResponse.globalRank || null,
+        blacklisted: usernameResponse.blacklisted === true,
+        gamemodeRatings: {},
+        peakRatings: {},
+        gamemodeMatchCount: {},
+        achievementTitles: {},
+        plus: usernameResponse.plus || null,
+        verifiedRoles: usernameResponse.verifiedRoles || {},
+        verifiedStaffRole: usernameResponse.staffRole || null,
+        userId: usernameResponse.userId || null,
+        retiredGamemodes: usernameResponse.retiredGamemodes || {}
+      };
 
-      // Find exact match first, then partial match
-      let player = allPlayersData.find(p =>
-        p.username?.toLowerCase() === query.toLowerCase()
-      );
+      const rankings = usernameResponse.rankings || {};
+      Object.keys(rankings).forEach((gamemodeId) => {
+        const ranking = rankings[gamemodeId] || {};
+        mappedPlayer.gamemodeRatings[gamemodeId] = typeof ranking.rating === 'number' ? ranking.rating : 0;
+        mappedPlayer.peakRatings[gamemodeId] = typeof ranking.peak_rating === 'number'
+          ? ranking.peak_rating
+          : mappedPlayer.gamemodeRatings[gamemodeId];
+        mappedPlayer.gamemodeMatchCount[gamemodeId] = typeof ranking.games_played === 'number' ? ranking.games_played : 0;
+      });
 
-      if (!player) {
-        // Try partial match
-        player = allPlayersData.find(p =>
-          p.username?.toLowerCase().includes(query.toLowerCase())
-        );
-      }
-
-      if (player) {
-        // Add role information to player if not present
-        if (!player.roles && player.createdBy && AppState.currentUser) {
-          try {
-            const userResponse = await apiService.getProfile();
-            if (userResponse.createdBy === player.createdBy) {
-              player.roles = {
-                admin: userResponse.admin || false,
-                tester: userResponse.tester || false
-              };
-            }
-          } catch (error) {
-            console.error('Error fetching user roles for search:', error);
-          }
-        }
-
-        openPlayerModal(player);
-        searchInput.value = '';
-      } else {
-        // No player found
+      openPlayerModal(mappedPlayer);
+      searchInput.value = '';
+    } catch (error) {
+      if (error?.status === 404) {
         Swal.fire({
           icon: 'info',
           title: 'Player Not Found',
@@ -682,8 +695,8 @@ async function handleSearch() {
           timer: 2000,
           showConfirmButton: false
         });
+        return;
       }
-    } catch (error) {
       console.error('Error searching for player:', error);
       Swal.fire({
         icon: 'error',
@@ -987,6 +1000,8 @@ async function openPlayerModal(player) {
   const showProfileTitlePill = hasAllGamemodeRatings(player);
   const combatTitle = player.achievementTitles?.overall || getCombatTitle(overallRating);
   const region = player.region || 'N/A';
+  const playerUuid = String(player.minecraftUUID || player.uuid || player.id || '').trim();
+  const hasValidUuid = /^[0-9a-fA-F-]{32,36}$/.test(playerUuid);
 
   // Build username gradient style if Plus is active and gradient is configured
   const gradient = player.plus?.active === true ? (player.plus?.gradient || null) : null;
@@ -1008,7 +1023,7 @@ async function openPlayerModal(player) {
   const gradientAngle = gradient ? safeAngle(gradient.angle) : 90;
   const gradientAnim = gradient && typeof gradient.animation === 'string' ? gradient.animation : 'none';
   const usernameGradientStyle = (gradientStops.length >= 2)
-    ? `style="
+    ? `
         background: linear-gradient(${gradientAngle}deg, ${gradientStops.join(', ')});
         -webkit-background-clip: text;
         background-clip: text;
@@ -1016,7 +1031,7 @@ async function openPlayerModal(player) {
         text-shadow: none;
         ${gradientAnim === 'shift' ? 'background-size: 200% 200%; animation: mclbGradientShift 4s ease infinite;' : ''}
         ${gradientAnim === 'pulse' ? 'animation: mclbGradientPulse 2.2s ease-in-out infinite;' : ''}
-      "`
+      `
     : '';
 
   // Build ratings display
@@ -1065,7 +1080,7 @@ async function openPlayerModal(player) {
            style="width: 64px; height: 64px; border-radius: 10px; border: 1px solid var(--border-color);"
            onerror="this.src='https://render.crafty.gg/3d/bust/Steve'">
       <div>
-        <div style="font-size: 1.2rem; font-weight: 700;" ${usernameGradientStyle}>${escapeHtml(player.username || 'Unknown')}</div>
+        <div style="font-size: 1.2rem; font-weight: 700; ${usernameGradientStyle}">${escapeHtml(player.username || 'Unknown')}</div>
         <div style="display: ${showProfileTitlePill ? 'flex' : 'none'}; align-items: center; gap: 0.4rem; color: var(--text-muted); margin-top: 0.2rem;">
           <img src="${combatTitle.icon}" alt="${combatTitle.title}" style="width: 16px; height: 16px;">
           <span>${combatTitle.title}</span>
@@ -1096,13 +1111,24 @@ async function openPlayerModal(player) {
       ${ratingsHtml || '<div class="text-muted">No ratings assigned yet.</div>'}
     </div>
 
-    <button type="button"
-            class="btn btn-danger"
-            style="width: 100%; font-weight: 700; padding: 0.85rem 1rem; border-radius: 12px; margin-top: 1rem;"
-            data-player="${escapeHtml(player.username || '')}"
-            onclick="openReportPageForPlayer(this.dataset.player)">
-      <i class="fas fa-flag"></i> Report This Player
-    </button>
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; margin-top: 1rem;">
+      <button type="button"
+              class="btn btn-secondary"
+              style="font-weight: 700; padding: 0.85rem 1rem; border-radius: 12px;"
+              data-player-uuid="${escapeHtml(playerUuid)}"
+              data-player-name="${escapeHtml(player.username || '')}"
+              onclick="openNameMcProfile(this.dataset.playerUuid, this.dataset.playerName)"
+              title="${hasValidUuid ? 'Open NameMC by UUID' : 'Open NameMC by username fallback'}">
+        <i class="fas fa-id-card"></i> NameMC
+      </button>
+      <button type="button"
+              class="btn btn-danger"
+              style="font-weight: 700; padding: 0.85rem 1rem; border-radius: 12px;"
+              data-player="${escapeHtml(player.username || '')}"
+              onclick="openReportPageForPlayer(this.dataset.player)">
+        <i class="fas fa-flag"></i> Report
+      </button>
+    </div>
   `;
 
   // Add ESC key listener to close modal and focus search input
@@ -1153,8 +1179,16 @@ function getRoleBadges(player) {
   const badges = [];
   const isAdmin = player.verifiedRoles?.admin === true || player.roles?.admin === true || player.admin === true;
   const isTester = player.verifiedRoles?.tester === true || player.roles?.tester === true || player.tester === true;
+  const staffRole = player.verifiedStaffRole || player.staffRole || null;
 
   const buildRoleBadge = (label, variant) => `<span class="role-pill-badge role-pill-${variant}" title="${label}" data-role="${label}">${label}</span>`;
+  const buildStaffBadge = (role) => {
+    const safeName = escapeHtml(role?.name || 'Staff');
+    const safeColor = /^#([0-9a-fA-F]{6})$/.test(String(role?.color || '')) ? role.color : '#38bdf8';
+    const safeIcon = escapeHtml(role?.iconUrl || '');
+    const safeIconClass = escapeHtml(role?.iconClass || 'fas fa-shield-alt');
+    return `<span class="role-pill-badge role-pill-staff" title="${safeName}" data-role="${safeName}" style="border-color:${safeColor}; color:${safeColor};">${safeIcon ? `<img src="${safeIcon}" alt="${safeName}" class="role-badge-icon" style="width:14px; height:14px; margin-right:0.25rem; border-radius:3px;">` : `<i class="${safeIconClass}" style="margin-right:0.25rem;"></i>`}${safeName}</span>`;
+  };
 
   // Check verified roles first (for other players)
   if (isAdmin) {
@@ -1163,6 +1197,10 @@ function getRoleBadges(player) {
 
   if (isTester) {
     badges.push(buildRoleBadge('Tier Tester', 'tester'));
+  }
+
+  if (staffRole) {
+    badges.push(buildStaffBadge(staffRole));
   }
 
   // Plus badge (can stack with other badges)
@@ -1181,6 +1219,9 @@ function getRoleBadges(player) {
     }
     if (profile?.plus?.active === true && profile?.plus?.showBadge !== false) {
       badges.push(buildRoleBadge('Plus', 'plus'));
+    }
+    if (profile?.staffRole) {
+      badges.push(buildStaffBadge(profile.staffRole));
     }
   }
 

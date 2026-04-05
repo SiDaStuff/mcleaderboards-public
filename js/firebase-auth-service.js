@@ -1,7 +1,59 @@
 // MC Leaderboards - Firebase Authentication Service
 
+function formatAuthRateLimitRetryText(retryAtMs) {
+  if (!retryAtMs || Number.isNaN(retryAtMs)) {
+    return null;
+  }
+
+  const remainingMs = Math.max(0, retryAtMs - Date.now());
+  if (remainingMs <= 0) {
+    return 'in a moment';
+  }
+
+  const totalSeconds = Math.ceil(remainingMs / 1000);
+  if (totalSeconds < 60) {
+    return `in ${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`;
+  }
+
+  const totalMinutes = Math.ceil(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `in ${totalMinutes} minute${totalMinutes === 1 ? '' : 's'}`;
+  }
+
+  const totalHours = Math.ceil(totalMinutes / 60);
+  return `in ${totalHours} hour${totalHours === 1 ? '' : 's'}`;
+}
+
+function parseAuthRateLimitRetryAt(resp, data = {}) {
+  if (data.resetAt) {
+    const resetDate = new Date(data.resetAt);
+    if (!Number.isNaN(resetDate.getTime())) {
+      return resetDate.getTime();
+    }
+  }
+
+  const rateLimitReset = resp.headers.get('RateLimit-Reset');
+  if (rateLimitReset) {
+    const resetSeconds = Number(rateLimitReset);
+    if (!Number.isNaN(resetSeconds) && resetSeconds > 0) {
+      return resetSeconds * 1000;
+    }
+  }
+
+  const retryAfterHeader = resp.headers.get('Retry-After');
+  if (retryAfterHeader) {
+    const retryAfterSeconds = Number(retryAfterHeader);
+    if (!Number.isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
+      return Date.now() + retryAfterSeconds * 1000;
+    }
+  }
+
+  return null;
+}
+
 const firebaseAuthService = {
-  banStatusListener: null,
+  banStatusPollInterval: null,
+  banStatusVisibilityHandler: null,
   _googleProvider: null,
 
   /**
@@ -47,6 +99,7 @@ const firebaseAuthService = {
         AppState.setUser(null);
         AppState.setProfile(null);
         apiService.setToken(null);
+        this.stopBanStatusPolling();
       }
     });
 
@@ -56,6 +109,7 @@ const firebaseAuthService = {
         AppState.setUser(null);
         AppState.setProfile(null);
         apiService.setToken(null);
+        this.stopBanStatusPolling();
       }
       // Profile fetching moved to onIdTokenChanged to ensure token is available
     });
@@ -86,16 +140,19 @@ const firebaseAuthService = {
       
       AppState.setProfile(profile);
 
-      // Set up realtime ban detection listener
-      this.setupBanStatusListener(userId);
+      // Use secure backend polling for ban detection.
+      this.startBanStatusPolling(userId);
 
       return profile;
     } catch (error) {
       console.error('Error fetching profile:', error);
       // If profile doesn't exist, create it
-      if (error.message.includes('not found') || error.message.includes('404')) {
+      const errorMessage = String(error?.message || '').toLowerCase();
+      if (errorMessage.includes('not found') || errorMessage.includes('404')) {
         await this.createUserProfile(userId);
+        return AppState.getProfile();
       }
+      throw error;
     } finally {
       AppState.setLoading('profile', false);
     }
@@ -264,6 +321,14 @@ const firebaseAuthService = {
         // Bubble backend ban details if present
         const backendError = new Error(data.message || 'Login failed');
         backendError.code = resp.status === 429 ? 'RATE_LIMITED' : (data.code || 'SERVER_ERROR');
+        if (resp.status === 429) {
+          backendError.retryAt = parseAuthRateLimitRetryAt(resp, data);
+          backendError.userMessage = 'Too many login attempts right now.';
+          backendError.suggestion = backendError.retryAt
+            ? `Please try again ${formatAuthRateLimitRetryText(backendError.retryAt)}.`
+            : 'Please wait a minute and try Google sign-in again.';
+          backendError.message = `${backendError.userMessage}\n\n${backendError.suggestion}`;
+        }
         throw backendError;
       }
 
@@ -361,46 +426,67 @@ const firebaseAuthService = {
   },
 
   /**
-   * Set up realtime ban status listener
+   * Start secure backend polling for ban status changes.
    */
-  setupBanStatusListener(userId) {
-    // Check if Firebase is initialized
-    if (typeof firebase === 'undefined' || !firebase.apps || firebase.apps.length === 0) {
-      console.warn('Firebase not initialized, cannot set up ban status listener');
+  startBanStatusPolling(userId) {
+    if (!userId) {
       return;
     }
 
-    // Clean up existing listener
-    if (this.banStatusListener) {
-      this.banStatusListener.off();
-    }
+    this.stopBanStatusPolling();
 
-    // Set up new listener for ban status changes
-    const db = typeof getDatabase === 'function' ? getDatabase() : firebase.database();
-    const userRef = db.ref(`users/${userId}`);
-    this.banStatusListener = userRef;
-    userRef.on('value', async (snapshot) => {
-      if (!snapshot || !snapshot.exists()) {
-        return; // User profile doesn't exist yet
+    const pollBanStatus = async () => {
+      if (document.visibilityState !== 'visible') {
+        return;
       }
 
-      const profile = snapshot.val();
-      if (profile && profile.banned) {
-        // Check if ban has expired
+      const activeUserId = AppState.getUserId();
+      if (!activeUserId || activeUserId !== userId) {
+        this.stopBanStatusPolling();
+        return;
+      }
+
+      try {
+        const profile = await apiService.getProfileQuick();
+        if (!profile?.banned) {
+          return;
+        }
+
         if (profile.banExpires && profile.banExpires !== 'permanent') {
           const banExpires = new Date(profile.banExpires);
-          const now = new Date();
-          if (banExpires <= now) {
-            // Ban has expired, ignore
+          if (!Number.isNaN(banExpires.getTime()) && banExpires <= new Date()) {
             return;
           }
         }
 
-        // User is banned - auto logout
-        console.log('Ban detected via realtime listener, logging out user');
+        console.log('Ban detected via secure polling, logging out user');
         await this.handleBanDetected(profile.banReason, profile.banExpires);
+      } catch (error) {
+        console.error('Error checking ban status:', error);
       }
-    });
+    };
+
+    this.banStatusVisibilityHandler = () => {
+      if (document.visibilityState === 'visible') {
+        pollBanStatus();
+      }
+    };
+
+    document.addEventListener('visibilitychange', this.banStatusVisibilityHandler);
+    this.banStatusPollInterval = setInterval(pollBanStatus, 15000);
+    pollBanStatus();
+  },
+
+  stopBanStatusPolling() {
+    if (this.banStatusPollInterval) {
+      clearInterval(this.banStatusPollInterval);
+      this.banStatusPollInterval = null;
+    }
+
+    if (this.banStatusVisibilityHandler) {
+      document.removeEventListener('visibilitychange', this.banStatusVisibilityHandler);
+      this.banStatusVisibilityHandler = null;
+    }
   },
 
   /**
@@ -408,11 +494,7 @@ const firebaseAuthService = {
    */
   async handleBanDetected(reason, expires) {
     try {
-      // Clean up listener
-      if (this.banStatusListener) {
-        this.banStatusListener.off();
-        this.banStatusListener = null;
-      }
+      this.stopBanStatusPolling();
 
       // Sign out user
       const auth = typeof getAuth === 'function' ? getAuth() : firebase.auth();
@@ -462,11 +544,7 @@ const firebaseAuthService = {
    */
   async signOut() {
     try {
-      // Clean up ban status listener
-      if (this.banStatusListener) {
-        this.banStatusListener.off();
-        this.banStatusListener = null;
-      }
+      this.stopBanStatusPolling();
 
       // If Firebase SDK isn't available for any reason, still allow a local "logout"
       // so pages like Support don't hard-crash.
@@ -637,6 +715,21 @@ const firebaseAuthService = {
    * Handle authentication errors with user-friendly messages and suggestions
    */
   handleAuthError(error) {
+    if (error.code === 'RATE_LIMITED') {
+      const message = error.userMessage || 'Too many login attempts right now.';
+      const suggestion = error.suggestion
+        || (error.retryAt
+          ? `Please try again ${formatAuthRateLimitRetryText(error.retryAt)}.`
+          : 'Please wait a minute and try again.');
+      const enhancedError = new Error(`${message}\n\n${suggestion}`);
+      enhancedError.code = error.code;
+      enhancedError.userMessage = message;
+      enhancedError.suggestion = suggestion;
+      enhancedError.action = 'wait';
+      enhancedError.retryAt = error.retryAt || null;
+      return enhancedError;
+    }
+
     const errorInfo = {
       'auth/email-already-in-use': {
         message: 'This email is already registered.',

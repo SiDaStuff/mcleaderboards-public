@@ -175,7 +175,7 @@
       const gradientAngle = gradient ? safeAngle(gradient.angle) : 90;
       const gradientAnim = gradient && typeof gradient.animation === 'string' ? gradient.animation : 'none';
       const usernameGradientStyle = (gradientStops.length >= 2)
-        ? `style="
+        ? `
             background: linear-gradient(${gradientAngle}deg, ${gradientStops.join(', ')});
             -webkit-background-clip: text;
             background-clip: text;
@@ -183,7 +183,7 @@
             text-shadow: none;
             ${gradientAnim === 'shift' ? 'background-size: 200% 200%; animation: mclbGradientShift 4s ease infinite;' : ''}
             ${gradientAnim === 'pulse' ? 'animation: mclbGradientPulse 2.2s ease-in-out infinite;' : ''}
-          "`
+          `
         : '';
 
       let retiredGamemodes = player.retiredGamemodes || {};
@@ -229,7 +229,7 @@
                style="width: 64px; height: 64px; border-radius: 10px; border: 1px solid var(--border-color);"
                onerror="this.src='https://render.crafty.gg/3d/bust/Steve'">
           <div>
-            <div style="font-size: 1.2rem; font-weight: 700;" ${usernameGradientStyle}>${escapeHtml(player.username || 'Unknown')}</div>
+            <div style="font-size: 1.2rem; font-weight: 700; ${usernameGradientStyle}">${escapeHtml(player.username || 'Unknown')}</div>
             <div style="display: flex; align-items: center; gap: 0.4rem; color: var(--text-muted); margin-top: 0.2rem;">
               <img src="${combatTitle.icon}" alt="${combatTitle.title}" style="width: 16px; height: 16px;">
               <span>${combatTitle.title}</span>

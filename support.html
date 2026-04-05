@@ -14,7 +14,6 @@
     <!-- Firebase SDK (compat) -->
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
 
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
@@ -196,6 +195,7 @@
                                             <li><strong>Vanilla:</strong> First to 3</li>
                                             <li><strong>Mace:</strong> First to 3</li>
                                         </ul>
+                                        <p style="margin-top: 0.6rem;"><strong>Vanilla totem drain rule:</strong> if both participants are above 1700 Vanilla rating, the drain is <strong>8 totems</strong>. Otherwise, it is <strong>14 totems</strong>.</p>
                                     </div>
                                 </div>
                                 <div class="faq-item">
@@ -210,10 +210,24 @@
                                 <div class="faq-item">
                                     <div class="faq-question" onclick="toggleFaq(this)">
                                         <i class="fas fa-chevron-right faq-icon"></i>
+                                        <span>How does the new queue system work?</span>
+                                    </div>
+                                    <div class="faq-answer">
+                                        <p>There is now one shared queue for both regular players and Tier Testers.</p>
+                                        <p>Every queue entry includes selected gamemodes, selected regions, and a server IP. The system only creates a match when two queued users share at least one gamemode and one region.</p>
+                                        <p>At least one of the two queued users must have the Tier Tester role. If only one queued user is a Tier Tester, they become the tester automatically and the other user becomes the player.</p>
+                                        <p>If both queued users are Tier Testers, the system still uses the same shared queue, but it randomly assigns one of them as the tester and the other as the player. The match page explains why that assignment happened.</p>
+                                        <p>Among all compatible pairs, the system prefers the closest Elo ratings so matches stay as fair as possible.</p>
+                                    </div>
+                                </div>
+                                <div class="faq-item">
+                                    <div class="faq-question" onclick="toggleFaq(this)">
+                                        <i class="fas fa-chevron-right faq-icon"></i>
                                         <span>How do I join the testing queue?</span>
                                     </div>
                                     <div class="faq-answer">
-                                        <p>Go to your dashboard, select a gamemode and region, enter your server IP, and click "Join Queue". You'll be matched with an available tester who has a similar Elo rating.</p>
+                                        <p>Go to your dashboard, select one or more gamemodes, select one or more regions, enter a whitelisted server IP, and click "Join Queue".</p>
+                                        <p>The system places you into the shared queue and looks for the closest compatible pair that shares a gamemode and region with you. A match only starts when at least one queued user in the pair is a Tier Tester.</p>
                                     </div>
                                 </div>
                                 <div class="faq-item">
@@ -222,7 +236,8 @@
                                         <span>Why was I removed from the queue?</span>
                                     </div>
                                     <div class="faq-answer">
-                                        <p>If no tester becomes available within 5 minutes, you'll be automatically removed from the queue. You can rejoin the queue at any time. There's also a 48-hour cooldown after completing a match in each gamemode.</p>
+                                        <p>If no compatible Tier Tester is queued within 5 minutes, you'll be automatically removed from the queue. You can rejoin at any time.</p>
+                                        <p>There is also a 30-minute cooldown after completing a match in each gamemode, unless your account has tester/admin queue exemptions.</p>
                                     </div>
                                 </div>
                                 <div class="faq-item">
@@ -317,6 +332,7 @@
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>

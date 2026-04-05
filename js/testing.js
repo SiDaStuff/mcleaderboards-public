@@ -5,15 +5,84 @@ let match = null;
 let isTester = false;
 let isPlayer = false;
 let isSpectator = false;
-let chatListener = null;
-let matchListener = null;
-let presenceListener = null;
-let pageStatsListener = null;
 let lastMessageTime = 0;
 let buttonHandlerCounter = 0;
 let countdownInterval = null;
 let countdownStartTime = null;
+let matchPollingInterval = null;
+let chatPollingInterval = null;
+let lastChatSignature = '';
 const chatMessageCache = new Map();
+
+function getRoleLabelForMatchUser(userId) {
+  if (!match || !userId) return 'Participant';
+  if (match.playerId === userId) return 'Player';
+  if (match.testerId === userId) return 'Tier Tester';
+  return 'Participant';
+}
+
+function getCurrentUserRoleLabel() {
+  if (isPlayer) return 'Player';
+  if (isTester) return 'Tier Tester';
+  return 'Spectator';
+}
+
+function getCurrentUserRoleReason() {
+  if (!match?.roleAssignment) return 'Roles are assigned automatically when a compatible pair is found.';
+  if (isPlayer) return match.roleAssignment.playerReason || match.roleAssignment.explanation || 'You were assigned as the player for this match.';
+  if (isTester) return match.roleAssignment.testerReason || match.roleAssignment.explanation || 'You were assigned as the tier tester for this match.';
+  return match.roleAssignment.explanation || 'Roles are assigned automatically when a compatible pair is found.';
+}
+
+function getRoleAssignmentDebugLabel() {
+  if (!AppState.isAdmin() || !match?.roleAssignment) return '';
+  if (match.roleAssignment.type === 'dual_tier_tester_cooldown_priority') {
+    return 'Admin Debug: cooldown forced the tester/player role split.';
+  }
+  if (match.roleAssignment.type === 'dual_tier_tester_random' || match.roleAssignment.randomized === true) {
+    return 'Admin Debug: both users were tester-eligible, so roles were randomized.';
+  }
+  if (match.roleAssignment.type === 'admin_force_test') {
+    if (match.roleAssignment.serverSelectionSource === 'player_queue') {
+      return 'Admin Debug: player queue server IP overrode the requested server.';
+    }
+    return 'Admin Debug: this match was force-created by an admin.';
+  }
+  return '';
+}
+
+function updateRoleAssignmentDisplays() {
+  const roleNotice = document.getElementById('roleAssignmentNotice');
+  const waitingRoleNotice = document.getElementById('waitingRoleAssignmentNotice');
+  const roleNoticeDebug = document.getElementById('roleAssignmentDebugNotice');
+  const waitingRoleNoticeDebug = document.getElementById('waitingRoleAssignmentDebugNotice');
+  const yourRoleEl = document.getElementById('matchYourRole');
+  const currentRole = getCurrentUserRoleLabel();
+  const reasonText = getCurrentUserRoleReason();
+  const debugLabel = getRoleAssignmentDebugLabel();
+
+  if (yourRoleEl) {
+    yourRoleEl.textContent = currentRole;
+  }
+
+  if (roleNotice) {
+    roleNotice.innerHTML = `<i class="fas fa-balance-scale"></i> ${escapeHtml(reasonText)}`;
+  }
+
+  if (waitingRoleNotice) {
+    waitingRoleNotice.innerHTML = `<i class="fas fa-balance-scale"></i> ${escapeHtml(reasonText)}`;
+  }
+
+  if (roleNoticeDebug) {
+    roleNoticeDebug.textContent = debugLabel;
+    roleNoticeDebug.classList.toggle('d-none', !debugLabel);
+  }
+
+  if (waitingRoleNoticeDebug) {
+    waitingRoleNoticeDebug.textContent = debugLabel;
+    waitingRoleNoticeDebug.classList.toggle('d-none', !debugLabel);
+  }
+}
 
 function getMatchFirstTo() {
   if (!match) return 3;
@@ -22,6 +91,10 @@ function getMatchFirstTo() {
   }
   const fromConfig = CONFIG?.FIRST_TO?.[match.gamemode];
   return Number.isFinite(fromConfig) && fromConfig > 0 ? fromConfig : 3;
+}
+
+function shouldShowTotemDrain() {
+  return String(match?.gamemode || '').trim().toLowerCase() === 'vanilla';
 }
 
 /**
@@ -47,9 +120,7 @@ async function initTesting() {
   }
 
   await loadMatch();
-
-  // Setup realtime listeners for match updates
-  setupRealtimeMatchListener();
+  startSecureMatchPolling();
 
   if (window.mclbLoadingOverlay) {
     window.mclbLoadingOverlay.updateStatus('Match ready!', 100);
@@ -80,20 +151,14 @@ async function loadMatch() {
     }
 
     if (window.mclbLoadingOverlay) {
-      window.mclbLoadingOverlay.updateStatus('Starting realtime sync...', 96);
-    }
-
-    // Setup real-time listeners (presence/page stats only for participants)
-    setupRealtimeListeners();
-    if (!isSpectator) {
-      setupRealtimePresenceListener();
-      setupRealtimePageStatsListener();
+      window.mclbLoadingOverlay.updateStatus('Starting secure live sync...', 96);
     }
 
     // Render match
     renderMatch();
+    await loadChatMessages();
 
-    // Check if both players joined (will be updated by realtime listener)
+    // Check if both players joined (updated through secure polling)
     updateBothJoinedStatus();
   } catch (error) {
     console.error('Error loading match:', error);
@@ -108,16 +173,31 @@ function renderMatch() {
   document.getElementById('loadingState').classList.add('d-none');
   
   const opponent = isPlayer
-    ? match.testerUsername
+    ? `${match.testerUsername} (${getRoleLabelForMatchUser(match.testerId)})`
     : isTester
-      ? match.playerUsername
-      : `${match.playerUsername} vs ${match.testerUsername}`;
+      ? `${match.playerUsername} (${getRoleLabelForMatchUser(match.playerId)})`
+      : `${match.playerUsername} (${getRoleLabelForMatchUser(match.playerId)}) vs ${match.testerUsername} (${getRoleLabelForMatchUser(match.testerId)})`;
   
   document.getElementById('matchGamemode').textContent = match.gamemode.toUpperCase();
   document.getElementById('displayGamemode').textContent = match.gamemode.toUpperCase();
   document.getElementById('matchOpponent').textContent = opponent;
   document.getElementById('matchRegion').textContent = match.region;
   document.getElementById('matchServerIP').textContent = match.serverIP;
+  const showTotemDrain = shouldShowTotemDrain();
+  const matchTotemDrainItem = document.getElementById('matchTotemDrainItem');
+  const matchFormatTotemDrain = document.getElementById('matchFormatTotemDrain');
+  const totemDrain = Number.isFinite(Number(match.totemDrain)) ? Number(match.totemDrain) : 14;
+  if (matchTotemDrainItem) {
+    matchTotemDrainItem.classList.toggle('d-none', !showTotemDrain);
+  }
+  if (matchFormatTotemDrain) {
+    matchFormatTotemDrain.classList.toggle('d-none', !showTotemDrain);
+  }
+  if (showTotemDrain) {
+    document.getElementById('matchTotemDrain').textContent = `${totemDrain} Totems`;
+    document.getElementById('displayTotemDrain').textContent = `${totemDrain} Totems`;
+  }
+  updateRoleAssignmentDisplays();
   
   // Display firstTo value
   const firstTo = getMatchFirstTo();
@@ -144,6 +224,8 @@ function renderMatch() {
   const sendBtn = document.getElementById('sendBtn');
   const abortBtn = document.getElementById('abortMatchBtn');
   const drawVotePanel = document.getElementById('drawVotePanel');
+  const matchStartRoleNotice = document.getElementById('matchStartRoleNotice');
+  const markStartedBtn = document.getElementById('markStartedBtn');
 
   if (isSpectator) {
     spectatorNotice.classList.remove('d-none');
@@ -153,6 +235,10 @@ function renderMatch() {
     sendBtn.disabled = true;
     if (abortBtn) abortBtn.style.display = 'none';
     if (drawVotePanel) drawVotePanel.classList.add('d-none');
+    if (matchStartRoleNotice) {
+      matchStartRoleNotice.textContent = 'Spectators can watch the join and start state, but only the tier tester can start the match.';
+    }
+    if (markStartedBtn) markStartedBtn.style.display = 'none';
   } else {
     spectatorNotice.classList.add('d-none');
     spectatorChatNotice.classList.add('d-none');
@@ -160,6 +246,12 @@ function renderMatch() {
     messageInput.disabled = false;
     sendBtn.disabled = false;
     if (drawVotePanel) drawVotePanel.classList.remove('d-none');
+    if (matchStartRoleNotice) {
+      matchStartRoleNotice.textContent = isTester
+        ? 'You are the tier tester for this match. Confirm the start once both sides are ready.'
+        : 'Waiting for the tier tester to confirm the match start. This updates automatically.';
+    }
+    if (markStartedBtn) markStartedBtn.style.display = isTester ? '' : 'none';
   }
 
   updateDrawVoteStatus();
@@ -207,11 +299,14 @@ function startCountdownTimer() {
     // Change color based on time remaining
     const progressBar = document.getElementById('countdownProgress');
     if (remaining < 60000) { // Less than 1 minute
-      progressBar.style.background = 'linear-gradient(90deg, #ef4444, #dc2626)';
+      progressBar.style.background = '#ef4444';
       document.getElementById('countdownDisplay').style.color = '#ef4444';
     } else if (remaining < 120000) { // Less than 2 minutes
-      progressBar.style.background = 'linear-gradient(90deg, #f59e0b, #d97706)';
+      progressBar.style.background = '#f59e0b';
       document.getElementById('countdownDisplay').style.color = '#f59e0b';
+    } else {
+      progressBar.style.background = 'var(--warning-color)';
+      document.getElementById('countdownDisplay').style.color = 'var(--warning-color)';
     }
   }, 1000);
 }
@@ -236,7 +331,7 @@ function startMatchStartCountdown() {
       window.matchStartCountdown = null;
       document.getElementById('matchStartedCountdown').textContent = '0:00';
       document.getElementById('matchStartedProgress').style.width = '0%';
-      // Match auto-finalized by backend
+      refreshMatchState({ silent: false });
       return;
     }
 
@@ -255,13 +350,13 @@ function startMatchStartCountdown() {
     // Change color based on time remaining
     const progressBar = document.getElementById('matchStartedProgress');
     if (remaining < 60000) { // Less than 1 minute
-      progressBar.style.background = 'linear-gradient(90deg, #ef4444, #dc2626)';
+      progressBar.style.background = '#ef4444';
       document.getElementById('matchStartedCountdown').style.color = '#ef4444';
     } else if (remaining < 120000) { // Less than 2 minutes
-      progressBar.style.background = 'linear-gradient(90deg, #f59e0b, #d97706)';
+      progressBar.style.background = '#f59e0b';
       document.getElementById('matchStartedCountdown').style.color = '#f59e0b';
     } else {
-      progressBar.style.background = 'linear-gradient(90deg, var(--warning-color), #e67e22)';
+      progressBar.style.background = 'var(--warning-color)';
       document.getElementById('matchStartedCountdown').style.color = 'var(--warning-color)';
     }
   }, 1000);
@@ -273,6 +368,11 @@ function startMatchStartCountdown() {
 async function handleMarkMatchStarted() {
   if (isSpectator) {
     showCustomModal('Spectator Mode', 'Spectators cannot perform match actions.', null);
+    return;
+  }
+
+  if (!isTester) {
+    showCustomModal('Tester Only', 'Only the tier tester can mark the match as started.', null);
     return;
   }
 
@@ -300,7 +400,7 @@ async function handleMarkMatchStarted() {
         window.matchStartCountdown = null;
       }
       
-      showCustomModal('Match Started', 'The match has been marked as started. Begin playing!', null);
+      showCustomModal('Match Started', 'The tier tester marked the match as started. Begin playing!', null);
     } else {
       btn.disabled = false;
       btn.textContent = '<i class="fas fa-play"></i> Mark Match as Started';
@@ -342,8 +442,9 @@ function updateJoinStatusIndicators() {
   }
 
   // Update names
-  document.getElementById('playerJoinName').textContent = match.playerUsername || 'Player';
-  document.getElementById('testerJoinName').textContent = match.testerUsername || 'Tier Tester';
+  document.getElementById('playerJoinName').textContent = `${match.playerUsername || 'Player'} (Player)`;
+  document.getElementById('testerJoinName').textContent = `${match.testerUsername || 'Tier Tester'} (Tier Tester)`;
+  updateRoleAssignmentDisplays();
 }
 
 /**
@@ -385,6 +486,13 @@ function updateBothJoinedStatus() {
       // Match not started yet, show countdown
       document.getElementById('matchStartedSection').style.display = 'block';
       document.getElementById('matchAlreadyStartedSection').style.display = 'none';
+
+      const lead = document.getElementById('matchStartedLead');
+      if (lead) {
+        lead.innerHTML = isTester
+          ? 'Both sides have joined. You have <strong>5 minutes</strong> to mark the match as started.'
+          : 'Both sides have joined. The tier tester has <strong>5 minutes</strong> to mark the match as started.';
+      }
       
       if (!window.matchStartCountdown) {
         startMatchStartCountdown();
@@ -413,117 +521,116 @@ function updateBothJoinedStatus() {
   }
 }
 
-/**
- * Setup real-time listeners
- */
-function setupRealtimeListeners() {
-  const db = getDatabase();
-  const chatRef = db.ref(`matches/${matchId}/chat`);
+async function refreshMatchState({ silent = true } = {}) {
+  try {
+    const updatedMatch = await apiService.getMatch(matchId);
+    if (!updatedMatch) return;
 
-  // Listen for new messages
-  chatListener = chatRef.on('child_added', (snapshot) => {
-    const message = snapshot.val();
-    addMessageToChat(message, snapshot.key);
-  });
-}
+    const previousStatus = match?.status;
+    const previousFinalized = match?.finalized === true;
+    match = updatedMatch;
 
-/**
- * Setup realtime match listener
- */
-function setupRealtimeMatchListener() {
-  const db = getDatabase();
-  const matchRef = db.ref(`matches/${matchId}`);
+    renderMatch();
+    updateBothJoinedStatus();
 
-  matchListener = matchRef.on('value', (snapshot) => {
-    const updatedMatch = snapshot.val();
-    if (updatedMatch) {
-      // Update local match data
-      match = updatedMatch;
-
-      // Check for match end
-      if (updatedMatch.status === 'ended') {
-        handleMatchEnded();
-      }
-
-      // Update UI if needed
-      renderMatch();
-      updateBothJoinedStatus();
-      
-      // Hide abort button if match is finalized
-      if (updatedMatch.finalized === true) {
-        const abortBtn = document.getElementById('abortMatchBtn');
-        if (abortBtn) {
-          abortBtn.style.display = 'none';
-        }
-      }
+    if ((updatedMatch.status === 'ended' || updatedMatch.finalized === true) && (previousStatus !== 'ended' || !previousFinalized)) {
+      handleMatchEnded();
     }
-  });
-}
 
-/**
- * Setup realtime presence listener
- */
-function setupRealtimePresenceListener() {
-  const db = getDatabase();
-  const presenceRef = db.ref(`matches/${matchId}/presence`);
-
-  presenceListener = presenceRef.on('value', (snapshot) => {
-    // Presence updates are handled automatically by the server
-    // This listener ensures we stay connected for realtime updates
-    console.log('Presence updated');
-  });
-}
-
-/**
- * Setup realtime page stats listener
- */
-function setupRealtimePageStatsListener() {
-  const db = getDatabase();
-  const pageStatsRef = db.ref(`matches/${matchId}/pagestats`);
-
-  pageStatsListener = pageStatsRef.on('value', (snapshot) => {
-    const pageStats = snapshot.val();
-    if (pageStats && match) {
-      // Update local match pagestats
-      match.pagestats = pageStats;
-      updateBothJoinedStatus();
+    const abortBtn = document.getElementById('abortMatchBtn');
+    if (abortBtn && updatedMatch.finalized === true) {
+      abortBtn.style.display = 'none';
     }
-  });
+  } catch (error) {
+    if (!silent) {
+      console.error('Error refreshing match state:', error);
+    }
+  }
 }
 
-/**
- * Add message to chat
- */
-function addMessageToChat(message, messageId) {
+function renderChatMessages(messages = []) {
   const chatDiv = document.getElementById('chatMessages');
-  const messageDiv = document.createElement('div');
-  messageDiv.className = 'mb-2';
-  messageDiv.id = `msg-${messageId}`;
-  chatMessageCache.set(messageId, {
-    username: message.username || 'Unknown',
-    text: message.text || ''
-  });
-  
-  const isOwnMessage = message.userId === AppState.getUserId();
-  const alignment = isOwnMessage ? 'text-right' : 'text-left';
-  
-  messageDiv.innerHTML = `
-    <div class="${alignment}">
-      <strong style="color: var(--accent-color);">${escapeHtml(message.username)}:</strong>
-      <span>${escapeHtml(message.text)}</span>
-      ${isTester ? `<button class="btn btn-sm btn-danger ml-2" onclick="deleteMessage('${messageId}')" style="padding: 0.25rem 0.5rem;">
-        <i class="fas fa-trash"></i>
-      </button>` : ''}
-      ${(!isOwnMessage && !isSpectator) ? `<button class="btn btn-sm btn-warning ml-2" onclick="reportChatMessage('${messageId}')" style="padding: 0.25rem 0.5rem;">
-        <i class="fas fa-flag"></i>
-      </button>` : ''}
-      <br>
-      <small class="text-muted">${new Date(message.timestamp).toLocaleTimeString()}</small>
-    </div>
-  `;
-  
-  chatDiv.appendChild(messageDiv);
-  chatDiv.scrollTop = chatDiv.scrollHeight;
+  if (!chatDiv) return;
+
+  const normalizedMessages = Array.isArray(messages) ? messages : [];
+  const nextSignature = normalizedMessages
+    .map((message) => `${message.messageId || ''}:${message.timestamp || 0}:${message.text || ''}`)
+    .join('|');
+  if (nextSignature === lastChatSignature) {
+    return;
+  }
+
+  const nearBottom = (chatDiv.scrollHeight - chatDiv.scrollTop - chatDiv.clientHeight) < 48;
+  lastChatSignature = nextSignature;
+  chatMessageCache.clear();
+
+  chatDiv.innerHTML = normalizedMessages.map((message) => {
+    const rawMessageId = message.messageId || '';
+    const messageId = escapeHtml(rawMessageId);
+    chatMessageCache.set(rawMessageId, {
+      username: message.username || 'Unknown',
+      text: message.text || ''
+    });
+
+    const isOwnMessage = message.userId === AppState.getUserId();
+    const alignment = isOwnMessage ? 'text-right' : 'text-left';
+
+    return `
+      <div class="mb-2" id="msg-${messageId}">
+        <div class="${alignment}">
+          <strong style="color: var(--accent-color);">${escapeHtml(message.username || 'Unknown')}:</strong>
+          <span style="color: var(--text-primary);">${escapeHtml(message.text || '')}</span>
+          ${isTester ? `<button class="btn btn-sm btn-danger ml-2" onclick="deleteMessage('${messageId}')" style="padding: 0.25rem 0.5rem;"><i class="fas fa-trash"></i></button>` : ''}
+          ${(!isOwnMessage && !isSpectator) ? `<button class="btn btn-sm btn-warning ml-2" onclick="reportChatMessage('${messageId}')" style="padding: 0.25rem 0.5rem;"><i class="fas fa-flag"></i></button>` : ''}
+          <br>
+          <small class="text-muted">${message.timestamp ? new Date(message.timestamp).toLocaleTimeString() : ''}</small>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  if (nearBottom || normalizedMessages.length <= 1) {
+    chatDiv.scrollTop = chatDiv.scrollHeight;
+  }
+}
+
+async function loadChatMessages() {
+  try {
+    const response = await apiService.getChatMessages(matchId);
+    renderChatMessages(response?.messages || []);
+  } catch (error) {
+    console.error('Error loading chat messages:', error);
+  }
+}
+
+function startSecureMatchPolling() {
+  stopSecureMatchPolling();
+  refreshMatchState({ silent: false });
+  loadChatMessages();
+
+  matchPollingInterval = setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      refreshMatchState();
+    }
+  }, 2500);
+
+  chatPollingInterval = setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      loadChatMessages();
+    }
+  }, 2500);
+}
+
+function stopSecureMatchPolling() {
+  if (matchPollingInterval) {
+    clearInterval(matchPollingInterval);
+    matchPollingInterval = null;
+  }
+
+  if (chatPollingInterval) {
+    clearInterval(chatPollingInterval);
+    chatPollingInterval = null;
+  }
 }
 
 /**
@@ -566,6 +673,7 @@ async function handleSendMessage(event) {
     await apiService.sendChatMessage(matchId, text);
     messageInput.value = '';
     lastMessageTime = now;
+    await loadChatMessages();
   } catch (error) {
     Swal.fire({
       icon: 'error',
@@ -584,11 +692,7 @@ async function handleSendMessage(event) {
 async function deleteMessage(messageId) {
   try {
     await apiService.deleteChatMessage(matchId, messageId);
-    const messageDiv = document.getElementById(`msg-${messageId}`);
-    if (messageDiv) {
-      messageDiv.remove();
-    }
-    chatMessageCache.delete(messageId);
+    await loadChatMessages();
   } catch (error) {
     Swal.fire({
       icon: 'error',
@@ -797,32 +901,66 @@ function getMatchResultInfo() {
  */
 function showScoreSubmissionForm() {
   const firstTo = getMatchFirstTo();
+  const winnerRequirement = `Winner must reach ${firstTo}`;
+  const testerDisplayName = AppState.getProfile()?.minecraftUsername
+    || match?.testerUsername
+    || AppState.currentUser?.displayName
+    || 'Tester';
   const modalBody = `
-    <div style="text-align: left; margin-bottom: 1rem;">
-      <p><strong>Player:</strong> ${escapeHtml(match.playerUsername)}</p>
-      <p><strong>Gamemode:</strong> ${match.gamemode.toUpperCase()}</p>
-      <p><strong>Match Type:</strong> First to ${firstTo}</p>
-    </div>
-
-    <div style="margin: 1rem 0;">
-      <p style="margin-bottom: 1rem;"><strong>Match Score:</strong></p>
-      <div style="display: flex; gap: 1rem; align-items: center;">
-        <div>
-          <label style="display: block; margin-bottom: 0.5rem;">Player Score:</label>
-          <input type="number" id="playerScore" class="form-input" min="0" max="${firstTo}" value="0" style="width: 80px; padding: 0.5rem; text-align: center;">
+    <div class="finalize-modal-shell">
+      <div class="finalize-modal-intro">
+        <div class="finalize-modal-panel">
+          <div class="finalize-modal-kicker">Match Review</div>
+          <h3 class="finalize-modal-title">Confirm the completed score</h3>
+          <p class="finalize-modal-copy">Enter the final result exactly as played. A tied result cannot be submitted, and the winner must hit the configured target.</p>
         </div>
-        <div style="font-size: 1.5rem; color: var(--text-secondary);">-</div>
-        <div>
-          <label style="display: block; margin-bottom: 0.5rem;">Your Score:</label>
-          <input type="number" id="testerScore" class="form-input" min="0" max="${firstTo}" value="0" style="width: 80px; padding: 0.5rem; text-align: center;">
+        <div class="finalize-modal-panel finalize-meta-list">
+          <div class="finalize-meta-row">
+            <span class="finalize-meta-label">Player</span>
+            <span class="finalize-meta-value">${escapeHtml(match.playerUsername)}</span>
+          </div>
+          <div class="finalize-meta-row">
+            <span class="finalize-meta-label">Gamemode</span>
+            <span class="finalize-meta-value">${escapeHtml(match.gamemode.toUpperCase())}</span>
+          </div>
+          <div class="finalize-meta-row">
+            <span class="finalize-meta-label">Format</span>
+            <span class="finalize-meta-value">First to ${firstTo}</span>
+          </div>
         </div>
       </div>
-    </div>
 
-    <div style="margin-top: 1rem; padding: 1rem; background: var(--tertiary-bg); border-radius: 0.5rem;">
-      <p style="margin: 0; font-size: 0.9rem; color: var(--text-secondary);">
-        <strong>Elo System:</strong> Submit the accurate match score. The system will automatically calculate rating changes based on expected vs actual outcome.
-      </p>
+      <div class="finalize-scoreboard">
+        <div class="finalize-scoreboard-header">
+          <div>
+            <h4 class="finalize-scoreboard-title">Score Entry</h4>
+            <p class="finalize-scoreboard-subtitle">Record both sides of the finished set.</p>
+          </div>
+          <div class="finalize-target-chip">${winnerRequirement}</div>
+        </div>
+
+        <div class="finalize-score-grid">
+          <div class="finalize-score-card">
+            <label for="playerScore" class="finalize-score-label">Player Score</label>
+            <span class="finalize-score-name">${escapeHtml(match.playerUsername)}</span>
+            <input type="number" id="playerScore" class="finalize-score-input" min="0" max="${firstTo}" value="0" inputmode="numeric">
+          </div>
+          <div class="finalize-score-divider">VS</div>
+          <div class="finalize-score-card">
+            <label for="testerScore" class="finalize-score-label">Your Score</label>
+            <span class="finalize-score-name">${escapeHtml(testerDisplayName)}</span>
+            <input type="number" id="testerScore" class="finalize-score-input" min="0" max="${firstTo}" value="0" inputmode="numeric">
+          </div>
+        </div>
+
+        <div class="finalize-helper-row">
+          <div class="finalize-helper-chip">No ties</div>
+          <div class="finalize-helper-chip">Winner must reach ${firstTo}</div>
+          <div class="finalize-helper-chip">Submit only once the match is complete</div>
+        </div>
+      </div>
+
+      <div id="finalizeValidationMessage" class="finalize-validation"></div>
     </div>
   `;
 
@@ -831,32 +969,30 @@ function showScoreSubmissionForm() {
     ${createModalButton('Submit Score', 'custom-modal-btn-primary', () => {
       const playerScore = parseInt(document.getElementById('playerScore').value) || 0;
       const testerScore = parseInt(document.getElementById('testerScore').value) || 0;
+      const validationEl = document.getElementById('finalizeValidationMessage');
+
+      if (validationEl) {
+        validationEl.textContent = '';
+      }
+
+      const showValidationError = (message) => {
+        if (validationEl) {
+          validationEl.textContent = message;
+        }
+      };
 
       if (playerScore + testerScore === 0) {
-        // Show validation error
-        const errorDiv = document.createElement('div');
-        errorDiv.style.color = '#ef4444';
-        errorDiv.style.marginTop = '0.5rem';
-        errorDiv.textContent = 'At least one round must be played';
-        document.querySelector('.custom-modal-body').appendChild(errorDiv);
+        showValidationError('At least one round must be played.');
         return;
       }
 
       if (playerScore === testerScore) {
-        const errorDiv = document.createElement('div');
-        errorDiv.style.color = '#ef4444';
-        errorDiv.style.marginTop = '0.5rem';
-        errorDiv.textContent = 'Ties are not allowed.';
-        document.querySelector('.custom-modal-body').appendChild(errorDiv);
+        showValidationError('Ties are not allowed.');
         return;
       }
 
       if (playerScore !== firstTo && testerScore !== firstTo) {
-        const errorDiv = document.createElement('div');
-        errorDiv.style.color = '#ef4444';
-        errorDiv.style.marginTop = '0.5rem';
-        errorDiv.textContent = `Winner must reach ${firstTo}.`;
-        document.querySelector('.custom-modal-body').appendChild(errorDiv);
+        showValidationError(`Winner must reach ${firstTo}.`);
         return;
       }
 
@@ -1198,7 +1334,10 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
 
   finalizedMatches.add(matchId);
   const { playerScore, testerScore, ratingChanges, titleChanges } = finalizationData;
-  const isDrawWithoutScoring = finalizationData?.type === 'draw_vote';
+  const isDrawWithoutScoring = ['draw_vote', 'draw_timeout'].includes(finalizationData?.type);
+  const drawSubtitle = finalizationData?.type === 'draw_timeout'
+    ? 'The 5 minute start window expired, so the match was finalized as a draw without rating changes.'
+    : 'Both participants agreed to end match without scoring.';
 
   // Note: last tested timestamp is now handled by backend during match finalization
 
@@ -1267,7 +1406,7 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
             <i class="fas ${isDrawWithoutScoring ? 'fa-handshake' : 'fa-trophy'}"></i>
           </div>
           <h2>${isDrawWithoutScoring ? 'Match Ended As Draw' : 'Match Finalized!'}</h2>
-          <p class="match-results-subtitle">${isDrawWithoutScoring ? 'Both participants agreed to end match without scoring.' : 'Your ratings have been updated based on the match results'}</p>
+          <p class="match-results-subtitle">${isDrawWithoutScoring ? drawSubtitle : 'Your ratings have been updated based on the match results'}</p>
         </div>
 
       <div class="match-results-details">
@@ -1328,18 +1467,6 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
                     ${ratingChanges?.testerRatingChange >= 0 ? '+' : ''}${ratingChanges?.testerRatingChange || 0}
                   </span>
                 </div>
-              </div>
-            </div>
-            <div class="rating-explanation">
-              <p>
-                <i class="fas fa-info-circle"></i>
-                <strong>Elo Rating System:</strong> Ratings are adjusted based on expected vs actual match outcomes using the Elo formula.
-              </p>
-              <div class="rating-note">
-                <small>
-                  <i class="fas fa-lightbulb"></i>
-                  Higher-rated players lose fewer points when they win and gain more points when they lose.
-                </small>
               </div>
             </div>
           </div>
@@ -1600,7 +1727,7 @@ async function handleAbortMatch() {
     try {
       await apiService.abortMatch(matchId);
       // Match is now finalized with scores, so results will be shown automatically
-      // via the realtime listener triggering handleMatchEnded()
+      // via the secure match polling loop.
     } catch (error) {
       Swal.fire({
         icon: 'error',
@@ -1659,7 +1786,7 @@ async function handleDrawVote() {
  * Handle match ended
  */
 function handleMatchEnded() {
-  // Show match results overlay when match ends (detected via realtime)
+  // Show match results overlay when match ends (detected via secure polling)
   // Only show if not already shown by finalizeMatch()
   if (match && match.finalizationData && !finalizedMatches.has(matchId)) {
     showMatchResults(match.finalizationData, null);
@@ -1677,23 +1804,7 @@ function escapeHtml(text) {
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {
-  const db = getDatabase();
-
-  // Disconnect all realtime listeners
-  if (chatListener) {
-    db.ref(`matches/${matchId}/chat`).off('child_added', chatListener);
-  }
-  if (matchListener) {
-    db.ref(`matches/${matchId}`).off('value', matchListener);
-  }
-  if (presenceListener) {
-    db.ref(`matches/${matchId}/presence`).off('value', presenceListener);
-  }
-  if (pageStatsListener) {
-    db.ref(`matches/${matchId}/pagestats`).off('value', pageStatsListener);
-  }
-
-  // Note: Presence will naturally update when Firebase detects disconnection
+  stopSecureMatchPolling();
 });
 
 /**

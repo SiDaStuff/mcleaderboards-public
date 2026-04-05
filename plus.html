@@ -14,7 +14,6 @@
     <!-- Firebase SDK (compat) -->
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
     <style>
@@ -235,6 +234,7 @@
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>
@@ -252,6 +252,8 @@
     <script src="js/auth-guard.js"></script>
     <script src="js/navigation.js"></script>
     <script>
+        let redeemInFlight = false;
+
         function sanitizeCodeInput(value) {
             return String(value || '').replace(/\D/g, '').slice(0, 6);
         }
@@ -260,6 +262,9 @@
             const input = document.getElementById('plusRedeemCode');
             const resultEl = document.getElementById('plusRedeemResult');
             if (!input || !resultEl) return;
+            if (redeemInFlight) return;
+
+            const redeemButton = input.closest('.plus-card')?.querySelector('.btn.btn-plus');
 
             const code = sanitizeCodeInput(input.value);
             input.value = code;
@@ -285,6 +290,12 @@
 
             resultEl.textContent = 'Redeeming code...';
             resultEl.style.color = 'var(--text-muted)';
+            redeemInFlight = true;
+            input.disabled = true;
+            if (redeemButton) {
+                redeemButton.disabled = true;
+                redeemButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Redeeming...';
+            }
 
             try {
                 const response = await apiService.redeemPlusCode(code);
@@ -294,8 +305,10 @@
 
                 Swal.fire({
                     icon: 'success',
-                    title: 'Plus Activated',
-                    text: 'Your Plus membership was activated successfully.'
+                    title: response?.alreadyRedeemed ? 'Already Active' : 'Plus Activated',
+                    text: response?.alreadyRedeemed
+                        ? 'This code was already redeemed on your account and your Plus membership is still linked.'
+                        : 'Your Plus membership was activated successfully.'
                 });
             } catch (error) {
                 resultEl.textContent = error.message || 'Unable to redeem this code.';
@@ -305,6 +318,13 @@
                     title: 'Redeem Failed',
                     text: error.message || 'Unable to redeem this code.'
                 });
+            } finally {
+                redeemInFlight = false;
+                input.disabled = false;
+                if (redeemButton) {
+                    redeemButton.disabled = false;
+                    redeemButton.innerHTML = '<i class="fas fa-key"></i> Redeem Plus Code';
+                }
             }
         }
 

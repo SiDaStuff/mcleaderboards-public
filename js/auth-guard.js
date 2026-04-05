@@ -124,6 +124,7 @@ async function requireAuth(requireAdmin = false, requireTierTester = false) {
   let profileLoaded = false;
   let retries = 0;
   const maxRetries = 3;
+  let lastProfileError = null;
   
   while (!profileLoaded && retries < maxRetries) {
     try {
@@ -133,6 +134,7 @@ async function requireAuth(requireAdmin = false, requireTierTester = false) {
         throw new Error('Profile not loaded yet');
       }
     } catch (error) {
+      lastProfileError = error;
       retries++;
       if (retries < maxRetries) {
         // Wait a bit before retrying
@@ -147,14 +149,35 @@ async function requireAuth(requireAdmin = false, requireTierTester = false) {
   if (!AppState.getProfile()) {
     if (!redirectInProgress) {
       redirectInProgress = true;
-      Swal.fire({
-        icon: 'error',
-        title: 'Session Error',
-        text: 'Could not load your account profile. Please sign in again.',
-        confirmButtonText: 'Go to Login'
-      }).then(() => {
-        window.location.href = 'login.html';
-      });
+      const isRateLimited = lastProfileError?.isRateLimit === true || lastProfileError?.status === 429;
+      if (isRateLimited) {
+        const message = lastProfileError?.message || 'Your account profile is temporarily rate limited.';
+        const suggestion = lastProfileError?.suggestion || 'Please wait a moment and try again.';
+        Swal.fire({
+          icon: 'warning',
+          title: 'Profile Load Rate Limited',
+          text: `${message} ${suggestion}`.trim(),
+          confirmButtonText: 'Retry',
+          showCancelButton: true,
+          cancelButtonText: 'Go to Login'
+        }).then((result) => {
+          redirectInProgress = false;
+          if (result.isConfirmed) {
+            window.location.reload();
+            return;
+          }
+          window.location.href = 'login.html';
+        });
+      } else {
+        Swal.fire({
+          icon: 'error',
+          title: 'Session Error',
+          text: 'Could not load your account profile. Please sign in again.',
+          confirmButtonText: 'Go to Login'
+        }).then(() => {
+          window.location.href = 'login.html';
+        });
+      }
     }
     return false;
   }

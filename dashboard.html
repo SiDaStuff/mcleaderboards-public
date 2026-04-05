@@ -13,7 +13,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11" defer></script>
 
     <style>
@@ -253,6 +252,67 @@
             flex-shrink: 0;
         }
 
+        .tester-card-minimal .card-header {
+            background: var(--secondary-bg);
+            color: var(--text-color);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .tester-card-minimal .card-title {
+            color: var(--text-color);
+        }
+
+        .tester-intro {
+            color: var(--text-muted);
+            margin-bottom: 0.8rem;
+            font-size: 0.95rem;
+        }
+
+        .tester-note {
+            background: var(--tertiary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 0.8rem;
+            margin-bottom: 1rem;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        .tester-note strong {
+            color: var(--text-color);
+        }
+
+        .tester-selection-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 1rem;
+        }
+
+        .tester-region-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 0.5rem;
+        }
+
+        .tester-region-choice {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            padding: 0.55rem 0.6rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: var(--primary-bg);
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .tester-controls {
+            border-top: 1px solid var(--border-color);
+            margin-top: 1rem;
+            padding-top: 1rem;
+        }
+
         .btn {
             padding: 0.75rem 1.5rem;
             border: none;
@@ -437,6 +497,10 @@
                 padding: 0.65rem 1.25rem;
                 font-size: 0.95rem;
             }
+
+            .tester-selection-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
@@ -520,42 +584,34 @@
         <!-- Queue Stats -->
         <div class="section-grid">
             <!-- Join Queue Card -->
-            <div class="card">
+            <div class="card" id="sharedQueueCard">
                 <div class="card-header" style="background: linear-gradient(135deg, var(--accent-color), var(--primary-color)); color: white; border: none;">
                     <h2 class="card-title" style="color: white;">
-                        <i class="fas fa-play-circle"></i> Join Competitive Queue
+                        <i class="fas fa-play-circle"></i> <span id="queueCardTitle">Join Shared Queue</span>
                     </h2>
                 </div>
                 <div class="card-body">
-                    <p style="color: var(--text-muted); margin-bottom: 1rem;">Get matched with a tier tester and prove your skills</p>
+                    <p id="queueCardSubtitle" style="color: var(--text-muted); margin-bottom: 1rem;">One shared queue for players and tier testers.</p>
                     <div class="alert alert-info" style="margin-bottom: 1rem;">
                         <i class="fas fa-route"></i>
-                        <div>
-                            <strong>Queue flow:</strong> Choose gamemode and region, pick a whitelisted server, then join queue.
+                        <div id="queueFlowMessage">
+                            <strong>Queue flow:</strong> Select one or more gamemodes and regions, choose a whitelisted server, then join queue.
                         </div>
                     </div>
                     
                     <form id="queueForm" onsubmit="handleJoinQueue(event)">
-                        <div class="row">
+                        <div class="tester-selection-grid">
                             <div class="form-group">
-                                <label class="form-label" for="gamemode">
-                                    <i class="fas fa-gamepad" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Gamemode
+                                <label class="form-label">
+                                    <i class="fas fa-gamepad" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Gamemodes
                                 </label>
-                                <input type="hidden" id="gamemode" required>
-                                <div id="queueGamemodeSelections" class="gamemode-choice-grid"></div>
+                                <div id="playerGamemodeSelections" class="gamemode-choice-grid"></div>
                             </div>
                             <div class="form-group">
-                                <label class="form-label" for="region">
-                                    <i class="fas fa-globe-americas" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Region
+                                <label class="form-label">
+                                    <i class="fas fa-globe-americas" style="color: var(--accent-color); margin-right: 0.5rem;"></i> Regions
                                 </label>
-                                <select class="form-select" id="region" required>
-                                    <option value="">Select your region...</option>
-                                    <option value="NA">North America</option>
-                                    <option value="EU">Europe</option>
-                                    <option value="AS">Asia</option>
-                                    <option value="SA">South America</option>
-                                    <option value="AU">Australia</option>
-                                </select>
+                                <div id="playerRegionSelections" class="tester-region-grid"></div>
                             </div>
                         </div>
                         
@@ -583,7 +639,7 @@
                         </div>
                         
                         <button type="submit" class="btn btn-primary" style="width: 100%; padding: 1rem; font-size: 1.1rem;" id="joinQueueBtn">
-                            <i class="fas fa-play-circle"></i> Join Queue Now
+                            <i class="fas fa-play-circle"></i> Join Shared Queue
                         </button>
                         <div style="text-align: center; margin-top: 0.75rem; font-size: 0.9rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.25rem; align-items: center;">
                             <div style="display: flex; align-items: center; gap: 0.5rem;">
@@ -593,12 +649,28 @@
                         </div>
                     </form>
 
+                    <div id="testerQueueOptions" style="display: none; margin-top: 1rem;">
+                        <div class="tester-note">
+                            <strong>Tier tester flow:</strong> you now use this same shared queue. Your account is queued with tester preference automatically.
+                        </div>
+                        <div class="form-group" style="margin-top: 1rem; margin-bottom: 0.5rem;">
+                            <label class="form-label" style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
+                                <span>Stay online after match</span>
+                                <span class="toggle-switch">
+                                    <input type="checkbox" id="stayInQueueAfterMatch">
+                                    <span class="toggle-slider"></span>
+                                </span>
+                            </label>
+                            <div class="form-help">Rejoin the shared queue automatically after each completed match.</div>
+                        </div>
+                    </div>
+
                     <!-- Queue Cooldowns -->
                     <div style="margin-top: 1rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
                         <button type="button" class="btn btn-secondary btn-sm" id="loadQueueCooldownsBtn" onclick="loadQueueCooldownsOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
-                            <i class="fas fa-clock"></i> Load Queue Cooldowns
+                            <i class="fas fa-rotate"></i> Refresh Cooldowns
                         </button>
-                        <span class="text-muted" style="font-size: 0.85rem;">Optional, loads on demand</span>
+                        <span class="text-muted" style="font-size: 0.85rem;">Loaded automatically on dashboard open</span>
                     </div>
                     <div id="queueCooldowns" style="margin-top: 1rem;"></div>
 
@@ -606,17 +678,17 @@
                     <div id="queueStatus" style="display: none; margin-top: 1rem;">
                         <div class="alert alert-info">
                             <div style="flex: 1;">
-                                <div style="font-weight: 600; margin-bottom: 0.5rem;" id="queueStatusText">Waiting for Tier Tester</div>
+                                <div style="font-weight: 600; margin-bottom: 0.5rem;" id="queueStatusText">Waiting for a compatible match</div>
                                 <div class="text-muted" id="queueWaitingTime">Just joined queue</div>
                             </div>
                         </div>
                         <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; margin-bottom: 1rem;">
                             <div class="status-card" style="padding: 0.75rem;">
-                                <div class="text-muted">Gamemode</div>
+                                <div class="text-muted">Gamemodes</div>
                                 <div class="h5 mb-0" id="queueGamemode">-</div>
                             </div>
                             <div class="status-card" style="padding: 0.75rem;">
-                                <div class="text-muted">Region</div>
+                                <div class="text-muted">Regions</div>
                                 <div class="h5 mb-0" id="queueRegion">-</div>
                             </div>
                             <div class="status-card" style="padding: 0.75rem;">
@@ -624,7 +696,7 @@
                                 <div class="h5 mb-0" id="queuePlayersCount">-</div>
                             </div>
                             <div class="status-card" style="padding: 0.75rem;">
-                                <div class="text-muted">Available Testers</div>
+                                <div class="text-muted">Tier Testers in Queue</div>
                                 <div class="h5 mb-0" id="queueAvailableTesters">-</div>
                             </div>
                             <div class="status-card" style="padding: 0.75rem;">
@@ -643,98 +715,10 @@
                 </div>
             </div>
 
-            <!-- Tier Tester Interface -->
-            <div class="card" id="testerCard" style="display: none;">
-                <div class="card-header" style="background: linear-gradient(135deg, var(--success-color), #27ae60); color: white; border: none;">
+            <!-- Staff Actions -->
+            <div class="card" id="staffActionsCard" style="display: none;">
+                <div class="card-header" style="background: linear-gradient(135deg, #0f172a, #1e293b); color: white; border: none;">
                     <h2 class="card-title" style="color: white;">
-                        <i class="fas fa-user-shield"></i> Tier Tester Dashboard
-                    </h2>
-                </div>
-                <div class="card-body">
-                    <p style="color: var(--text-muted); margin-bottom: 1rem;">Set your availability and start testing players</p>
-
-                    <div class="info-banner">
-                        <div class="info-banner-icon">
-                            <i class="fas fa-lightbulb"></i>
-                        </div>
-                        <div class="info-banner-text">
-                            <strong>Tip:</strong> Select one or more gamemodes and regions, then click "Set Available" to start matching with players. You'll be notified when a match is found!
-                        </div>
-                    </div>
-
-                    <!-- Current Status -->
-                    <div id="currentAvailabilityStatus" style="display: none; margin-bottom: 1rem;">
-                        <div class="alert alert-success">
-                            <i class="fas fa-check-circle"></i>
-                            <span id="availabilityStatusText">Currently Available</span>
-                        </div>
-                    </div>
-
-                    <!-- Selection -->
-                    <div class="row">
-                        <div>
-                            <div class="form-group">
-                                <label class="form-label">Gamemodes</label>
-                                <div id="testerGamemodeSelections" class="gamemode-choice-grid"></div>
-                            </div>
-                        </div>
-                        <div>
-                            <div class="form-group">
-                                <label class="form-label">Regions</label>
-                                <div id="testerRegionSelections" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.5rem;">
-                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="NA"> NA</label>
-                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="EU"> EU</label>
-                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="AS"> AS</label>
-                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="SA"> SA</label>
-                                    <label style="display: flex; align-items: center; gap: 0.5rem;"><input type="checkbox" class="tester-region-checkbox" value="AU"> AU</label>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Stay in Queue Toggle -->
-                    <div class="form-group" style="margin-top: 1rem;">
-                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                            <span>Stay in queue after match</span>
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="stayInQueueAfterMatch">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </label>
-                        <div class="form-help">When enabled, you'll remain available for testing after each match ends</div>
-                    </div>
-
-                    <!-- Action Button -->
-                    <div id="testerStatus" style="margin-top: 1.5rem;">
-                        <button class="btn btn-success" style="width: 100%; padding: 1rem;" onclick="handleSetAvailable()" id="setAvailableBtn">
-                            <i class="fas fa-check"></i> Set Available
-                        </button>
-                    </div>
-                    <div style="margin-top: 1rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
-                        <button type="button" class="btn btn-secondary btn-sm" id="loadTesterReputationBtn" onclick="loadTesterReputationOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
-                            <i class="fas fa-star"></i> Load Reputation
-                        </button>
-                        <span class="text-muted" style="font-size: 0.85rem;">Optional, loads on demand</span>
-                    </div>
-                    <div id="testerReputationCard" class="alert alert-info" style="margin-top: 1rem; display: none;">
-                        <div style="width: 100%;">
-                            <div style="font-weight: 700; margin-bottom: 0.5rem;">
-                                <i class="fas fa-star"></i> Tester Reputation
-                            </div>
-                            <div class="row">
-                                <div class="col-6">
-                                    <div class="text-muted">On-time Rate</div>
-                                    <div id="testerOnTimeRate" class="h5 mb-0">-</div>
-                                </div>
-                                <div class="col-6">
-                                    <div class="text-muted">No-show Rate</div>
-                                    <div id="testerNoShowRate" class="h5 mb-0">-</div>
-                                </div>
-                                <div class="col-6">
-                                    <div class="text-muted">Avg Completion</div>
-                                    <div id="testerAvgCompletion" class="h5 mb-0">-</div>
-                                </div>
-                                <div class="col-6">
                                     <div class="text-muted">Evaluated Matches</div>
                                     <div id="testerMatchCount" class="h5 mb-0">-</div>
                                 </div>
@@ -766,57 +750,6 @@
                 <div class="card-body">
                     <div id="gamemodeStatsList">
                         <div class="spinner"></div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Notification Settings -->
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">
-                        <i class="fas fa-bell"></i> Notification Settings
-                    </h2>
-                    <button type="button" class="btn btn-secondary btn-sm" id="loadNotificationSettingsBtn" onclick="loadNotificationSettingsOnDemand()" style="padding: 0.45rem 0.8rem; font-size: 0.85rem;">
-                        <i class="fas fa-download"></i> Load
-                    </button>
-                </div>
-                <div class="card-body">
-                    <p class="text-muted mb-3">Configure when you want to receive notifications about matches and tester availability.</p>
-                    
-                    <div class="form-group">
-                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                            Notify when put in a match
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="notifyMatchCreated">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                            Notify when match is finalized
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="notifyMatchFinalized">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label" style="display: flex; align-items: center; justify-content: space-between;">
-                            Notify when a tester is available (selected gamemodes)
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="notifyTesterAvailable">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </label>
-                    </div>
-                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                        <button class="btn btn-primary btn-sm" id="configureTesterNotificationsBtn" onclick="openTesterAvailabilitySettings()" style="padding: 0.5rem 1rem; font-size: 0.9rem;" disabled>
-                            <i class="fas fa-cog"></i> Configure Tester Notifications
-                        </button>
-                        <button class="btn btn-secondary btn-sm" id="saveNotificationSettingsBtn" onclick="saveNotificationSettings()" style="padding: 0.5rem 1rem; font-size: 0.9rem;" disabled>
-                            <i class="fas fa-save"></i> Save Settings
-                        </button>
                     </div>
                 </div>
             </div>
@@ -867,6 +800,7 @@
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>
@@ -955,7 +889,7 @@
                         Tenure: <strong style="color: white;">${calculateTesterTenure(profile.testerApprovedAt)}</strong>
                     </div>
                     <button type="button" onclick="scrollToTesterDashboard()" class="btn btn-primary" style="width: 100%; padding: 0.5rem; font-size: 0.85rem;">
-                        <i class="fas fa-user-shield"></i> Tester Dashboard
+                        <i class="fas fa-play-circle"></i> Open Shared Queue
                     </button>
                 `;
             } else if (profile.pendingTesterApplication === true) {

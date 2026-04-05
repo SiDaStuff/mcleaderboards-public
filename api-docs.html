@@ -13,7 +13,6 @@
 
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 </head>
 <body>
@@ -244,6 +243,23 @@ GET /api/players?gamemode=pot</code></pre>
 
                 <hr>
 
+                <div class="endpoint">
+                    <h4>Unified Queue Matching</h4>
+                    <p>The platform now uses one shared queue for both regular players and Tier Testers.</p>
+                    <div class="endpoint-details">
+                        <strong>Rules:</strong>
+                        <ul>
+                            <li>Two queued users must share at least one gamemode and one region.</li>
+                            <li>At least one of the two queued users must be tester-eligible.</li>
+                            <li>The matcher prefers the closest Elo ratings among all compatible pairs.</li>
+                            <li>If both queued users are Tier Testers, the backend randomly assigns one as <code>tester</code> and the other as <code>player</code>.</li>
+                            <li>Match responses include a <code>roleAssignment</code> object so clients can explain why each role was assigned.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <hr>
+
                 <!-- Get Queue Status -->
                 <div class="endpoint">
                     <h4>GET /queue/status</h4>
@@ -255,10 +271,17 @@ GET /api/players?gamemode=pot</code></pre>
                         <pre><code>{
   "inQueue": true,
   "queueEntry": {
+        "queueId": "queue123",
     "gamemode": "vanilla",
     "region": "NA",
+        "gamemodes": ["vanilla", "uhc"],
+        "regions": ["NA", "EU"],
     "serverIP": "play.example.com",
-    "status": "waiting"
+        "status": "waiting",
+        "queueRolePreference": "player",
+        "testerEligible": false,
+        "queueSource": "player_queue",
+        "joinedAt": "2024-01-01T00:00:00.000Z"
   }
 }</code></pre>
                     </div>
@@ -313,9 +336,15 @@ GET /api/players?gamemode=pot</code></pre>
   "status": "active",
   "matchType": "regular",
   "playerCurrentRating": 1500,
-  "testerCurrentRating": 1800,
   "createdAt": "2024-01-01T00:00:00.000Z",
   "finalized": false,
+    "roleAssignment": {
+        "type": "single_tier_tester",
+        "explanation": "Tester1 was chosen as the tier tester because only they have the Tier Tester role.",
+        "playerReason": "Player1 stayed in the player slot because the other queued participant is the only Tier Tester.",
+        "testerReason": "Tester1 was assigned as the tier tester because they are the only Tier Tester in this pairing.",
+        "randomized": false
+    },
   "pagestats": {
     "playerJoined": true,
     "testerJoined": true
@@ -342,13 +371,81 @@ GET /api/players?gamemode=pot</code></pre>
                         <pre><code>{
   "gamemode": "vanilla",
   "region": "NA",
+    "gamemodes": ["vanilla", "uhc"],
+    "regions": ["NA", "EU"],
   "serverIP": "play.example.com"
 }</code></pre>
                         <strong>Response:</strong>
                         <pre><code>{
   "success": true,
   "queueId": "queue123",
-  "queueEntry": { ... }
+    "matched": false,
+    "message": "Added to queue. Waiting for a compatible match..."
+}</code></pre>
+                                                <strong>Notes:</strong>
+                                                <ul>
+                                                        <li>This endpoint creates a regular player queue entry in the shared queue.</li>
+                                                        <li>The backend automatically marks the entry as tester-eligible if the authenticated user has tester/admin queue privileges.</li>
+                                                        <li>If an immediate compatible match is found, the response includes <code>matched: true</code> and a <code>matchId</code>.</li>
+                                                </ul>
+                                        </div>
+                                </div>
+
+                                <hr>
+
+                                <div class="endpoint">
+                                        <h4>POST /tester/availability</h4>
+                                        <p>Join or leave the same shared queue as a Tier Tester</p>
+                                        <div class="endpoint-details">
+                                                <strong>Auth Required:</strong> Yes (tester access)
+                                                <br>
+                                                <strong>Body:</strong>
+                                                <pre><code>{
+    "available": true,
+    "gamemode": "vanilla",
+    "region": "NA",
+    "gamemodes": ["vanilla", "uhc"],
+    "regions": ["NA", "EU"],
+    "serverIP": "play.example.com"
+}</code></pre>
+                                                <strong>Response:</strong>
+                                                <pre><code>{
+    "success": true,
+    "message": "Joined the queue as a tier tester"
+}</code></pre>
+                                                <strong>Notes:</strong>
+                                                <ul>
+                                                        <li>This endpoint no longer writes to a separate tester pool. It creates or removes a queue entry in the shared <code>queue</code> collection.</li>
+                                                        <li>When <code>available</code> is <code>false</code>, the user is removed from the queue and the response message is <code>Removed from queue</code>.</li>
+                                                        <li>Tester queue entries expire automatically if their queue timeout is reached.</li>
+                                                </ul>
+                                        </div>
+                                </div>
+
+                                <hr>
+
+                                <div class="endpoint">
+                                        <h4>GET /tester/availability</h4>
+                                        <p>Get the current tester's shared-queue status</p>
+                                        <div class="endpoint-details">
+                                                <strong>Auth Required:</strong> Yes (tester access)
+                                                <br>
+                                                <strong>Response:</strong>
+                                                <pre><code>{
+    "available": true,
+    "availability": {
+        "queueId": "queue789",
+        "gamemode": "vanilla",
+        "region": "NA",
+        "gamemodes": ["vanilla", "uhc"],
+        "regions": ["NA", "EU"],
+        "serverIP": "play.example.com",
+        "queueRolePreference": "tester",
+        "testerEligible": true,
+        "queueSource": "tester_dashboard",
+        "joinedAt": "2024-01-01T00:00:00.000Z",
+        "timeoutAt": "2024-01-01T03:00:00.000Z"
+    }
 }</code></pre>
                     </div>
                 </div>
@@ -491,6 +588,7 @@ GET /api/players?gamemode=pot</code></pre>
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>

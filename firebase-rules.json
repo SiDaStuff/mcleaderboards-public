@@ -1,32 +1,34 @@
 {
   "rules": {
+    ".read": false,
+    ".write": false,
     "tempUnblocks": {
-      ".read": "auth != null",
+      ".read": false,
       ".write": false
     },
     "users": {
       ".indexOn": ["email"],
       "$userId": {
-        ".read": "$userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null",
+        ".read": false,
         ".write": false,
         "warnings": {
-          ".read": "$userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null",
+          ".read": false,
           ".write": "root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null"
         }
       }
     },
     "players": {
-      ".read": true,
+      ".read": false,
       ".write": false,
       ".indexOn": ["username", "userId"]
     },
     "securityLogs": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".read": false,
       ".write": false,
       ".indexOn": ["userId", "timestamp"]
     },
     "altReports": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".read": false,
       ".write": false,
       ".indexOn": ["groupId", "createdAt"]
     },
@@ -35,7 +37,7 @@
       ".write": false,
       ".indexOn": ["gamemode", "userId", "region", "joinedAt"],
       "$queueId": {
-        ".read": "auth != null && (data.child('userId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".read": false,
         ".write": false
       }
     },
@@ -44,26 +46,26 @@
       ".write": false,
       ".indexOn": ["status", "playerId", "testerId", "createdAt"],
       "$matchId": {
-        ".read": "auth != null && (data.child('playerId').val() === auth.uid || data.child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".read": false,
         "chat": {
-          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          ".read": false,
           "$messageId": {
             ".write": false,
-            ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)"
+            ".read": false
           }
         },
         "presence": {
-          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          ".read": false,
           "$userId": {
             ".write": false
           }
         },
         "pagestats": {
-          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          ".read": false,
           ".write": false
         },
         "participants": {
-          ".read": "auth != null && (root.child('matches').child($matchId).child('playerId').val() === auth.uid || root.child('matches').child($matchId).child('testerId').val() === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+          ".read": false,
           "$userId": {
             ".write": false
           }
@@ -73,26 +75,26 @@
     "testerAvailability": {
       ".read": false,
       "$userId": {
-        ".read": "auth != null && (auth.uid === $userId || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".read": false,
         ".write": false
       }
     },
     "adminAuditLog": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".read": false,
       ".write": false,
       ".indexOn": ["timestamp", "adminUid", "action", "adminId"]
     },
     "adminNotes": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".read": false,
       ".write": false,
       ".indexOn": ["timestamp"]
     },
     "blacklist": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null || root.child('users').child(auth.uid).child('tester').val() === true)",
+      ".read": false,
       ".write": false
     },
     "playerReports": {
-      ".read": "auth != null && (root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+      ".read": false,
       ".write": false,
       ".indexOn": ["reporterId", "createdAt", "status"]
     },
@@ -100,7 +102,7 @@
       ".read": false,
       ".write": false,
       "$userId": {
-        ".read": "auth != null && ($userId === auth.uid || root.child('users').child(auth.uid).child('admin').val() === true || root.child('users').child(auth.uid).child('adminRole').val() != null)",
+        ".read": false,
         ".write": false,
         ".indexOn": ["createdAt"]
       }
@@ -110,9 +112,13 @@
       ".write": false
     },
     "news": {
-      ".read": true,
+      ".read": false,
       ".write": false,
       ".indexOn": ["createdAt"]
+    },
+    "securityScores": {
+      ".read": false,
+      ".write": false
     }
   }
 }

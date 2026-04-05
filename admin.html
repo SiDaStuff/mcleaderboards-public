@@ -12,7 +12,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11" defer></script>
 </head>
 <body>
@@ -51,12 +50,16 @@
         <div class="page-header">
             <h1 class="page-title">Admin Panel</h1>
             <p class="page-subtitle">Manage applications, blacklist, and users</p>
+            <div class="admin-page-summary">
+                <div class="admin-page-summary-text" id="adminContextSummary">Loading admin context...</div>
+                <div class="admin-capability-chip-row" id="adminCapabilityChips"></div>
+            </div>
         </div>
 
         <!-- Tabs -->
         <div class="card mb-4">
             <div class="card-body">
-                <div class="row" id="adminTabs">
+                <div class="row admin-tab-grid" id="adminTabs">
                     <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('management')" id="tab-management">
                         Users & Players
                     </button>
@@ -87,9 +90,96 @@
                     <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('matches')" id="tab-matches">
                         Matches
                     </button>
+                    <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('operations')" id="tab-operations">
+                        Operations
+                    </button>
                     <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('security-scores')" id="tab-security-scores">
                         <i class="fas fa-shield-alt"></i> Security Scores
                     </button>
+                    <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('staff-roles')" id="tab-staff-roles">
+                        <i class="fas fa-id-badge"></i> Staff Roles
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Staff Roles Tab -->
+        <div id="staff-rolesTab" class="tab-content d-none">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h2 class="card-title">
+                        <i class="fas fa-id-badge"></i> Staff Role System
+                    </h2>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">Create staff roles with shield, star, crown-style icons and choose which admin shortcuts appear in the dashboard staff panel.</p>
+                    <form id="staffRoleForm" onsubmit="handleSaveStaffRole(event)">
+                        <input type="hidden" id="staffRoleId" value="">
+                        <div class="row">
+                            <div class="col-12 col-md-3">
+                                <label class="form-label" for="staffRoleName">Role Name</label>
+                                <input type="text" class="form-input" id="staffRoleName" maxlength="32" required placeholder="Moderator Ops">
+                            </div>
+                            <div class="col-12 col-md-2">
+                                <label class="form-label" for="staffRoleColor">Role Color</label>
+                                <input type="color" class="form-input" id="staffRoleColor" value="#38bdf8">
+                            </div>
+                            <div class="col-12 col-md-3">
+                                <label class="form-label" for="staffRoleIconPreset">Role Icon</label>
+                                <select class="form-select" id="staffRoleIconPreset">
+                                    <option value="shield">Shield</option>
+                                </select>
+                            </div>
+                            <div class="col-12 col-md-4">
+                                <label class="form-label" for="staffRoleIconUrl">Custom Icon URL (optional override)</label>
+                                <input type="text" class="form-input" id="staffRoleIconUrl" placeholder="https://example.com/staff-icon.svg">
+                            </div>
+                        </div>
+                        <div class="form-group mt-3">
+                            <label class="form-label">Staff Panel Actions</label>
+                            <div class="row" id="staffRoleActionsGrid">
+                                <div class="col-12 text-muted">Loading available staff actions...</div>
+                            </div>
+                        </div>
+                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top: 1rem;">
+                            <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Save Role</button>
+                            <button type="button" class="btn btn-secondary" onclick="resetStaffRoleForm()"><i class="fas fa-undo"></i> Reset</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fas fa-users-cog"></i> Assign Staff Role to User</h3>
+                </div>
+                <div class="card-body">
+                    <form id="assignStaffRoleForm" onsubmit="handleAssignStaffRole(event)">
+                        <div class="row">
+                            <div class="col-12 col-md-5">
+                                <label class="form-label" for="assignStaffUserId">User UID</label>
+                                <input type="text" class="form-input" id="assignStaffUserId" required placeholder="Firebase UID">
+                            </div>
+                            <div class="col-12 col-md-5">
+                                <label class="form-label" for="assignStaffRoleId">Role</label>
+                                <select class="form-select" id="assignStaffRoleId">
+                                    <option value="">Remove staff role</option>
+                                </select>
+                            </div>
+                            <div class="col-12 col-md-2" style="display:flex; align-items:flex-end;">
+                                <button type="submit" class="btn btn-success" style="width:100%;"><i class="fas fa-user-check"></i> Apply</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fas fa-list"></i> Existing Staff Roles</h3>
+                </div>
+                <div class="card-body" id="staffRolesList">
+                    <div class="spinner"></div>
                 </div>
             </div>
         </div>
@@ -190,7 +280,7 @@
                                 </div>
                                 <div class="col-12 col-md-6">
                                     <div class="form-group">
-                                        <label class="form-label" for="blacklistUserId">Firebase UID (Optional)</label>
+                                        <label class="form-label" for="blacklistUserId">Firebase UID or Minecraft UUID (Optional)</label>
                                         <input type="text"
                                                class="form-input"
                                                id="blacklistUserId"
@@ -215,9 +305,13 @@
                                     <div class="row">
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableChat"> Chat</label></div>
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableQueue"> Queue</label></div>
+                                        <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableQueueJoin"> Queue Join</label></div>
+                                        <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableQueueLeave"> Queue Leave</label></div>
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableReports"> Reports</label></div>
+                                        <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableReportSubmit"> Report Submit</label></div>
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableAccountChanges"> Account Changes</label></div>
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableApplications"> Applications</label></div>
+                                        <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableApplicationsSubmit"> Application Submit</label></div>
                                         <div class="col-6 col-md-4"><label><input type="checkbox" id="blDisableSupportMessages"> Support Messages</label></div>
                                     </div>
                                 </div>
@@ -232,7 +326,7 @@
                                 <div class="row g-2 align-items-end">
                                     <div class="col-12 col-md-5">
                                         <label class="form-label" for="blacklistSearchInput">Filter</label>
-                                        <input type="text" class="form-input" id="blacklistSearchInput" placeholder="username / uid / reason">
+                                        <input type="text" class="form-input" id="blacklistSearchInput" placeholder="username / account / uid / uuid / reason">
                                     </div>
                                     <div class="col-6 col-md-3">
                                         <label class="form-label" for="blacklistIncludeExpired">Include expired</label>
@@ -295,13 +389,13 @@
                 <div class="card-body">
                     <form id="unifiedSearchForm" onsubmit="handleUnifiedSearch(event)" class="mb-4">
                         <div class="form-group">
-                            <label class="form-label" for="unifiedSearch">Search by Email, Minecraft Username, or Firebase UID</label>
+                            <label class="form-label" for="unifiedSearch">Search by Minecraft Username or Account</label>
                             <div class="row">
                                 <div class="col-10">
                                     <input type="text"
                                            class="form-input"
                                            id="unifiedSearch"
-                                           placeholder="Enter email, username, or UID..."
+                                           placeholder="Enter username, email, or UID..."
                                            required>
                                 </div>
                                 <div class="col-2">
@@ -454,6 +548,7 @@
                         </button>
                     </div>
                     <div class="management-section-body">
+                        <div id="managementIdentitySummary" class="minimal-note" style="margin-bottom: 1rem; display: none;"></div>
                         <div class="management-action-selector">
                             <h3>Select Action</h3>
                             <div class="action-grid" id="managementActionGrid">
@@ -687,8 +782,8 @@
                         <form id="noshowFilters" class="mb-4">
                             <div class="row">
                                 <div class="col-md-6">
-                                    <label class="form-label">Player Username/UID</label>
-                                    <input type="text" class="form-input" id="noshowPlayerFilter" placeholder="Search...">
+                                    <label class="form-label">Player Username or Account</label>
+                                    <input type="text" class="form-input" id="noshowPlayerFilter" placeholder="Search by username or account...">
                                 </div>
                                 <div class="col-md-3">
                                     <label class="form-label">Status</label>
@@ -1163,6 +1258,85 @@
             </div>
         </div>
 
+        <div id="operationsTab" class="tab-content d-none">
+            <div class="admin-ops-grid">
+                <div class="card main-card">
+                    <div class="card-body">
+                        <h2><i class="fas fa-stream"></i> Match Timeline</h2>
+                        <p class="text-muted">Review queue join timing, assignment reason, page joins, start, finalize, revert, disputes, and admin interventions for a match.</p>
+                        <div class="row mb-3" style="gap: 0.5rem;">
+                            <div class="col-12 col-md-8">
+                                <input type="text" class="form-control" id="timelineMatchIdInput" placeholder="Enter match ID">
+                            </div>
+                            <div class="col-12 col-md-4">
+                                <button class="btn btn-primary" onclick="loadMatchTimeline()" style="width:100%;">
+                                    <i class="fas fa-search"></i> Load Timeline
+                                </button>
+                            </div>
+                        </div>
+                        <div id="matchTimelineResults" class="admin-tool-result">
+                            <div class="empty-state"><p class="text-muted">Enter a match ID to inspect its timeline.</p></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card main-card">
+                    <div class="card-body">
+                        <h2><i class="fas fa-project-diagram"></i> Queue Inspector</h2>
+                        <p class="text-muted">Preview why two queued users can or cannot match, including cooldown, role eligibility, retired gamemodes, and region overlap.</p>
+                        <div class="row mb-3" style="gap: 0.5rem;">
+                            <div class="col-12 col-md-5">
+                                <input type="text" class="form-control" id="queueInspectorLeftUserId" placeholder="First user UID">
+                            </div>
+                            <div class="col-12 col-md-5">
+                                <input type="text" class="form-control" id="queueInspectorRightUserId" placeholder="Second user UID">
+                            </div>
+                            <div class="col-12 col-md-2">
+                                <button class="btn btn-primary" onclick="runQueueInspector()" style="width:100%;">
+                                    <i class="fas fa-bolt"></i> Inspect
+                                </button>
+                            </div>
+                        </div>
+                        <div id="queueInspectorResults" class="admin-tool-result">
+                            <div class="empty-state"><p class="text-muted">Enter two queued user IDs to inspect compatibility.</p></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card main-card">
+                    <div class="card-body">
+                        <h2><i class="fas fa-balance-scale"></i> Match Disputes</h2>
+                        <p class="text-muted">Track participant disputes, review evidence links, and record resolution history tied to the match.</p>
+                        <div class="row mb-3" style="gap: 0.5rem;">
+                            <div class="col-12 col-md-3">
+                                <select id="disputeStatusFilter" class="form-control" onchange="loadAdminDisputes()">
+                                    <option value="">All Statuses</option>
+                                    <option value="open">Open</option>
+                                    <option value="in_review">In Review</option>
+                                    <option value="resolved">Resolved</option>
+                                    <option value="rejected">Rejected</option>
+                                </select>
+                            </div>
+                            <div class="col-12 col-md-4">
+                                <input type="text" class="form-control" id="disputeMatchFilter" placeholder="Filter by match ID">
+                            </div>
+                            <div class="col-12 col-md-3">
+                                <input type="text" class="form-control" id="disputeUserFilter" placeholder="Filter by user UID">
+                            </div>
+                            <div class="col-12 col-md-2">
+                                <button class="btn btn-primary" onclick="loadAdminDisputes()" style="width:100%;">
+                                    <i class="fas fa-search"></i> Load
+                                </button>
+                            </div>
+                        </div>
+                        <div id="adminDisputesList" class="admin-tool-result">
+                            <div class="empty-state"><p class="text-muted">Disputes will appear here.</p></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- Footer -->
@@ -1177,6 +1351,7 @@
                 <a href="/privacy-policy.html">Privacy Policy</a>
                 <a href="/terms-of-service.html">Terms of Service</a>
                 <a href="support.html">Support</a>
+                <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
                 <a href="api-docs.html">API Docs</a>
             </div>

@@ -6,7 +6,6 @@
 
 let firebaseApp = null;
 let firebaseAuth = null;
-let firebaseDatabase = null;
 let firebaseInitialized = false;
 let firebaseInitPromise = null;
 let firebaseUnavailable = false;
@@ -65,18 +64,18 @@ function getFirebaseNamespace() {
 }
 
 function looksLikeFirebaseAppOnly(fb) {
-  // "app-only" firebase namespace: has initializeApp/apps but lacks auth/database services.
+  // "app-only" firebase namespace: has initializeApp/apps but lacks auth service.
   return !!(
     fb &&
     typeof fb.initializeApp === 'function' &&
     Array.isArray(fb.apps) &&
-    (typeof fb.auth !== 'function' || typeof fb.database !== 'function')
+    typeof fb.auth !== 'function'
   );
 }
 
 /**
  * If something (like a browser extension/userscript) loads Firebase app-only and overwrites the global,
- * we can re-load the missing compat service bundles and then lock `window.firebase` to the working instance.
+ * re-load the auth compat bundle and then lock `window.firebase` to the working instance.
  */
 async function ensureFirebaseCompatServices() {
   // Wait a moment for firebase global to appear (if scripts are still loading).
@@ -89,13 +88,12 @@ async function ensureFirebaseCompatServices() {
 
   if (typeof firebase === 'undefined') return false;
 
-  // If firebase is present but missing auth/database, load compat service bundles.
+  // If firebase is present but missing auth, load compat service bundles.
   if (looksLikeFirebaseAppOnly(firebase)) {
     try {
       // Ensure app compat is present (harmless if already loaded).
       await loadScriptOnce(`${FIREBASE_CDN_BASE}/firebase-app-compat.js`);
       await loadScriptOnce(`${FIREBASE_CDN_BASE}/firebase-auth-compat.js`);
-      await loadScriptOnce(`${FIREBASE_CDN_BASE}/firebase-database-compat.js`);
     } catch (e) {
       console.error('Failed to load Firebase compat service scripts:', e);
       return false;
@@ -106,8 +104,8 @@ async function ensureFirebaseCompatServices() {
   const fb = getFirebaseNamespace();
   if (!fb || typeof fb.initializeApp !== 'function') return false;
 
-  // If auth/database still aren't available, fail (this indicates a blocked script or severe conflict).
-  if (typeof fb.auth !== 'function' || typeof fb.database !== 'function') {
+  // If auth still isn't available, fail (this indicates a blocked script or severe conflict).
+  if (typeof fb.auth !== 'function') {
     return false;
   }
 
@@ -156,9 +154,8 @@ function initializeFirebase() {
       firebaseApp = fb.initializeApp(CONFIG.FIREBASE_CONFIG, MCLB_FIREBASE_APP_NAME);
     }
 
-    // Initialize Firebase Auth / Database using our app
+    // Initialize Firebase Auth using our app.
     firebaseAuth = fb.auth(firebaseApp);
-    firebaseDatabase = fb.database(firebaseApp);
 
     firebaseInitialized = true;
     if (typeof window !== 'undefined') {
@@ -215,16 +212,13 @@ function getAuth() {
 }
 
 /**
- * Get Firebase Database instance
+ * Realtime Database is intentionally disabled in the browser.
  */
 function getDatabase() {
-  if (!firebaseDatabase) {
-    waitForFirebaseSync();
-    if (!firebaseDatabase) {
-      initializeFirebase();
-    }
+  if (typeof console !== 'undefined') {
+    console.warn('Firebase Realtime Database is disabled on the client. Use backend API routes instead.');
   }
-  return firebaseDatabase;
+  return null;
 }
 
 /**

@@ -14,6 +14,28 @@ admin.initializeApp({
 
 const db = admin.database();
 
+function isCredentialMisconfigurationError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('invalid') && message.includes('credential')
+    || message.includes('permission_denied')
+    || message.includes('unauthorized')
+    || message.includes('auth');
+}
+
+async function verifyFirebaseAccess() {
+  try {
+    // Lightweight read to validate credential/databaseURL pairing before scheduling loops.
+    await db.ref('.info/connected').once('value');
+  } catch (error) {
+    if (isCredentialMisconfigurationError(error)) {
+      throw new Error(
+        `Firebase authentication failed for cleanup job. Verify FIREBASE_SERVICE_ACCOUNT_PATH/key.json belongs to the same project as DATABASE_URL. Original error: ${error.message}`
+      );
+    }
+    throw error;
+  }
+}
+
 /**
  * Cleanup old matches (older than 1 week)
  */
@@ -97,6 +119,9 @@ async function cleanupExpiredTesterAvailabilities() {
 async function startScheduledCleanup() {
   console.log('🔄 Starting scheduled match cleanup (runs every 48 hours)...');
 
+  // Fail fast if Firebase auth is misconfigured to avoid endless warning spam in PM2 logs.
+  await verifyFirebaseAccess();
+
   // Run initial cleanup
   try {
     await cleanupMatches();
@@ -115,6 +140,10 @@ async function startScheduledCleanup() {
       await cleanupExpiredTesterAvailabilities();
     } catch (error) {
       console.error('❌ Scheduled cleanup failed:', error);
+      if (isCredentialMisconfigurationError(error)) {
+        console.error('❌ Fatal Firebase credential/databaseURL mismatch detected. Exiting cleanup process.');
+        process.exit(1);
+      }
     }
   }, INTERVAL_MS);
 

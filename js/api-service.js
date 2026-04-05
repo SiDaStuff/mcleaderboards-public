@@ -12,6 +12,41 @@ class ApiService {
     this.cacheTimeout = 30000; // 30 seconds cache timeout
   }
 
+  formatRateLimitRetryText(retryAtMs) {
+    if (!retryAtMs || Number.isNaN(retryAtMs)) {
+      return null;
+    }
+
+    const remainingMs = Math.max(0, retryAtMs - Date.now());
+    if (remainingMs <= 0) {
+      return 'in a moment';
+    }
+
+    const totalSeconds = Math.ceil(remainingMs / 1000);
+    if (totalSeconds < 60) {
+      return `in ${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`;
+    }
+
+    const totalMinutes = Math.ceil(totalSeconds / 60);
+    if (totalMinutes < 60) {
+      return `in ${totalMinutes} minute${totalMinutes === 1 ? '' : 's'}`;
+    }
+
+    const totalHours = Math.ceil(totalMinutes / 60);
+    return `in ${totalHours} hour${totalHours === 1 ? '' : 's'}`;
+  }
+
+  buildRateLimitMessage(baseMessage, retryAtMs) {
+    const normalizedBaseMessage = String(baseMessage || 'Too many requests right now.').trim();
+    const retryText = this.formatRateLimitRetryText(retryAtMs);
+
+    if (retryText) {
+      return `${normalizedBaseMessage} Please try again ${retryText}.`;
+    }
+
+    return `${normalizedBaseMessage} Please wait a bit and try again.`;
+  }
+
   /**
    * Set authentication token
    */
@@ -155,8 +190,16 @@ class ApiService {
                 remaining: Number.isNaN(remaining) ? null : remaining,
                 resetAt: error.retryAt
               };
+              error.userMessage = 'Too many requests right now.';
+              error.suggestion = error.retryAt
+                ? `Please try again ${this.formatRateLimitRetryText(error.retryAt)}.`
+                : 'Please wait a bit and try again.';
+              error.message = this.buildRateLimitMessage(errorMessage, error.retryAt);
             } catch (metaError) {
               console.warn('Error parsing rate limit metadata:', metaError);
+              error.userMessage = 'Too many requests right now.';
+              error.suggestion = 'Please wait a bit and try again.';
+              error.message = this.buildRateLimitMessage(errorMessage, null);
             }
           }
 
@@ -463,10 +506,19 @@ class ApiService {
   /**
    * Join queue
    */
-  async joinQueue(gamemode, region, serverIP) {
+  async joinQueue(gamemodeOrGamemodes, regionOrRegions, serverIP) {
+    const gamemodes = Array.isArray(gamemodeOrGamemodes)
+      ? gamemodeOrGamemodes
+      : (gamemodeOrGamemodes ? [gamemodeOrGamemodes] : []);
+    const regions = Array.isArray(regionOrRegions)
+      ? regionOrRegions
+      : (regionOrRegions ? [regionOrRegions] : []);
+
     return this.post('/queue/join', {
-      gamemode,
-      region,
+      gamemode: gamemodes[0] || null,
+      region: regions[0] || null,
+      gamemodes,
+      regions,
       serverIP
     });
   }
@@ -497,7 +549,7 @@ class ApiService {
   /**
    * Set tester availability
    */
-  async setTesterAvailability(available, gamemodeOrGamemodes, regionOrRegions = null) {
+  async setTesterAvailability(available, gamemodeOrGamemodes, regionOrRegions = null, serverIP = null) {
     const gamemodes = Array.isArray(gamemodeOrGamemodes)
       ? gamemodeOrGamemodes
       : (gamemodeOrGamemodes ? [gamemodeOrGamemodes] : []);
@@ -510,7 +562,8 @@ class ApiService {
       gamemode: gamemodes[0] || null,
       region: regions[0] || null,
       gamemodes,
-      regions
+      regions,
+      serverIP: serverIP || null
     });
   }
 
@@ -596,6 +649,24 @@ class ApiService {
       evidenceLinks: Array.isArray(payload.evidenceLinks) ? payload.evidenceLinks : [],
       hasEvidence: payload.hasEvidence === true
     });
+  }
+
+  /**
+   * Create a dispute for a match
+   */
+  async createMatchDispute(matchId, payload = {}) {
+    return this.post(`/match/${matchId}/disputes`, {
+      category: payload.category || 'general',
+      summary: payload.summary || '',
+      evidenceLinks: Array.isArray(payload.evidenceLinks) ? payload.evidenceLinks : []
+    });
+  }
+
+  /**
+   * Get disputes for a match
+   */
+  async getMatchDisputes(matchId) {
+    return this.get(`/match/${matchId}/disputes`);
   }
 
   /**
@@ -775,6 +846,41 @@ class ApiService {
   }
 
   /**
+   * Admin: list staff roles
+   */
+  async getStaffRoles() {
+    return this.get('/admin/staff-roles');
+  }
+
+  /**
+   * Admin: create staff role
+   */
+  async createStaffRole(roleData) {
+    return this.post('/admin/staff-roles', roleData || {});
+  }
+
+  /**
+   * Admin: update staff role
+   */
+  async updateStaffRole(roleId, roleData) {
+    return this.put(`/admin/staff-roles/${encodeURIComponent(roleId)}`, roleData || {});
+  }
+
+  /**
+   * Admin: remove staff role
+   */
+  async deleteStaffRole(roleId) {
+    return this.delete(`/admin/staff-roles/${encodeURIComponent(roleId)}`);
+  }
+
+  /**
+   * Admin: assign or clear staff role for a user
+   */
+  async setUserStaffRole(userId, roleId = null) {
+    return this.post(`/admin/users/${encodeURIComponent(userId)}/staff-role`, { roleId });
+  }
+
+  /**
    * Force set rating for a player
    */
   async setPlayerRating(playerId, gamemode, rating) {
@@ -840,7 +946,7 @@ class ApiService {
   /**
    * Force create match between tester and player (admin only)
    */
-  async forceTest(testerUserId, playerUserId, gamemode, region = 'NA', serverIP = 'play.example.com') {
+  async forceTest(testerUserId, playerUserId, gamemode, region = 'NA', serverIP = '') {
     return this.post('/admin/players/force-test', { testerUserId, playerUserId, gamemode, region, serverIP });
   }
 
@@ -1310,6 +1416,39 @@ class ApiService {
     if (gamemode) url += `&gamemode=${encodeURIComponent(gamemode)}`;
     if (search) url += `&search=${encodeURIComponent(search)}`;
     return this.get(url);
+  }
+
+  /**
+   * Get admin match timeline
+   */
+  async getAdminMatchTimeline(matchId) {
+    return this.get(`/admin/matches/${encodeURIComponent(matchId)}/timeline`);
+  }
+
+  /**
+   * Inspect two queued users for compatibility
+   */
+  async inspectQueuePair(leftUserId, rightUserId) {
+    return this.get(`/admin/queue-inspector?leftUserId=${encodeURIComponent(leftUserId)}&rightUserId=${encodeURIComponent(rightUserId)}`);
+  }
+
+  /**
+   * Get admin disputes with optional filters
+   */
+  async getAdminDisputes(filters = {}) {
+    const params = new URLSearchParams();
+    if (filters.status) params.append('status', filters.status);
+    if (filters.matchId) params.append('matchId', filters.matchId);
+    if (filters.userId) params.append('userId', filters.userId);
+    const query = params.toString();
+    return this.get(`/admin/disputes${query ? `?${query}` : ''}`);
+  }
+
+  /**
+   * Update admin dispute status
+   */
+  async updateAdminDisputeStatus(disputeId, status, note = '') {
+    return this.post(`/admin/disputes/${encodeURIComponent(disputeId)}/status`, { status, note });
   }
 
   /**

@@ -17,6 +17,122 @@ const adminUiState = {
   }
 };
 
+const CLIENT_ADMIN_CAPABILITY_MATRIX = {
+  owner: ['*'],
+  lead_admin: ['users:view', 'users:manage', 'blacklist:view', 'blacklist:manage', 'audit:view', 'matches:view', 'matches:manage', 'reports:manage', 'disputes:manage', 'queue:inspect', 'settings:manage'],
+  moderator: ['users:view', 'blacklist:view', 'blacklist:manage', 'audit:view', 'matches:view', 'reports:manage', 'disputes:manage'],
+  support: ['users:view', 'audit:view', 'matches:view']
+};
+
+const ADMIN_TAB_REQUIREMENTS = {
+  management: ['users:view'],
+  moderation: ['blacklist:view'],
+  reported: ['reports:manage'],
+  judgment: ['blacklist:manage'],
+  banned: ['users:manage'],
+  testing: ['matches:view'],
+  ratings: ['users:manage'],
+  audit: ['audit:view'],
+  servers: ['settings:manage'],
+  matches: ['matches:view'],
+  operations: ['matches:view'],
+  'security-scores': ['audit:view'],
+  'staff-roles': ['settings:manage']
+};
+
+let staffRoleCatalog = [];
+let staffRoleActionCatalog = [];
+let staffRoleIconCatalog = [];
+
+function getStaffRoleIconPreview(role = {}) {
+  if (role.iconType === 'url' && role.iconUrl) {
+    return `<img src="${escapeHtml(role.iconUrl)}" alt="${escapeHtml(role.name || 'Staff')}" class="staff-role-icon-preview-image">`;
+  }
+
+  return `<span class="staff-role-icon-preview-glyph"><i class="${escapeHtml(role.iconClass || 'fas fa-shield-alt')}"></i></span>`;
+}
+
+function renderStaffRoleActionOptions() {
+  const grid = document.getElementById('staffRoleActionsGrid');
+  if (!grid) return;
+
+  const actionEntries = Array.isArray(staffRoleActionCatalog) ? staffRoleActionCatalog : [];
+  grid.innerHTML = actionEntries.map((action) => `
+    <div class="col-12 col-md-6 col-xl-4">
+      <label class="staff-role-action-option">
+        <input type="checkbox" class="staff-role-action" value="${escapeHtml(action.id)}">
+        <span><i class="fas ${escapeHtml(action.icon || 'fa-square')}"></i> ${escapeHtml(action.label || action.id)}</span>
+      </label>
+    </div>
+  `).join('');
+}
+
+function renderStaffRoleIconOptions() {
+  const select = document.getElementById('staffRoleIconPreset');
+  if (!select) return;
+
+  const iconEntries = Array.isArray(staffRoleIconCatalog) ? staffRoleIconCatalog : [];
+  select.innerHTML = iconEntries.map((icon) => `<option value="${escapeHtml(icon.id)}">${escapeHtml(icon.label)}</option>`).join('');
+
+  if (!select.value) {
+    select.value = 'shield';
+  }
+}
+
+function normalizeAdminUsername(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getClientAdminCapabilities() {
+  const profile = AppState.getProfile?.() || AppState.userProfile || {};
+  const contextCapabilities = Array.isArray(profile?.adminContext?.capabilities) ? profile.adminContext.capabilities : null;
+  if (contextCapabilities && contextCapabilities.length > 0) {
+    return contextCapabilities;
+  }
+
+  const role = typeof profile?.adminContext?.role === 'string'
+    ? profile.adminContext.role
+    : (typeof profile?.adminRole === 'string' ? profile.adminRole : (profile?.admin === true ? 'lead_admin' : null));
+  return CLIENT_ADMIN_CAPABILITY_MATRIX[role] || [];
+}
+
+function clientAdminHasCapability(capability) {
+  const capabilities = getClientAdminCapabilities();
+  return capabilities.includes('*') || capabilities.includes(capability);
+}
+
+function isAdminTabVisible(tab) {
+  const requirements = ADMIN_TAB_REQUIREMENTS[tab] || [];
+  if (!requirements.length) return true;
+  return requirements.some((capability) => clientAdminHasCapability(capability));
+}
+
+function applyAdminCapabilityVisibility() {
+  Object.keys(ADMIN_TAB_REQUIREMENTS).forEach((tab) => {
+    const button = document.getElementById(`tab-${tab}`);
+    const content = document.getElementById(`${tab}Tab`);
+    const visible = isAdminTabVisible(tab);
+    if (button) button.style.display = visible ? '' : 'none';
+    if (content && !visible) content.classList.add('d-none');
+  });
+
+  const summary = document.getElementById('adminContextSummary');
+  const chips = document.getElementById('adminCapabilityChips');
+  const profile = AppState.getProfile?.() || AppState.userProfile || {};
+  const role = profile?.adminContext?.role || profile?.adminRole || (profile?.admin === true ? 'lead_admin' : 'staff');
+  const capabilities = getClientAdminCapabilities();
+
+  if (summary) {
+    summary.textContent = `Role: ${String(role).replace(/_/g, ' ')}${capabilities.includes('*') ? ' · Full access' : ''}`;
+  }
+
+  if (chips) {
+    chips.innerHTML = capabilities.length
+      ? capabilities.map((capability) => `<span class="admin-capability-chip">${escapeHtml(capability)}</span>`).join('')
+      : '<span class="admin-capability-chip">No explicit capabilities</span>';
+  }
+}
+
 /**
  * Initialize admin panel
  */
@@ -32,7 +148,11 @@ async function initAdmin() {
     window.mclbLoadingOverlay.updateStatus('Loading admin panel...', 85);
   }
 
-  switchTab('management');
+  applyAdminCapabilityVisibility();
+  const params = new URLSearchParams(window.location.search);
+  const requestedTab = params.get('tab');
+  const defaultTab = Object.keys(ADMIN_TAB_REQUIREMENTS).find((tab) => isAdminTabVisible(tab)) || 'management';
+  switchTab(requestedTab && isAdminTabVisible(requestedTab) ? requestedTab : defaultTab);
   
   // Signal that all initial loading is complete
   if (window.mclbLoadingOverlay) {
@@ -44,6 +164,10 @@ async function initAdmin() {
  * Switch tab
  */
 function switchTab(tab) {
+  if (!isAdminTabVisible(tab)) {
+    return;
+  }
+
   currentTab = tab;
   
   // Update tab buttons
@@ -96,13 +220,190 @@ function switchTab(tab) {
     loadWhitelistedServers();
   } else if (tab === 'matches') {
     loadMatches();
+  } else if (tab === 'operations') {
+    loadAdminDisputes();
   } else if (tab === 'security-scores') {
     loadSecurityScores();
+  } else if (tab === 'staff-roles') {
+    loadStaffRoles();
   } else if (tab === 'support') {
     loadSupportTickets();
   }
 
 }
+
+function resetStaffRoleForm() {
+  const roleIdEl = document.getElementById('staffRoleId');
+  const roleNameEl = document.getElementById('staffRoleName');
+  const roleColorEl = document.getElementById('staffRoleColor');
+  const rolePresetEl = document.getElementById('staffRoleIconPreset');
+  const roleUrlEl = document.getElementById('staffRoleIconUrl');
+  if (roleIdEl) roleIdEl.value = '';
+  if (roleNameEl) roleNameEl.value = '';
+  if (roleColorEl) roleColorEl.value = '#38bdf8';
+  if (rolePresetEl) rolePresetEl.value = 'shield';
+  if (roleUrlEl) roleUrlEl.value = '';
+  document.querySelectorAll('.staff-role-action').forEach((cb) => {
+    cb.checked = false;
+  });
+}
+
+function getSelectedStaffRoleActions() {
+  return Array.from(document.querySelectorAll('.staff-role-action:checked')).map((el) => el.value);
+}
+
+function populateStaffRoleAssignments() {
+  const assignSelect = document.getElementById('assignStaffRoleId');
+  if (!assignSelect) return;
+  assignSelect.innerHTML = '<option value="">Remove staff role</option>';
+  staffRoleCatalog.forEach((role) => {
+    const option = document.createElement('option');
+    option.value = role.id;
+    option.textContent = role.name;
+    assignSelect.appendChild(option);
+  });
+}
+
+function renderStaffRoleList() {
+  const container = document.getElementById('staffRolesList');
+  if (!container) return;
+
+  if (!Array.isArray(staffRoleCatalog) || staffRoleCatalog.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p class="text-muted">No staff roles created yet.</p></div>';
+    return;
+  }
+
+  container.innerHTML = staffRoleCatalog.map((role) => `
+    <div class="card mb-2">
+      <div class="card-body" style="display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; align-items:flex-start;">
+        <div>
+          <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.4rem;">
+            ${getStaffRoleIconPreview(role)}
+            <strong style="color:${escapeHtml(role.color || '#38bdf8')};">${escapeHtml(role.name || role.id)}</strong>
+            <span class="text-muted" style="font-size:0.8rem;">${escapeHtml(role.id)}</span>
+          </div>
+          <div class="text-muted" style="font-size:0.85rem;">Actions: ${(role.dashboardActions || []).map(escapeHtml).join(', ') || 'None'}</div>
+        </div>
+        <div style="display:flex; gap:0.5rem;">
+          <button class="btn btn-secondary btn-sm" onclick="editStaffRole('${escapeHtml(role.id)}')"><i class="fas fa-pen"></i> Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteStaffRole('${escapeHtml(role.id)}')"><i class="fas fa-trash"></i> Delete</button>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function loadStaffRoles() {
+  const container = document.getElementById('staffRolesList');
+  if (container) container.innerHTML = '<div class="spinner"></div>';
+  try {
+    const response = await apiService.getStaffRoles();
+    staffRoleCatalog = Array.isArray(response?.roles) ? response.roles : [];
+    staffRoleActionCatalog = Array.isArray(response?.actionCatalog) ? response.actionCatalog : [];
+    staffRoleIconCatalog = Array.isArray(response?.badgePresets) ? response.badgePresets : [];
+    renderStaffRoleActionOptions();
+    renderStaffRoleIconOptions();
+    populateStaffRoleAssignments();
+    renderStaffRoleList();
+  } catch (error) {
+    if (container) {
+      container.innerHTML = `<div class="alert alert-danger">Failed to load staff roles: ${escapeHtml(error.message || 'Unknown error')}</div>`;
+    }
+  }
+}
+
+window.handleSaveStaffRole = async function handleSaveStaffRole(event) {
+  event.preventDefault();
+  const roleId = (document.getElementById('staffRoleId')?.value || '').trim();
+  const roleName = (document.getElementById('staffRoleName')?.value || '').trim();
+  const roleColor = (document.getElementById('staffRoleColor')?.value || '').trim();
+  const iconPreset = (document.getElementById('staffRoleIconPreset')?.value || '').trim();
+  const iconUrl = (document.getElementById('staffRoleIconUrl')?.value || '').trim();
+  const dashboardActions = getSelectedStaffRoleActions();
+
+  if (!roleName || roleName.length < 2) {
+    Swal.fire({ icon: 'warning', title: 'Invalid Role', text: 'Role name must be at least 2 characters.' });
+    return;
+  }
+
+  const payload = {
+    id: roleId || roleName,
+    name: roleName,
+    color: roleColor,
+    iconPreset,
+    iconUrl,
+    dashboardActions
+  };
+
+  try {
+    if (roleId) {
+      await apiService.updateStaffRole(roleId, payload);
+      Swal.fire({ icon: 'success', title: 'Role Updated', timer: 1200, showConfirmButton: false });
+    } else {
+      await apiService.createStaffRole(payload);
+      Swal.fire({ icon: 'success', title: 'Role Created', timer: 1200, showConfirmButton: false });
+    }
+    resetStaffRoleForm();
+    await loadStaffRoles();
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Save Failed', text: error.message || 'Unable to save role.' });
+  }
+};
+
+window.editStaffRole = function editStaffRole(roleId) {
+  const role = staffRoleCatalog.find((item) => item.id === roleId);
+  if (!role) return;
+
+  document.getElementById('staffRoleId').value = role.id;
+  document.getElementById('staffRoleName').value = role.name || '';
+  document.getElementById('staffRoleColor').value = role.color || '#38bdf8';
+  document.getElementById('staffRoleIconPreset').value = role.iconType === 'preset' ? (role.iconValue || 'shield') : 'shield';
+  document.getElementById('staffRoleIconUrl').value = role.iconType === 'url' ? (role.iconValue || '') : '';
+
+  const actionSet = new Set(role.dashboardActions || []);
+  document.querySelectorAll('.staff-role-action').forEach((checkbox) => {
+    checkbox.checked = actionSet.has(checkbox.value);
+  });
+};
+
+window.deleteStaffRole = async function deleteStaffRole(roleId) {
+  const confirm = await Swal.fire({
+    icon: 'warning',
+    title: 'Delete role?',
+    text: 'Users with this role will have their staff role removed.',
+    showCancelButton: true,
+    confirmButtonText: 'Delete',
+    cancelButtonText: 'Cancel'
+  });
+  if (!confirm.isConfirmed) return;
+
+  try {
+    await apiService.deleteStaffRole(roleId);
+    await loadStaffRoles();
+    Swal.fire({ icon: 'success', title: 'Role Deleted', timer: 1200, showConfirmButton: false });
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Delete Failed', text: error.message || 'Unable to delete role.' });
+  }
+};
+
+window.handleAssignStaffRole = async function handleAssignStaffRole(event) {
+  event.preventDefault();
+  const userId = (document.getElementById('assignStaffUserId')?.value || '').trim();
+  const roleId = (document.getElementById('assignStaffRoleId')?.value || '').trim();
+  if (!userId) {
+    Swal.fire({ icon: 'warning', title: 'Missing UID', text: 'Enter a valid user UID.' });
+    return;
+  }
+
+  try {
+    await apiService.setUserStaffRole(userId, roleId || null);
+    Swal.fire({ icon: 'success', title: 'Staff Role Updated', timer: 1200, showConfirmButton: false });
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Assignment Failed', text: error.message || 'Unable to assign role.' });
+  }
+};
+
+window.resetStaffRoleForm = resetStaffRoleForm;
 
 function sanitizePlusCodeInput(value) {
   return String(value || '').replace(/\D/g, '').slice(0, 6);
@@ -424,9 +725,13 @@ async function handleAddBlacklist(event) {
   const disabledFunctions = {
     chat: document.getElementById('blDisableChat')?.checked === true,
     queue: document.getElementById('blDisableQueue')?.checked === true,
+    queue_join: document.getElementById('blDisableQueueJoin')?.checked === true,
+    queue_leave: document.getElementById('blDisableQueueLeave')?.checked === true,
     reports: document.getElementById('blDisableReports')?.checked === true,
+    report_submit: document.getElementById('blDisableReportSubmit')?.checked === true,
     account_changes: document.getElementById('blDisableAccountChanges')?.checked === true,
     applications: document.getElementById('blDisableApplications')?.checked === true,
+    applications_submit: document.getElementById('blDisableApplicationsSubmit')?.checked === true,
     support_messages: document.getElementById('blDisableSupportMessages')?.checked === true
   };
   
@@ -515,8 +820,9 @@ async function loadUsers() {
         <table style="width: 100%; border-collapse: collapse;">
           <thead>
             <tr style="border-bottom: 2px solid var(--border-color);">
-              <th style="padding: 1rem; text-align: left;">Email</th>
               <th style="padding: 1rem; text-align: left;">Minecraft Username</th>
+              <th style="padding: 1rem; text-align: left;">Account</th>
+              <th style="padding: 1rem; text-align: left;">Identifiers</th>
               <th style="padding: 1rem; text-align: left;">Status</th>
               <th style="padding: 1rem; text-align: left;">Actions</th>
             </tr>
@@ -524,8 +830,11 @@ async function loadUsers() {
           <tbody>
             ${users.map(user => `
               <tr style="border-bottom: 1px solid var(--border-color);">
-                <td style="padding: 1rem;">${escapeHtml(user.email || 'N/A')}</td>
                 <td style="padding: 1rem;">${escapeHtml(user.minecraftUsername || 'Not linked')}</td>
+                <td style="padding: 1rem;">${escapeHtml(user.email || 'No account email')}</td>
+                <td style="padding: 1rem; font-size: 0.85em;">
+                  <div><strong>User:</strong> <code style="font-size: 0.9em;">${escapeHtml(user.id)}</code></div>
+                </td>
                 <td style="padding: 1rem;">
                   ${user.admin ? '<span class="badge badge-primary">Admin</span>' : ''}
                   ${user.tester ? '<span class="badge badge-success">Tier Tester</span>' : ''}
@@ -542,7 +851,7 @@ async function loadUsers() {
                       ${user.admin ? 'Remove Admin' : 'Make Admin'}
                     </button>
                     <button class="btn btn-sm btn-secondary"
-                            onclick="openManagementScreen('user', '${user.id}', '${escapeHtml(user.email || 'N/A')}', '${escapeHtml(user.minecraftUsername || '')}')">
+                            onclick="openManagementScreen('user', '${user.id}', '${escapeHtml(user.minecraftUsername || user.email || 'Unknown')}', '${escapeHtml(user.minecraftUsername || '')}', '${user.id}', '')">
                       Manage
                     </button>
                   </div>
@@ -557,6 +866,28 @@ async function loadUsers() {
     console.error('Error loading users:', error);
     listDiv.innerHTML = `<div class="alert alert-error">Error loading users: ${escapeHtml(error.message)}</div>`;
   }
+}
+
+function buildManagementIdentitySummary(context) {
+  const lines = [];
+
+  if (context.username) {
+    lines.push(`<div><strong>Username:</strong> ${escapeHtml(context.username)}</div>`);
+  }
+
+  if (context.accountName && context.accountName !== context.username) {
+    lines.push(`<div><strong>Account:</strong> ${escapeHtml(context.accountName)}</div>`);
+  }
+
+  if (context.userId) {
+    lines.push(`<div><strong>Firebase UID:</strong> <code>${escapeHtml(context.userId)}</code></div>`);
+  }
+
+  if (context.playerId) {
+    lines.push(`<div><strong>Player ID:</strong> <code>${escapeHtml(context.playerId)}</code></div>`);
+  }
+
+  return lines.join('');
 }
 
 /**
@@ -669,27 +1000,31 @@ async function handleAddPlayer(event) {
 function openManagementScreen(type, id, name, username = '', userId = '', playerId = '') {
   const section = document.getElementById('managementSection');
   const titleEl = document.getElementById('managementSectionTitle');
+  const summaryEl = document.getElementById('managementIdentitySummary');
   const actionGrid = document.getElementById('managementActionGrid');
   const formContainer = document.getElementById('managementFormContainer');
   
-  // Set title with UID info
-  let titleText = `Manage ${type === 'player' ? 'Player' : 'User'}: ${escapeHtml(name)}`;
-  if (type === 'player' && id) {
-    titleText += ` (Player ID: ${escapeHtml(id)})`;
-  } else if (type === 'user' && id) {
-    titleText += ` (User ID: ${escapeHtml(id)})`;
-  }
+  const resolvedUsername = String(username || '').trim();
+  const resolvedAccountName = String(name || '').trim();
+  const primaryIdentity = resolvedUsername || resolvedAccountName || (type === 'player' ? 'Unknown player' : 'Unknown user');
+  let titleText = `Manage ${type === 'player' ? 'Player' : 'Account'}: ${primaryIdentity}`;
   titleEl.textContent = titleText;
   
   // Store current context
   window.currentManagementContext = {
     type,
     id,
-    name,
-    username,
+    name: primaryIdentity,
+    accountName: resolvedAccountName,
+    username: resolvedUsername,
     userId,
     playerId
   };
+
+  if (summaryEl) {
+    summaryEl.innerHTML = buildManagementIdentitySummary(window.currentManagementContext);
+    summaryEl.style.display = summaryEl.innerHTML ? 'block' : 'none';
+  }
   
   // Define available actions - ALL actions shown for both users and players
   const actions = [
@@ -884,9 +1219,13 @@ function selectManagementAction(actionId) {
         <div class="row">
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionChat"> Chat</label></div>
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionQueue"> Queue</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionQueueJoin"> Queue Join</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionQueueLeave"> Queue Leave</label></div>
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionReports"> Reports</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionReportSubmit"> Report Submit</label></div>
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionAccountChanges"> Account Changes</label></div>
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionApplications"> Applications</label></div>
+          <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionApplicationsSubmit"> Application Submit</label></div>
           <div class="col-6"><label><input type="checkbox" id="mgmtRestrictionSupportMessages"> Support Messages</label></div>
         </div>
       </div>
@@ -1031,9 +1370,13 @@ async function executeManagementAction() {
     formData.restrictions = {
       chat: document.getElementById('mgmtRestrictionChat')?.checked === true,
       queue: document.getElementById('mgmtRestrictionQueue')?.checked === true,
+      queue_join: document.getElementById('mgmtRestrictionQueueJoin')?.checked === true,
+      queue_leave: document.getElementById('mgmtRestrictionQueueLeave')?.checked === true,
       reports: document.getElementById('mgmtRestrictionReports')?.checked === true,
+      report_submit: document.getElementById('mgmtRestrictionReportSubmit')?.checked === true,
       account_changes: document.getElementById('mgmtRestrictionAccountChanges')?.checked === true,
       applications: document.getElementById('mgmtRestrictionApplications')?.checked === true,
+      applications_submit: document.getElementById('mgmtRestrictionApplicationsSubmit')?.checked === true,
       support_messages: document.getElementById('mgmtRestrictionSupportMessages')?.checked === true
     };
     
@@ -1603,36 +1946,65 @@ async function handleUnifiedSearch(event) {
       playersResponse?.pagination?.totalPages || 1
     );
 
-    // Combine and deduplicate results
-    // If a user has a linked player, merge the data
+    // Combine and deduplicate results using explicit linkage metadata first,
+    // then fall back to userId or normalized username matching.
     const combinedResults = [];
     const processedPlayerIds = new Set();
+    const playersById = new Map();
+    const playersByUserId = new Map();
+    const playersByUsername = new Map();
+
+    for (const player of players) {
+      const normalizedPlayerUsername = normalizeAdminUsername(player.username);
+      const playerUserId = String(player.userId || '').trim();
+
+      if (player.id) {
+        playersById.set(player.id, player);
+      }
+      if (playerUserId && !playersByUserId.has(playerUserId)) {
+        playersByUserId.set(playerUserId, player);
+      }
+      if (normalizedPlayerUsername && !playersByUsername.has(normalizedPlayerUsername)) {
+        playersByUsername.set(normalizedPlayerUsername, player);
+      }
+    }
 
     // Process users first
     for (const user of users) {
+      const normalizedUserUsername = normalizeAdminUsername(user.linkedPlayerUsername || user.minecraftUsername);
+      const linkedPlayer = (user.linkedPlayerId ? playersById.get(user.linkedPlayerId) : null)
+        || playersByUserId.get(user.id)
+        || (normalizedUserUsername ? playersByUsername.get(normalizedUserUsername) : null)
+        || null;
+      const resolvedPlayerId = user.linkedPlayerId || linkedPlayer?.id || null;
+      const resolvedMinecraftUsername = user.linkedPlayerUsername
+        || linkedPlayer?.username
+        || user.minecraftUsername
+        || null;
+      const resolvedPlayerData = linkedPlayer || (resolvedPlayerId ? {
+        id: resolvedPlayerId,
+        username: resolvedMinecraftUsername,
+        blacklisted: Boolean(user.linkedPlayerBlacklisted)
+      } : null);
+
       const result = {
         type: 'user',
         id: user.id,
         email: user.email,
-        minecraftUsername: user.minecraftUsername,
+        minecraftUsername: resolvedMinecraftUsername,
+        primaryLabel: resolvedMinecraftUsername || user.email || user.id,
         admin: user.admin || false,
         tierTester: user.tierTester || false,
         banned: user.banned || false,
+        staffRole: user.staffRole || null,
+        staffRoleId: user.staffRoleId || null,
         userId: user.id,
-        playerId: null,
-        playerData: null
+        playerId: resolvedPlayerId,
+        playerData: resolvedPlayerData
       };
 
-      // Check if this user has a linked player
-      if (user.minecraftUsername) {
-        const linkedPlayer = players.find(p => 
-          p.username?.toLowerCase() === user.minecraftUsername.toLowerCase()
-        );
-        if (linkedPlayer) {
-          result.playerId = linkedPlayer.id;
-          result.playerData = linkedPlayer;
-          processedPlayerIds.add(linkedPlayer.id);
-        }
+      if (resolvedPlayerId) {
+        processedPlayerIds.add(resolvedPlayerId);
       }
 
       combinedResults.push(result);
@@ -1644,12 +2016,15 @@ async function handleUnifiedSearch(event) {
         combinedResults.push({
           type: 'player',
           id: player.id,
-          email: null,
+          email: player.email || null,
           minecraftUsername: player.username,
-          admin: false,
-          tierTester: false,
-          banned: false,
-          userId: null,
+          primaryLabel: player.username || player.email || player.id,
+          admin: player.admin || false,
+          tierTester: player.tierTester || player.tester || false,
+          banned: player.banned || false,
+          staffRole: player.staffRole || null,
+          staffRoleId: player.staffRoleId || null,
+          userId: player.userId || null,
           playerId: player.id,
           playerData: player
         });
@@ -1667,9 +2042,9 @@ async function handleUnifiedSearch(event) {
         <table style="width: 100%; border-collapse: collapse;">
           <thead>
             <tr style="border-bottom: 2px solid var(--border-color);">
-              <th style="padding: 1rem; text-align: left;">Email</th>
-              <th style="padding: 1rem; text-align: left;">UIDs</th>
               <th style="padding: 1rem; text-align: left;">Minecraft Username</th>
+              <th style="padding: 1rem; text-align: left;">Account</th>
+              <th style="padding: 1rem; text-align: left;">Identifiers</th>
               <th style="padding: 1rem; text-align: left;">Status</th>
               <th style="padding: 1rem; text-align: left;">Actions</th>
             </tr>
@@ -1684,26 +2059,27 @@ async function handleUnifiedSearch(event) {
 
               return `
               <tr style="border-bottom: 1px solid var(--border-color);">
-                <td style="padding: 1rem;">${escapeHtml(result.email || 'N/A')}</td>
+                <td style="padding: 1rem;">
+                  ${escapeHtml(result.minecraftUsername || 'Not linked')}
+                  ${result.playerData?.blacklisted ? '<span class="badge badge-danger ml-2">Blacklisted</span>' : ''}
+                </td>
+                <td style="padding: 1rem;">${escapeHtml(result.email || 'No linked account')}</td>
                 <td style="padding: 1rem; font-size: 0.85em;">
                   ${result.userId ? `<div><strong>User:</strong> <code style="font-size: 0.9em;">${escapeHtml(result.userId)}</code></div>` : ''}
                   ${result.playerId ? `<div><strong>Player:</strong> <code style="font-size: 0.9em;">${escapeHtml(result.playerId)}</code></div>` : ''}
                   ${!result.userId && !result.playerId ? 'N/A' : ''}
                 </td>
                 <td style="padding: 1rem;">
-                  ${escapeHtml(result.minecraftUsername || 'Not linked')}
-                  ${result.playerData?.blacklisted ? '<span class="badge badge-danger ml-2">Blacklisted</span>' : ''}
-                </td>
-                <td style="padding: 1rem;">
                   ${result.admin ? '<span class="badge badge-primary">Admin</span>' : ''}
                   ${result.tierTester ? '<span class="badge badge-success">Tester</span>' : ''}
+                  ${result.staffRole ? `<span class="badge badge-info">${escapeHtml(result.staffRole.name || 'Staff')}</span>` : ''}
                   ${result.banned ? '<span class="badge badge-danger">Banned</span>' : ''}
-                  ${!result.admin && !result.tierTester && !result.banned ? '<span class="badge badge-secondary">User</span>' : ''}
+                  ${!result.admin && !result.tierTester && !result.staffRole && !result.banned ? '<span class="badge badge-secondary">User</span>' : ''}
                 </td>
                 <td style="padding: 1rem;">
                   <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
                     <button class="btn btn-sm btn-primary"
-                            onclick="handleManageResult('${result.type}', '${result.id}', '${escapeHtml(result.email || result.minecraftUsername || 'Unknown')}', '${escapeHtml(result.minecraftUsername || '')}', '${result.userId || ''}', '${result.playerId || ''}')">
+                            onclick="handleManageResult('${result.type}', '${result.id}', '${escapeHtml(result.email || '')}', '${escapeHtml(result.minecraftUsername || '')}', '${result.userId || ''}', '${result.playerId || ''}')">
                       <i class="fas fa-cog"></i> Manage
                     </button>
                     ${canSetRating ? `
@@ -2032,7 +2408,8 @@ async function resistAltReport(reportId, detectionReason) {
   if (result.isConfirmed) {
     try {
       // Get all reports to find this one
-      const allReports = await apiService.getReportedAccounts();
+      const response = await apiService.getReportedAccounts();
+      const allReports = Array.isArray(response?.reportedAccounts) ? response.reportedAccounts : [];
       const report = allReports.find(r => r.id === reportId);
       if (!report) throw new Error('Report not found');
 
@@ -3081,13 +3458,32 @@ function displayMatches(matches) {
     return;
   }
 
+  const getRoleAssignmentBadge = (match) => {
+    const assignmentType = match?.roleAssignment?.type || '';
+    if (assignmentType === 'dual_tier_tester_cooldown_priority') {
+      return '<span class="badge badge-danger">Cooldown Forced Roles</span>';
+    }
+    if (assignmentType === 'dual_tier_tester_random' || match?.roleAssignment?.randomized === true) {
+      return '<span class="badge badge-info">Randomized Roles</span>';
+    }
+    if (assignmentType === 'admin_force_test') {
+      return '<span class="badge badge-dark">Force Created</span>';
+    }
+    return '';
+  };
+
   listDiv.innerHTML = matches.map(match => {
     const isFinalized = match.finalized;
     const isActive = match.status === 'active';
+    const canManageMatches = clientAdminHasCapability('matches:manage');
+    const canViewTimeline = clientAdminHasCapability('matches:view');
+    const canManageDisputes = clientAdminHasCapability('disputes:manage') || clientAdminHasCapability('reports:manage');
     const createdTime = new Date(match.createdAt).toLocaleString();
     const finalizedTime = match.finalizedAt ? new Date(match.finalizedAt).toLocaleString() : '-';
     const ratingChange = match.finalizationData?.ratingChanges?.playerRatingChange;
     const ratingChangeDisplay = ratingChange !== undefined ? (ratingChange >= 0 ? `+${ratingChange}` : ratingChange) : '-';
+    const roleAssignmentBadge = getRoleAssignmentBadge(match);
+    const roleAssignmentReason = match?.roleAssignment?.explanation || '';
 
     return `
       <div class="card mb-3">
@@ -3098,9 +3494,13 @@ function displayMatches(matches) {
                 <span class="badge badge-primary">${match.gamemode.toUpperCase()}</span>
                 <span class="badge ${match.finalized ? 'badge-success' : isActive ? 'badge-warning' : 'badge-secondary'}">${match.status.toUpperCase()}</span>
                 ${isFinalized ? `<span class="badge badge-info">Finalized</span>` : ''}
+                ${match.forceCreated ? `<span class="badge badge-dark">Admin Match</span>` : ''}
+                ${roleAssignmentBadge}
               </div>
               <p><strong>Player:</strong> ${escapeHtml(match.playerUsername)} (${escapeHtml(match.playerId?.substring(0, 8))})</p>
               <p><strong>Tester:</strong> ${escapeHtml(match.testerUsername)} (${escapeHtml(match.testerId?.substring(0, 8))})</p>
+              <p><strong>Region:</strong> ${escapeHtml(match.region || '-')} | <strong>Server:</strong> ${escapeHtml(match.serverIP || '-')}</p>
+              ${roleAssignmentReason ? `<p class="text-muted small mb-2"><strong>Role Debug:</strong> ${escapeHtml(roleAssignmentReason)}</p>` : ''}
               
               ${match.finalizationData ? `
                 <p><strong>Score:</strong> ${match.finalizationData.playerScore} - ${match.finalizationData.testerScore}</p>
@@ -3112,19 +3512,31 @@ function displayMatches(matches) {
             </div>
             <div class="col-md-4 text-end">
               <div class="d-flex flex-column gap-2">
-                ${!isFinalized && !isActive ? `
+                ${canViewTimeline ? `
+                  <button class="btn btn-secondary btn-sm" onclick="openMatchTimeline('${match.id}')">
+                    <i class="fas fa-stream"></i> Timeline
+                  </button>
+                ` : ''}
+                ${canManageDisputes ? `
+                  <button class="btn btn-secondary btn-sm" onclick="openMatchDisputeBoard('${match.id}')">
+                    <i class="fas fa-balance-scale"></i> Disputes
+                  </button>
+                ` : ''}
+                ${canManageMatches && !isFinalized && !isActive ? `
                   <button class="btn btn-info btn-sm" onclick="openFinalizeDialog('${match.id}', '${escapeHtml(match.playerUsername)}', '${escapeHtml(match.testerUsername)}')">
                     <i class="fas fa-check"></i> Finalize
                   </button>
                 ` : ''}
-                ${isFinalized && match.finalizationData?.type !== 'draw_vote' ? `
+                ${canManageMatches && isFinalized && match.finalizationData?.type !== 'draw_vote' ? `
                   <button class="btn btn-warning btn-sm" onclick="revertAdminMatch('${match.id}', '${escapeHtml(match.playerUsername)}')">
                     <i class="fas fa-undo"></i> Revert
                   </button>
                 ` : ''}
-                <button class="btn btn-danger btn-sm" onclick="deleteAdminMatch('${match.id}', '${escapeHtml(match.playerUsername)}')">
-                  <i class="fas fa-trash"></i> Delete
-                </button>
+                ${canManageMatches ? `
+                  <button class="btn btn-danger btn-sm" onclick="deleteAdminMatch('${match.id}', '${escapeHtml(match.playerUsername)}')">
+                    <i class="fas fa-trash"></i> Delete
+                  </button>
+                ` : ''}
               </div>
             </div>
           </div>
@@ -3132,6 +3544,172 @@ function displayMatches(matches) {
       </div>
     `;
   }).join('');
+}
+
+function renderTimelineEntries(timeline = []) {
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return '<div class="empty-state"><p class="text-muted">No timeline entries found for this match.</p></div>';
+  }
+
+  return `<div class="timeline-list">${timeline.map((entry) => `
+    <div class="timeline-item">
+      <div class="timeline-item-marker"></div>
+      <div class="timeline-item-content">
+        <div class="timeline-item-header">
+          <strong>${escapeHtml(entry.title || 'Event')}</strong>
+          <span class="text-muted">${entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-'}</span>
+        </div>
+        <div class="timeline-item-type">${escapeHtml((entry.type || 'event').replace(/_/g, ' '))}</div>
+        ${entry.description ? `<p class="timeline-item-description">${escapeHtml(entry.description)}</p>` : ''}
+      </div>
+    </div>
+  `).join('')}</div>`;
+}
+
+async function loadMatchTimeline(matchId = null) {
+  const resolvedMatchId = matchId || document.getElementById('timelineMatchIdInput')?.value?.trim();
+  const container = document.getElementById('matchTimelineResults');
+  if (!resolvedMatchId || !container) return;
+
+  container.innerHTML = '<div class="spinner"></div>';
+  try {
+    const response = await apiService.getAdminMatchTimeline(resolvedMatchId);
+    container.innerHTML = renderTimelineEntries(response.timeline || []);
+    const input = document.getElementById('timelineMatchIdInput');
+    if (input) input.value = resolvedMatchId;
+  } catch (error) {
+    container.innerHTML = `<div class="alert alert-danger">Failed to load timeline: ${escapeHtml(error.message || 'Unknown error')}</div>`;
+  }
+}
+
+function renderQueueInspectorResponse(response = {}) {
+  const analysis = response.analysis || {};
+  const previews = Array.isArray(analysis.previews) ? analysis.previews : [];
+  const blockers = Array.isArray(analysis.blockers) ? analysis.blockers : [];
+
+  return `
+    <div class="admin-inspector-summary ${analysis.canMatch ? 'is-success' : 'is-warning'}">
+      <strong>${analysis.canMatch ? 'Compatible pair found' : 'Pair is blocked'}</strong>
+      <span>${analysis.canMatch ? 'At least one shared selection can create a match.' : 'The current queue state prevents a match.'}</span>
+    </div>
+    ${blockers.length ? `<div class="admin-inspector-reasons">${blockers.map((reason) => `<div class="admin-inspector-reason">${escapeHtml(reason)}</div>`).join('')}</div>` : ''}
+    <div class="admin-inspector-grid">
+      ${previews.map((preview) => `
+        <div class="admin-inspector-card">
+          <div class="admin-inspector-card-header">
+            <strong>${escapeHtml(String(preview.gamemode || '').toUpperCase())}</strong>
+            <span>${escapeHtml(preview.region || '-')}</span>
+          </div>
+          <div class="admin-inspector-card-status ${preview.canMatch ? 'is-success' : 'is-warning'}">${preview.canMatch ? 'Can Match' : 'Blocked'}</div>
+          ${preview.assignment ? `<p class="text-muted">${escapeHtml(preview.assignment.explanation || '')}</p>` : ''}
+          ${(preview.reasons || []).map((reason) => `<div class="admin-inspector-reason">${escapeHtml(reason)}</div>`).join('')}
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+async function runQueueInspector() {
+  const leftUserId = document.getElementById('queueInspectorLeftUserId')?.value?.trim();
+  const rightUserId = document.getElementById('queueInspectorRightUserId')?.value?.trim();
+  const container = document.getElementById('queueInspectorResults');
+  if (!leftUserId || !rightUserId || !container) return;
+
+  container.innerHTML = '<div class="spinner"></div>';
+  try {
+    const response = await apiService.inspectQueuePair(leftUserId, rightUserId);
+    container.innerHTML = renderQueueInspectorResponse(response);
+  } catch (error) {
+    container.innerHTML = `<div class="alert alert-danger">Failed to inspect queue: ${escapeHtml(error.message || 'Unknown error')}</div>`;
+  }
+}
+
+function renderAdminDisputes(disputes = []) {
+  const container = document.getElementById('adminDisputesList');
+  if (!container) return;
+
+  if (!Array.isArray(disputes) || disputes.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p class="text-muted">No disputes found for the selected filters.</p></div>';
+    return;
+  }
+
+  const canManageDisputes = clientAdminHasCapability('disputes:manage') || clientAdminHasCapability('reports:manage');
+  container.innerHTML = disputes.map((dispute) => `
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-2">
+          <div>
+            <div class="mb-1">
+              <span class="badge badge-primary">${escapeHtml((dispute.gamemode || 'match').toUpperCase())}</span>
+              <span class="badge badge-secondary">${escapeHtml((dispute.status || 'open').replace(/_/g, ' '))}</span>
+            </div>
+            <strong>${escapeHtml(dispute.reporterUsername || 'Unknown')}</strong> disputed match <code>${escapeHtml(dispute.matchId || '')}</code>
+          </div>
+          <div class="text-muted small">${dispute.updatedAt ? new Date(dispute.updatedAt).toLocaleString() : '-'}</div>
+        </div>
+        <p>${escapeHtml(dispute.summary || '')}</p>
+        ${Array.isArray(dispute.evidenceLinks) && dispute.evidenceLinks.length ? `<div class="text-muted small mb-2">Evidence: ${dispute.evidenceLinks.map((link) => `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link)}</a>`).join(' • ')}</div>` : ''}
+        <div class="text-muted small mb-2">History entries: ${Array.isArray(dispute.history) ? dispute.history.length : 0}</div>
+        ${canManageDisputes ? `
+          <div class="d-flex gap-2 flex-wrap">
+            <button class="btn btn-secondary btn-sm" onclick="updateAdminDisputeStatusPrompt('${dispute.disputeId}', 'in_review')">Mark In Review</button>
+            <button class="btn btn-success btn-sm" onclick="updateAdminDisputeStatusPrompt('${dispute.disputeId}', 'resolved')">Resolve</button>
+            <button class="btn btn-danger btn-sm" onclick="updateAdminDisputeStatusPrompt('${dispute.disputeId}', 'rejected')">Reject</button>
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+async function loadAdminDisputes() {
+  const container = document.getElementById('adminDisputesList');
+  if (!container) return;
+  container.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const filters = {
+      status: document.getElementById('disputeStatusFilter')?.value || '',
+      matchId: document.getElementById('disputeMatchFilter')?.value?.trim() || '',
+      userId: document.getElementById('disputeUserFilter')?.value?.trim() || ''
+    };
+    const response = await apiService.getAdminDisputes(filters);
+    renderAdminDisputes(response.disputes || []);
+  } catch (error) {
+    container.innerHTML = `<div class="alert alert-danger">Failed to load disputes: ${escapeHtml(error.message || 'Unknown error')}</div>`;
+  }
+}
+
+async function updateAdminDisputeStatusPrompt(disputeId, status) {
+  const { value: note } = await Swal.fire({
+    title: `Set dispute to ${status.replace(/_/g, ' ')}`,
+    input: 'textarea',
+    inputPlaceholder: 'Add an optional resolution note',
+    showCancelButton: true,
+    confirmButtonText: 'Save'
+  });
+
+  if (note === undefined) return;
+  try {
+    await apiService.updateAdminDisputeStatus(disputeId, status, note || '');
+    await loadAdminDisputes();
+  } catch (error) {
+    Swal.fire({ icon: 'error', title: 'Update Failed', text: error.message || 'Unable to update dispute.' });
+  }
+}
+
+function openMatchTimeline(matchId) {
+  switchTab('operations');
+  const input = document.getElementById('timelineMatchIdInput');
+  if (input) input.value = matchId;
+  loadMatchTimeline(matchId);
+}
+
+function openMatchDisputeBoard(matchId) {
+  switchTab('operations');
+  const input = document.getElementById('disputeMatchFilter');
+  if (input) input.value = matchId;
+  loadAdminDisputes();
 }
 
 /**
@@ -4542,6 +5120,12 @@ window.blockTierTesterApplication = blockTierTesterApplication;
 window.loadWhitelistedServers = loadWhitelistedServers;
 window.handleAddServer = handleAddServer;
 window.handleDeleteServer = handleDeleteServer;
+window.loadMatchTimeline = loadMatchTimeline;
+window.runQueueInspector = runQueueInspector;
+window.loadAdminDisputes = loadAdminDisputes;
+window.updateAdminDisputeStatusPrompt = updateAdminDisputeStatusPrompt;
+window.openMatchTimeline = openMatchTimeline;
+window.openMatchDisputeBoard = openMatchDisputeBoard;
 window.loadSupportTickets = loadSupportTickets;
 window.openSupportTicket = openSupportTicket;
 window.replySupportTicket = replySupportTicket;

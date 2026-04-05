@@ -2,19 +2,61 @@
 
 let queueCheckInterval = null;
 let activeMatch = null;
+let activeMatchPollInterval = null;
 let gamemodeStatsInterval = null;
 let gamemodeStatsBackoffUntilMs = 0;
 let hasLoadedRecentMatches = false;
 let hasLoadedGamemodeActivity = false;
 let hasLoadedNotificationSettings = false;
-let hasLoadedTesterReputation = false;
 let hasLoadedQueueCooldowns = false;
 let dashboardInitialized = false;
 let notificationPollInterval = null;
 const seenNotificationIds = new Set();
+const DASHBOARD_ACTIVE_MATCH_POLL_MS = 5000;
+
+const DASHBOARD_ADMIN_CAPABILITY_MATRIX = {
+  owner: ['*'],
+  lead_admin: ['users:view', 'users:manage', 'blacklist:view', 'blacklist:manage', 'audit:view', 'matches:view', 'matches:manage', 'reports:manage', 'disputes:manage', 'queue:inspect', 'settings:manage'],
+  moderator: ['users:view', 'blacklist:view', 'blacklist:manage', 'audit:view', 'matches:view', 'reports:manage', 'disputes:manage'],
+  support: ['users:view', 'audit:view', 'matches:view']
+};
+
+const DASHBOARD_ADMIN_TAB_REQUIREMENTS = {
+  management: ['users:view'],
+  moderation: ['blacklist:view'],
+  reported: ['reports:manage'],
+  matches: ['matches:view'],
+  operations: ['matches:view'],
+  'security-scores': ['audit:view'],
+  servers: ['settings:manage'],
+  'staff-roles': ['settings:manage']
+};
+
+function getDashboardAdminCapabilities(profile = {}) {
+  const contextCapabilities = Array.isArray(profile?.adminContext?.capabilities) ? profile.adminContext.capabilities : null;
+  if (contextCapabilities && contextCapabilities.length > 0) {
+    return contextCapabilities;
+  }
+
+  const role = typeof profile?.adminContext?.role === 'string'
+    ? profile.adminContext.role
+    : (typeof profile?.adminRole === 'string' ? profile.adminRole : (profile?.admin === true ? 'lead_admin' : null));
+  return DASHBOARD_ADMIN_CAPABILITY_MATRIX[role] || [];
+}
+
+function dashboardAdminHasCapability(profile, capability) {
+  const capabilities = getDashboardAdminCapabilities(profile);
+  return capabilities.includes('*') || capabilities.includes(capability);
+}
+
+function isDashboardAdminTabVisible(profile, tab) {
+  const requirements = DASHBOARD_ADMIN_TAB_REQUIREMENTS[tab] || [];
+  if (!requirements.length) return true;
+  return requirements.some((capability) => dashboardAdminHasCapability(profile, capability));
+}
 
 function scrollToTesterDashboard() {
-  const testerSection = document.getElementById('testerCard');
+  const testerSection = document.getElementById('sharedQueueCard');
   if (!testerSection) return;
 
   if (testerSection.style.display === 'none') {
@@ -27,34 +69,73 @@ function scrollToTesterDashboard() {
   window.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
 }
 
+function isTierTesterUser() {
+  return Boolean(AppState.isTierTester && AppState.isTierTester());
+}
+
+function getJoinQueueButtonLabel() {
+  return isTierTesterUser() ? 'Join as Tier Tester' : 'Join Shared Queue';
+}
+
+function configureUnifiedQueueExperience() {
+  const title = document.getElementById('queueCardTitle');
+  const subtitle = document.getElementById('queueCardSubtitle');
+  const flowMessage = document.getElementById('queueFlowMessage');
+  const testerOptions = document.getElementById('testerQueueOptions');
+
+  if (isTierTesterUser()) {
+    if (title) title.textContent = 'Join Shared Queue';
+    if (subtitle) subtitle.textContent = 'Use the same shared queue as everyone else. Your tier tester preference is applied automatically.';
+    if (flowMessage) {
+      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select your gamemodes and regions, choose a whitelisted server, then join the same live queue players use.';
+    }
+    if (testerOptions) testerOptions.style.display = 'block';
+  } else {
+    if (title) title.textContent = 'Join Shared Queue';
+    if (subtitle) subtitle.textContent = 'One shared queue for players and tier testers.';
+    if (flowMessage) {
+      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select one or more gamemodes and regions, choose a whitelisted server, then join queue.';
+    }
+    if (testerOptions) testerOptions.style.display = 'none';
+  }
+
+  updateJoinQueueButtonState();
+}
+
+async function loadSharedQueueSettings() {
+  try {
+    const profile = await getCachedProfile();
+    const stayInQueueCheckbox = document.getElementById('stayInQueueAfterMatch');
+    if (stayInQueueCheckbox && profile?.stayInQueueAfterMatch !== undefined) {
+      stayInQueueCheckbox.checked = profile.stayInQueueAfterMatch;
+    }
+  } catch (error) {
+    console.error('Error loading shared queue settings:', error);
+  }
+}
+
 function renderGamemodeSelectionControls() {
   const gamemodes = (CONFIG?.GAMEMODES || []).filter(gm => gm.id && gm.id !== 'overall');
   if (!gamemodes.length) return;
 
-  const queueContainer = document.getElementById('queueGamemodeSelections');
-  const queueInput = document.getElementById('gamemode');
-  if (queueContainer && queueInput) {
-    queueContainer.innerHTML = gamemodes.map(gm => `
+  const playerGamemodeContainer = document.getElementById('playerGamemodeSelections');
+  if (playerGamemodeContainer) {
+    playerGamemodeContainer.innerHTML = gamemodes.map(gm => `
       <label class="gamemode-choice">
-        <input type="radio" name="queueGamemode" class="queue-gamemode-radio" value="${gm.id}">
+        <input type="checkbox" class="player-gamemode-checkbox" value="${gm.id}">
         <span class="gamemode-choice-content">
           <img src="${gm.icon}" alt="${escapeHtml(gm.name)}" class="gamemode-choice-icon">
           <span>${escapeHtml(gm.name)}</span>
         </span>
       </label>
     `).join('');
+  }
 
-    const radios = queueContainer.querySelectorAll('.queue-gamemode-radio');
-    radios.forEach((radio) => {
-      radio.addEventListener('change', () => {
-        queueInput.value = radio.checked ? radio.value : '';
-      });
-    });
-
-    if (!queueInput.value && radios.length > 0) {
-      radios[0].checked = true;
-      queueInput.value = radios[0].value;
-    }
+  const playerRegionContainer = document.getElementById('playerRegionSelections');
+  if (playerRegionContainer) {
+    playerRegionContainer.innerHTML = ['NA', 'EU', 'AS', 'SA', 'AU'].map((region) =>
+      `<label class="tester-region-choice"><input type="checkbox" class="player-region-checkbox" value="${region}"> ${region}</label>`
+    ).join('');
   }
 
   const testerContainer = document.getElementById('testerGamemodeSelections');
@@ -69,6 +150,61 @@ function renderGamemodeSelectionControls() {
       </label>
     `).join('');
   }
+}
+
+function getSelectedValues(selector) {
+  return Array.from(document.querySelectorAll(selector))
+    .filter((input) => input.checked)
+    .map((input) => input.value);
+}
+
+function getSelectedPlayerQueueGamemodes() {
+  return getSelectedValues('.player-gamemode-checkbox');
+}
+
+function getSelectedPlayerQueueRegions() {
+  return getSelectedValues('.player-region-checkbox');
+}
+
+function formatQueueSelectionText(values = [], fallback = null, formatter = (value) => value) {
+  const normalizedValues = Array.isArray(values) && values.length > 0
+    ? values
+    : (fallback ? [fallback] : []);
+
+  if (!normalizedValues.length) return '-';
+  return normalizedValues.map((value) => formatter(String(value))).join(', ');
+}
+
+function calculateQueueTotals(queueStats, queueEntry) {
+  const gamemodes = Array.isArray(queueEntry?.gamemodes) && queueEntry.gamemodes.length > 0
+    ? queueEntry.gamemodes
+    : (queueEntry?.gamemode ? [queueEntry.gamemode] : []);
+  const regions = Array.isArray(queueEntry?.regions) && queueEntry.regions.length > 0
+    ? queueEntry.regions
+    : (queueEntry?.region ? [queueEntry.region] : []);
+
+  let playersInQueue = 0;
+  let availableTesters = 0;
+
+  gamemodes.forEach((gamemode) => {
+    regions.forEach((region) => {
+      playersInQueue += queueStats.playersQueued?.[gamemode]?.[region] || 0;
+      availableTesters += queueStats.testersAvailable?.[gamemode]?.[region] || 0;
+    });
+  });
+
+  return { playersInQueue, availableTesters };
+}
+
+async function getBlockedQueueCooldown(gamemodes) {
+  for (const gamemode of gamemodes) {
+    const cooldownCheck = await checkQueueCooldown(gamemode);
+    if (!cooldownCheck.allowed) {
+      return { gamemode, ...cooldownCheck };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -100,12 +236,10 @@ async function initDashboard() {
     checkUserWarnings()
   ]);
 
-  // Auto-load notification settings so users do not need to click "Load".
-  try {
-    await loadNotificationSettings();
-  } catch (error) {
-    console.warn('Notification settings auto-load failed:', error);
-  }
+  configureUnifiedQueueExperience();
+
+  await loadUserCooldowns();
+  hasLoadedQueueCooldowns = true;
 
   if (window.mclbLoadingOverlay) {
     window.mclbLoadingOverlay.updateStatus('Loading gamemode activity...', 89);
@@ -130,9 +264,9 @@ async function initDashboard() {
       await Promise.all([
         loadUserProfile(),
         checkQueueStatus(),
-        checkActiveMatch(),
-        AppState.isTierTester() ? loadTesterStatus() : Promise.resolve()
+        checkActiveMatch()
       ]);
+      configureUnifiedQueueExperience();
       // Reset on success
       consecutiveErrors = 0;
       refreshInterval = 30000;
@@ -153,23 +287,19 @@ async function initDashboard() {
   
   // Start interval (don't run immediately since we just loaded everything above)
   setInterval(refreshDashboard, refreshInterval);
+  startActiveMatchPolling();
 
   // Show tier tester application banner if user doesn't have tester role
   showTierTesterBanner();
+  renderStaffActionsSection();
 
-  // Show tester interface if applicable
-  if (AppState.isTierTester()) {
-    document.getElementById('testerCard').style.display = 'block';
-    
+  if (isTierTesterUser()) {
     // Update loading status
     if (window.mclbLoadingOverlay) {
       window.mclbLoadingOverlay.updateStatus('Loading tester data...', 90);
     }
-    
-    await Promise.all([
-      loadTesterStatus(),
-      loadTesterSettings()
-    ]);
+
+    await loadSharedQueueSettings();
 
     // Set up stay in queue setting listener
     const stayInQueueCheckbox = document.getElementById('stayInQueueAfterMatch');
@@ -179,9 +309,6 @@ async function initDashboard() {
           await apiService.updateProfile({
             stayInQueueAfterMatch: stayInQueueCheckbox.checked
           });
-          // Show brief success message
-          const originalText = stayInQueueCheckbox.checked ? 'Stay in queue after match' : 'Auto-leave after match';
-          // Could add a toast notification here if desired
         } catch (error) {
           console.error('Error saving stay in queue setting:', error);
           // Revert the checkbox on error
@@ -190,31 +317,96 @@ async function initDashboard() {
       });
     }
 
-    // Poll every 5 seconds to check if tester has been matched
-    setInterval(async () => {
-      if (document.visibilityState === 'visible') {
-        try {
-          const response = await apiService.getActiveMatch();
-          if (response.hasMatch && !activeMatch) {
-            activeMatch = response.match;
-            openTestingPage();
-            return;
-          }
-        } catch (error) {
-          // Silently fail - don't spam errors
-          console.error('Error checking for match:', error);
-        }
-      }
-    }, 5000); // Check every 5 seconds
   }
 
-  // Set up real-time notification listener
-  setupNotificationListener();
-  
   // Signal that all initial loading is complete
   if (window.mclbLoadingOverlay) {
     window.mclbLoadingOverlay.updateStatus('Dashboard ready!', 100);
   }
+}
+
+function renderStaffActionsSection() {
+  const card = document.getElementById('staffActionsCard');
+  const intro = document.getElementById('staffActionsIntro');
+  const grid = document.getElementById('staffActionsGrid');
+  if (!card || !intro || !grid) return;
+
+  const profile = AppState.getProfile?.() || AppState.userProfile || {};
+  const staffRole = profile.staffRole || null;
+  if (!staffRole) {
+    card.style.display = 'none';
+    return;
+  }
+
+  card.style.display = 'block';
+  const introIcon = staffRole.iconUrl
+    ? `<img src="${escapeHtml(staffRole.iconUrl)}" alt="${escapeHtml(staffRole.name || 'Staff')}" class="staff-role-inline-icon-image">`
+    : `<i class="${escapeHtml(staffRole.iconClass || 'fas fa-shield-alt')} staff-role-inline-icon-glyph"></i>`;
+  intro.innerHTML = `Role: <strong style="color:${escapeHtml(staffRole.color || '#38bdf8')};">${introIcon}${escapeHtml(staffRole.name || 'Staff')}</strong>`;
+
+  const actionDefs = {
+    open_admin_management: { label: 'User Management', icon: 'fa-users-cog', adminTab: 'management', run: () => openAdminTabShortcut('management') },
+    open_admin_moderation: { label: 'Blacklist & Applications', icon: 'fa-ban', adminTab: 'moderation', run: () => openAdminTabShortcut('moderation') },
+    open_admin_reports: { label: 'Reports Review', icon: 'fa-flag', adminTab: 'reported', run: () => openAdminTabShortcut('reported') },
+    open_admin_matches: { label: 'Match Manager', icon: 'fa-gamepad', adminTab: 'matches', run: () => openAdminTabShortcut('matches') },
+    open_admin_operations: { label: 'Queue & Match Ops', icon: 'fa-diagram-project', adminTab: 'operations', run: () => openAdminTabShortcut('operations') },
+    open_admin_security_scores: { label: 'Security Scores', icon: 'fa-shield-alt', adminTab: 'security-scores', run: () => openAdminTabShortcut('security-scores') },
+    open_admin_support: { label: 'Support Tickets', icon: 'fa-life-ring', adminTab: 'support', run: () => openAdminTabShortcut('support') },
+    open_admin_servers: { label: 'Whitelisted Servers', icon: 'fa-server', adminTab: 'servers', run: () => openAdminTabShortcut('servers') },
+    open_admin_staff_roles: { label: 'Staff Roles', icon: 'fa-user-shield', adminTab: 'staff-roles', run: () => openAdminTabShortcut('staff-roles') },
+    queue_open: { label: 'Join Queue', icon: 'fa-play', run: () => document.getElementById('queueForm')?.scrollIntoView({ behavior: 'smooth', block: 'center' }) },
+    queue_leave: { label: 'Leave Queue', icon: 'fa-sign-out-alt', run: () => handleLeaveQueue() },
+    queue_refresh: { label: 'Refresh Queue', icon: 'fa-sync-alt', run: () => checkQueueStatus() },
+    load_activity: { label: 'Load Activity', icon: 'fa-chart-line', run: () => window.loadGamemodeActivityOnDemand?.() },
+    load_cooldowns: { label: 'Load Cooldowns', icon: 'fa-clock', run: () => window.loadQueueCooldownsOnDemand?.() },
+    open_reports_page: { label: 'Open Reports', icon: 'fa-flag', run: () => { window.location.href = 'report.html'; } },
+    open_support_page: { label: 'Open Support', icon: 'fa-life-ring', run: () => { window.location.href = 'support.html'; } },
+    open_testing_page: { label: 'Open Testing', icon: 'fa-flask', run: () => openTestingPage() }
+  };
+
+  function openAdminTabShortcut(tab) {
+    window.location.href = `admin.html?tab=${encodeURIComponent(tab)}`;
+  }
+
+  const configuredActions = Array.isArray(staffRole.dashboardActions) ? staffRole.dashboardActions : [];
+  const visibleActions = configuredActions.filter((actionId) => {
+    const def = actionDefs[actionId];
+    if (!def) {
+      return false;
+    }
+
+    if (!def.adminTab) {
+      return true;
+    }
+
+    return isDashboardAdminTabVisible(profile, def.adminTab);
+  });
+
+  if (!visibleActions.length) {
+    grid.innerHTML = '<div class="text-muted">No accessible dashboard shortcuts are configured for this role.</div>';
+    return;
+  }
+
+  grid.innerHTML = visibleActions.map((actionId) => {
+    const def = actionDefs[actionId];
+    if (!def) return '';
+    return `
+      <button class="btn btn-secondary" type="button" onclick="runStaffDashboardAction('${escapeHtml(actionId)}')">
+        <i class="fas ${escapeHtml(def.icon)}"></i> ${escapeHtml(def.label)}
+      </button>
+    `;
+  }).join('');
+
+  window.runStaffDashboardAction = (actionId) => {
+    if (!visibleActions.includes(actionId)) return;
+    const def = actionDefs[actionId];
+    if (!def || typeof def.run !== 'function') return;
+    try {
+      def.run();
+    } catch (error) {
+      console.error('Failed running staff dashboard action:', error);
+    }
+  };
 }
 
 async function getCachedProfile({ forceRefresh = false } = {}) {
@@ -321,16 +513,6 @@ window.loadGamemodeActivityOnDemand = async function loadGamemodeActivityOnDeman
     startGamemodeStatsPolling();
   } finally {
     setButtonLoading('loadGamemodeActivityBtn', '', false);
-  }
-};
-
-window.loadTesterReputationOnDemand = async function loadTesterReputationOnDemand() {
-  if (hasLoadedTesterReputation) return;
-  setButtonLoading('loadTesterReputationBtn', 'Loading...', true);
-  try {
-    await loadTesterReputation();
-  } finally {
-    setButtonLoading('loadTesterReputationBtn', '', false);
   }
 };
 
@@ -783,9 +965,11 @@ async function loadUserProfile() {
     const profile = await getCachedProfile();
 
     AppState.setProfile(profile);
-    const regionSelect = document.getElementById('region');
-    if (regionSelect && !regionSelect.value && profile?.region) {
-      regionSelect.value = profile.region;
+    if (profile?.region) {
+      const preferredRegionCheckbox = document.querySelector(`.player-region-checkbox[value="${profile.region}"]`);
+      if (preferredRegionCheckbox) {
+        preferredRegionCheckbox.checked = true;
+      }
     }
   } catch (error) {
     console.error('Error loading profile:', error);
@@ -800,6 +984,7 @@ let joinQueueCooldownUntil = 0;
  */
 async function handleJoinQueue(event) {
   event.preventDefault();
+  const tierTester = isTierTesterUser();
 
   const now = Date.now();
   if (now < joinQueueCooldownUntil) {
@@ -814,23 +999,16 @@ async function handleJoinQueue(event) {
     return;
   }
 
-  let gamemode = document.getElementById('gamemode').value;
-  if (!gamemode) {
-    const selectedRadio = document.querySelector('.queue-gamemode-radio:checked');
-    if (selectedRadio?.value) {
-      gamemode = selectedRadio.value;
-      document.getElementById('gamemode').value = gamemode;
-    }
-  }
-  const region = document.getElementById('region').value;
+  const gamemodes = getSelectedPlayerQueueGamemodes();
+  const regions = getSelectedPlayerQueueRegions();
   const serverIP = (document.getElementById('serverIP').value || '').trim();
   const joinBtn = document.getElementById('joinQueueBtn');
 
-  if (!gamemode || !region || !serverIP) {
+  if (gamemodes.length === 0 || regions.length === 0 || !serverIP) {
     Swal.fire({
       icon: 'warning',
       title: 'Missing Fields',
-      text: 'Please select a gamemode, region, and server before joining queue.'
+      text: 'Please select at least one gamemode, one region, and a server before joining queue.'
     });
     return;
   }
@@ -851,26 +1029,43 @@ async function handleJoinQueue(event) {
     return;
   }
 
-  // Check 48-hour cooldown
-  const cooldownCheck = await checkQueueCooldown(gamemode);
-  if (!cooldownCheck.allowed) {
-    const timeLeft = formatTimeLeft(cooldownCheck.timeLeft);
-    const reason = cooldownCheck.reason || 'You recently participated in a match in this gamemode.';
-    Swal.fire({
-      icon: 'warning',
-      title: 'Queue Cooldown Active',
-      html: `<p>${reason}</p><br>You can join the <strong>${gamemode.toUpperCase()}</strong> queue again in:<br><br><div style="font-size: 1.2em; font-weight: bold; color: var(--accent-color);">${timeLeft}</div>`,
-      confirmButtonText: 'OK'
-    });
-    return;
+  if (!tierTester) {
+    const cooldownCheck = await getBlockedQueueCooldown(gamemodes);
+    if (cooldownCheck) {
+      const timeLeft = formatTimeLeft(cooldownCheck.timeLeft);
+      const reason = cooldownCheck.reason || 'You recently participated in a match in this gamemode.';
+      Swal.fire({
+        icon: 'warning',
+        title: 'Queue Cooldown Active',
+        html: `<p>${reason}</p><br>You can join the <strong>${cooldownCheck.gamemode.toUpperCase()}</strong> queue again in:<br><br><div style="font-size: 1.2em; font-weight: bold; color: var(--accent-color);">${timeLeft}</div>`,
+        confirmButtonText: 'OK'
+      });
+      return;
+    }
   }
 
   joinBtn.disabled = true;
-  joinBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Joining...';
+  joinBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${tierTester ? 'Joining as tester...' : 'Joining...'}`;
 
   try {
-    const response = await apiService.joinQueue(gamemode, region, serverIP);
-    const isRegularPlayer = !(typeof AppState !== 'undefined' && AppState.isTierTester && AppState.isTierTester());
+    if (tierTester) {
+      await apiService.setTesterAvailability(true, gamemodes, regions, serverIP);
+
+      const stayInQueueCheckbox = document.getElementById('stayInQueueAfterMatch');
+      if (stayInQueueCheckbox) {
+        await apiService.updateProfile({
+          stayInQueueAfterMatch: stayInQueueCheckbox.checked
+        });
+      }
+
+      localStorage.setItem('queueJoinTime', Date.now());
+      localStorage.setItem('queueGamemode', JSON.stringify(gamemodes));
+      localStorage.setItem('queueRegion', JSON.stringify(regions));
+      window.location.reload();
+      return;
+    }
+
+    const response = await apiService.joinQueue(gamemodes, regions, serverIP);
     
 
     if (response.matched) {
@@ -878,9 +1073,11 @@ async function handleJoinQueue(event) {
       window.location.href = `testing.html?matchId=${response.matchId}`;
       return;
     } else {
-      // Added to queue, waiting for tester
+      // Added to the unified queue and waiting for a compatible match.
       // Store queue join time for auto-kick functionality
       localStorage.setItem('queueJoinTime', Date.now());
+      localStorage.setItem('queueGamemode', JSON.stringify(gamemodes));
+      localStorage.setItem('queueRegion', JSON.stringify(regions));
       window.location.reload();
       return;
     }
@@ -927,7 +1124,7 @@ async function handleJoinQueue(event) {
     }
   } finally {
     joinBtn.disabled = false;
-    joinBtn.innerHTML = '<i class="fas fa-play"></i> Join Queue';
+    joinBtn.innerHTML = `<i class="fas fa-play"></i> ${getJoinQueueButtonLabel()}`;
     updateJoinQueueButtonState();
   }
 }
@@ -946,7 +1143,7 @@ function updateJoinQueueButtonState() {
     joinBtn.innerHTML = `<i class="fas fa-clock"></i> Wait ${remaining}s`;
   } else {
     joinBtn.disabled = false;
-    joinBtn.innerHTML = '<i class="fas fa-play"></i> Join Queue';
+    joinBtn.innerHTML = `<i class="fas fa-play"></i> ${getJoinQueueButtonLabel()}`;
   }
 }
 
@@ -983,14 +1180,14 @@ async function checkQueueStatus() {
     if (status.inQueue) {
       document.getElementById('queueForm').style.display = 'none';
       document.getElementById('queueStatus').style.display = 'block';
-      document.getElementById('queueGamemode').textContent = status.queueEntry.gamemode.toUpperCase();
-      document.getElementById('queueRegion').textContent = status.queueEntry.region;
+      document.getElementById('queueGamemode').textContent = formatQueueSelectionText(status.queueEntry.gamemodes, status.queueEntry.gamemode, (value) => value.toUpperCase());
+      document.getElementById('queueRegion').textContent = formatQueueSelectionText(status.queueEntry.regions, status.queueEntry.region);
 
       // Start waiting timer
       startQueueWaitingTimer(status.queueEntry);
 
       // Update queue statistics
-      await updateQueueStatistics(status.queueEntry);
+      await updateQueueStatistics(status);
 
       // Check for auto-kick after 5 minutes if no testers available
       checkQueueTimeout(status.queueEntry);
@@ -1007,6 +1204,7 @@ async function checkQueueStatus() {
       // Clear stored queue data when not in queue
       localStorage.removeItem('queueJoinTime');
       localStorage.removeItem('queueGamemode');
+      localStorage.removeItem('queueRegion');
     }
   } catch (error) {
     console.error('Error checking queue status:', error);
@@ -1042,19 +1240,94 @@ function startQueueWaitingTimer(queueEntry) {
 /**
  * Update queue statistics display
  */
-async function updateQueueStatistics(queueEntry) {
+async function updateQueueStatistics(queueState) {
   try {
+    const queueEntry = queueState?.queueEntry || queueState;
+    const queueSummary = queueState?.queueSummary || null;
+
+    if (queueSummary) {
+      const playersInQueue = Number(queueSummary.compatiblePlayers || 0);
+      const availableTesters = Number(queueSummary.compatibleTesters || 0);
+      const rolePreference = queueSummary.rolePreference === 'tester' ? 'tester' : 'player';
+      const position = Math.max(1, Number(queueSummary.yourPosition || 1));
+      const etaMinutes = Number.isFinite(Number(queueSummary.estimatedWaitMinutes))
+        ? Math.max(1, Number(queueSummary.estimatedWaitMinutes))
+        : null;
+
+      document.getElementById('queuePlayersCount').textContent = playersInQueue;
+      document.getElementById('queueAvailableTesters').textContent = availableTesters;
+      document.getElementById('queuePosition').textContent = position;
+
+      const statusTextEl = document.getElementById('queueStatusText');
+      const etaEl = document.getElementById('queueEta');
+      const gamemodes = Array.isArray(queueEntry?.gamemodes) && queueEntry.gamemodes.length > 0
+        ? queueEntry.gamemodes
+        : (queueEntry?.gamemode ? [queueEntry.gamemode] : []);
+      const gamemodeName = formatQueueSelectionText(gamemodes, null, (value) => {
+        const gamemode = CONFIG.GAMEMODES.find((gm) => gm.id === value);
+        return gamemode?.name || value.toUpperCase();
+      });
+
+      if (rolePreference === 'tester') {
+        if (playersInQueue > 0) {
+          if (statusTextEl) {
+            statusTextEl.innerHTML = `Compatible players are queued for ${gamemodeName}`;
+            statusTextEl.style.color = 'var(--success-color)';
+          }
+          if (etaEl) {
+            etaEl.textContent = etaMinutes ? `~${etaMinutes} min` : 'Calculating...';
+          }
+        } else {
+          if (statusTextEl) {
+            statusTextEl.innerHTML = `Waiting for a compatible player in ${gamemodeName}...`;
+            statusTextEl.style.color = 'var(--warning-color)';
+          }
+          if (etaEl) {
+            etaEl.textContent = 'No players queued';
+          }
+        }
+      } else if (availableTesters > 0) {
+        if (statusTextEl) {
+          statusTextEl.innerHTML = `Compatible tier testers are queued for ${gamemodeName}`;
+          statusTextEl.style.color = 'var(--success-color)';
+        }
+        if (etaEl) {
+          etaEl.textContent = etaMinutes ? `~${etaMinutes} min` : 'Calculating...';
+        }
+      } else {
+        if (statusTextEl) {
+          statusTextEl.innerHTML = `Waiting for a compatible tier tester in ${gamemodeName}...`;
+          statusTextEl.style.color = 'var(--warning-color)';
+        }
+        if (etaEl) {
+          etaEl.textContent = 'No tier testers queued';
+        }
+      }
+
+      return;
+    }
+
     // Get queue stats
     const queueStats = await apiService.getQueueStats();
-    const gamemode = queueEntry.gamemode;
-    const region = queueEntry.region;
+    const gamemodes = Array.isArray(queueEntry?.gamemodes) && queueEntry.gamemodes.length > 0
+      ? queueEntry.gamemodes
+      : (queueEntry?.gamemode ? [queueEntry.gamemode] : []);
+    const regions = Array.isArray(queueEntry?.regions) && queueEntry.regions.length > 0
+      ? queueEntry.regions
+      : (queueEntry?.region ? [queueEntry.region] : []);
 
-    // Players in queue for this gamemode/region
-    const playersInQueue = queueStats.playersQueued?.[gamemode]?.[region] || 0;
+    if (!gamemodes.length || !regions.length) {
+      document.getElementById('queuePlayersCount').textContent = '-';
+      document.getElementById('queueAvailableTesters').textContent = '-';
+      document.getElementById('queuePosition').textContent = '-';
+      const etaElMissing = document.getElementById('queueEta');
+      if (etaElMissing) etaElMissing.textContent = '-';
+      return;
+    }
+
+    const { playersInQueue, availableTesters } = calculateQueueTotals(queueStats, queueEntry);
     document.getElementById('queuePlayersCount').textContent = playersInQueue;
 
-    // Available testers for this gamemode/region
-    const availableTesters = queueStats.testersAvailable?.[gamemode]?.[region] || 0;
     document.getElementById('queueAvailableTesters').textContent = availableTesters;
 
     // Calculate approximate queue position (simplified)
@@ -1065,11 +1338,14 @@ async function updateQueueStatistics(queueEntry) {
     const statusTextEl = document.getElementById('queueStatusText');
     const etaEl = document.getElementById('queueEta');
     
-    const gamemodeName = CONFIG.GAMEMODES.find(gm => gm.id === gamemode)?.name || gamemode.toUpperCase();
+    const gamemodeName = formatQueueSelectionText(gamemodes, null, (value) => {
+      const gamemode = CONFIG.GAMEMODES.find((gm) => gm.id === value);
+      return gamemode?.name || value.toUpperCase();
+    });
     
     if (availableTesters > 0) {
       if (statusTextEl) {
-        statusTextEl.innerHTML = `Searching for available ${gamemodeName} testers`;
+        statusTextEl.innerHTML = `Compatible tier testers are queued for ${gamemodeName}`;
         statusTextEl.style.color = 'var(--success-color)';
       }
       if (etaEl) {
@@ -1078,11 +1354,11 @@ async function updateQueueStatistics(queueEntry) {
       }
     } else {
       if (statusTextEl) {
-        statusTextEl.innerHTML = `Waiting for Tester in ${gamemodeName}...`;
+        statusTextEl.innerHTML = `Waiting for a compatible tier tester in ${gamemodeName}...`;
         statusTextEl.style.color = 'var(--warning-color)';
       }
       if (etaEl) {
-        etaEl.textContent = 'No testers online';
+        etaEl.textContent = 'No tier testers queued';
       }
     }
 
@@ -1102,20 +1378,19 @@ async function updateQueueStatistics(queueEntry) {
  */
 async function checkQueueTimeout(queueEntry) {
   const joinTime = localStorage.getItem('queueJoinTime');
-  if (!joinTime || !queueEntry || !queueEntry.gamemode) return;
+  if (!joinTime || !queueEntry) return;
 
   const elapsed = Date.now() - parseInt(joinTime);
   const fiveMinutes = 5 * 60 * 1000; // 5 minutes in milliseconds
 
   if (elapsed >= fiveMinutes) {
     try {
-      // Check if there are any testers available for this gamemode
-      const stats = await apiService.getDashboardStats();
-      const testersAvailableForGamemode = stats.testersAvailable[queueEntry.gamemode] || 0;
+      const stats = await apiService.getQueueStats();
+      const { availableTesters } = calculateQueueTotals(stats, queueEntry);
 
-      if (testersAvailableForGamemode === 0) {
-        // No testers available and been waiting 5+ minutes - auto leave queue
-        console.log('Auto-kicking from queue: no testers available for 5+ minutes');
+      if (availableTesters === 0) {
+        // No testers queued and been waiting 5+ minutes - auto leave queue
+        console.log('Auto-kicking from queue: no tier testers queued for 5+ minutes');
 
         await apiService.leaveQueue();
         const isRegularPlayer = !(typeof AppState !== 'undefined' && AppState.isTierTester && AppState.isTierTester());
@@ -1123,11 +1398,12 @@ async function checkQueueTimeout(queueEntry) {
         // Clear stored queue data
         localStorage.removeItem('queueJoinTime');
         localStorage.removeItem('queueGamemode');
+        localStorage.removeItem('queueRegion');
 
         Swal.fire({
           icon: 'info',
           title: 'Auto-Left Queue',
-          text: 'You were automatically removed from the queue because no testers were available for 5 minutes.',
+          text: 'You were automatically removed from the queue because no compatible tier testers were queued for 5 minutes.',
           confirmButtonText: 'OK'
         });
 
@@ -1205,8 +1481,10 @@ async function checkActiveMatch() {
           <h4><i class="fas fa-gamepad"></i> Match Found!</h4>
           <p><strong>Gamemode:</strong> ${activeMatch.gamemode.toUpperCase()}</p>
           <p><strong>Opponent:</strong> ${escapeHtml(opponent)}</p>
+          <p><strong>Your Role:</strong> ${isPlayer ? 'Player' : 'Tier Tester'}</p>
           <p><strong>Region:</strong> ${activeMatch.region}</p>
           <p><strong>Server IP:</strong> ${escapeHtml(activeMatch.serverIP)}</p>
+          ${activeMatch.roleAssignment?.explanation ? `<p><strong>Role Assignment:</strong> ${escapeHtml(isPlayer ? (activeMatch.roleAssignment.playerReason || activeMatch.roleAssignment.explanation) : (activeMatch.roleAssignment.testerReason || activeMatch.roleAssignment.explanation))}</p>` : ''}
         </div>
         ${countdownHtml}
       `;
@@ -1219,6 +1497,19 @@ async function checkActiveMatch() {
   } catch (error) {
     console.error('Error checking active match:', error);
   }
+}
+
+function startActiveMatchPolling() {
+  if (activeMatchPollInterval) {
+    clearInterval(activeMatchPollInterval);
+  }
+
+  activeMatchPollInterval = setInterval(() => {
+    if (document.visibilityState !== 'visible') {
+      return;
+    }
+    checkActiveMatch();
+  }, DASHBOARD_ACTIVE_MATCH_POLL_MS);
 }
 
 /**
@@ -1264,167 +1555,6 @@ function openTestingPage() {
   sessionStorage.setItem('testingPageOpen', 'true');
   const url = `testing.html?matchId=${activeMatch.matchId}`;
   window.location.href = url;
-}
-
-/**
- * Handle set available (tester)
- */
-async function handleSetAvailable() {
-  const gamemodes = Array.from(document.querySelectorAll('.tester-gamemode-checkbox:checked')).map(el => el.value);
-  const regions = Array.from(document.querySelectorAll('.tester-region-checkbox:checked')).map(el => el.value);
-  const stayInQueueAfterMatch = document.getElementById('stayInQueueAfterMatch').checked;
-
-  if (gamemodes.length === 0) {
-    Swal.fire({
-      icon: 'warning',
-      title: 'Select Gamemodes',
-      text: 'Please select at least one gamemode first.'
-    });
-    return;
-  }
-
-  if (regions.length === 0) {
-    Swal.fire({
-      icon: 'warning',
-      title: 'Select Regions',
-      text: 'Please select at least one region first.'
-    });
-    return;
-  }
-
-  const btn = document.getElementById('setAvailableBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Setting...';
-
-  try {
-    // First set availability
-    await apiService.setTesterAvailability(true, gamemodes, regions);
-
-
-    // Then save the stay in queue setting
-    await apiService.updateProfile({
-      stayInQueueAfterMatch: stayInQueueAfterMatch
-    });
-
-    await Swal.fire({
-      icon: 'success',
-      title: 'Available!',
-      text: 'Waiting for players to match with...',
-      timer: 1500,
-      showConfirmButton: false
-    });
-    window.location.reload();
-    return;
-  } catch (error) {
-    const retiredError = error?.code === 'GAMEMODE_RETIRED' || error?.data?.code === 'GAMEMODE_RETIRED';
-    Swal.fire({
-      icon: retiredError ? 'warning' : 'error',
-      title: retiredError ? 'Gamemode Retired' : 'Failed',
-      text: error.message
-    });
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-check"></i> Set Available';
-  }
-}
-
-
-/**
- * Load tester status
- */
-async function loadTesterStatus() {
-  try {
-    const response = await apiService.getTesterAvailability();
-    const statusBadge = document.getElementById('currentAvailabilityStatus');
-    const statusText = document.getElementById('availabilityStatusText');
-    const testerStatusDiv = document.getElementById('testerStatus');
-
-    if (response.available) {
-      // Show status badge
-      if (statusBadge) {
-        if (statusText) {
-          const availability = response.availability || {};
-          const gmList = Array.isArray(availability.gamemodes) && availability.gamemodes.length > 0
-            ? availability.gamemodes
-            : (availability.gamemode ? [availability.gamemode] : []);
-          const regionList = Array.isArray(availability.regions) && availability.regions.length > 0
-            ? availability.regions
-            : (availability.region ? [availability.region] : []);
-          statusText.textContent = `Available for ${gmList.map(g => String(g).toUpperCase()).join(', ')} in ${regionList.join(', ')}`;
-        }
-        statusBadge.style.display = 'block';
-      }
-
-      // Restore selected checkboxes from current availability
-      const activeGamemodes = new Set(response.availability?.gamemodes || (response.availability?.gamemode ? [response.availability.gamemode] : []));
-      const activeRegions = new Set(response.availability?.regions || (response.availability?.region ? [response.availability.region] : []));
-      document.querySelectorAll('.tester-gamemode-checkbox').forEach(el => { el.checked = activeGamemodes.has(el.value); });
-      document.querySelectorAll('.tester-region-checkbox').forEach(el => { el.checked = activeRegions.has(el.value); });
-
-      // Update button to "Set Unavailable"
-      if (testerStatusDiv) {
-        testerStatusDiv.innerHTML = `
-          <button class="btn btn-danger" style="width: 100%;" onclick="handleSetUnavailable()">
-            <i class="fas fa-times"></i> Set Unavailable
-          </button>
-        `;
-      }
-    } else {
-      // Hide status badge
-      if (statusBadge) {
-        statusBadge.style.display = 'none';
-      }
-
-      // Update button to "Set Available"
-      if (testerStatusDiv) {
-        testerStatusDiv.innerHTML = `
-          <button class="btn btn-success" style="width: 100%;" onclick="handleSetAvailable()" id="setAvailableBtn">
-            <i class="fas fa-check"></i> Set Available
-          </button>
-        `;
-      }
-    }
-  } catch (error) {
-    console.error('Error loading tester status:', error);
-  }
-}
-
-/**
- * Load tester settings
- */
-async function loadTesterSettings() {
-  try {
-    const profile = await getCachedProfile();
-    if (profile.stayInQueueAfterMatch !== undefined) {
-      document.getElementById('stayInQueueAfterMatch').checked = profile.stayInQueueAfterMatch;
-    }
-  } catch (error) {
-    console.error('Error loading tester settings:', error);
-  }
-}
-
-async function loadTesterReputation() {
-  try {
-    const response = await apiService.getTesterReputation();
-    const reputation = response?.reputation;
-    if (!reputation) return;
-
-    const repCard = document.getElementById('testerReputationCard');
-    if (repCard) repCard.style.display = 'flex';
-
-    const onTimeEl = document.getElementById('testerOnTimeRate');
-    const noShowEl = document.getElementById('testerNoShowRate');
-    const avgEl = document.getElementById('testerAvgCompletion');
-    const countEl = document.getElementById('testerMatchCount');
-
-    if (onTimeEl) onTimeEl.textContent = `${reputation.onTimeRate ?? 0}%`;
-    if (noShowEl) noShowEl.textContent = `${reputation.noShowRate ?? 0}%`;
-    if (avgEl) avgEl.textContent = `${reputation.averageMatchCompletionMinutes ?? 0} min`;
-    if (countEl) countEl.textContent = `${reputation.totalMatchesEvaluated ?? 0}`;
-    hasLoadedTesterReputation = true;
-  } catch (error) {
-    console.error('Error loading tester reputation:', error);
-  }
 }
 
 /**
@@ -1616,7 +1746,7 @@ async function loadQueueCooldowns() {
     const lastQueueJoins = profile.lastQueueJoins || {};
     const lastTestCompletions = profile.lastTestCompletions || {};
     const now = new Date();
-    const cooldownMs = 48 * 60 * 60 * 1000; // 48 hours
+    const cooldownMs = 30 * 60 * 1000; // 30 minutes
 
     const activeCooldowns = [];
 
@@ -1738,7 +1868,7 @@ async function handleSetUnavailable() {
 
     await Swal.fire({
       icon: 'success',
-      title: 'Unavailable',
+      title: 'Removed from Queue',
       timer: 1500,
       showConfirmButton: false
     });
@@ -1762,12 +1892,12 @@ async function checkQueueCooldown(gamemode) {
   try {
     const profile = await getCachedProfile();
 
-    // Check for testing cooldown first (48 hours after being tested)
+    // Check for testing cooldown first (30 minutes after being tested)
     const lastTestCompletion = profile.lastTestCompletions?.[gamemode];
     if (lastTestCompletion) {
       const lastTestTime = new Date(lastTestCompletion);
       const now = new Date();
-      const testCooldownMs = 48 * 60 * 60 * 1000; // 48 hours in milliseconds
+      const testCooldownMs = 30 * 60 * 1000; // 30 minutes in milliseconds
 
       if (now - lastTestTime < testCooldownMs) {
         const timeLeft = testCooldownMs - (now - lastTestTime);
@@ -1787,7 +1917,7 @@ async function checkQueueCooldown(gamemode) {
 
     const lastJoinTime = new Date(lastQueueJoin);
     const now = new Date();
-    const cooldownMs = 48 * 60 * 60 * 1000; // 48 hours in milliseconds
+    const cooldownMs = 30 * 60 * 1000; // 30 minutes in milliseconds
 
     if (now - lastJoinTime >= cooldownMs) {
       return { allowed: true };
@@ -1825,303 +1955,7 @@ function escapeHtml(text) {
 // ===== Dashboard Stats =====
 
 /**
- * Set up realtime listener for user's queue status
- */
-function setupRealtimeQueueListener() {
-  const userId = AppState.getUserId();
-  if (!userId) return;
-
-  // Listen for queue changes for this user
-  const queueRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('queue');
-  const queueListener = queueRef
-    .orderByChild('userId')
-    .equalTo(userId)
-    .on('value', (snapshot) => {
-      try {
-        const queueData = snapshot.val();
-
-        if (queueData) {
-          // User is in queue
-          const queueEntryKey = Object.keys(queueData)[0];
-          const queueEntry = queueData[queueEntryKey];
-
-          document.getElementById('queueForm').style.display = 'none';
-          document.getElementById('queueStatus').style.display = 'block';
-          document.getElementById('queueGamemode').textContent = queueEntry.gamemode.toUpperCase();
-          document.getElementById('queueRegion').textContent = queueEntry.region;
-
-          // Start waiting timer
-          startQueueWaitingTimer(queueEntry);
-
-          // Update queue statistics
-          updateQueueStatistics(queueEntry);
-
-          // Check for auto-kick after 5 minutes if no testers available
-          checkQueueTimeout(queueEntry);
-        } else {
-          // User is not queue
-          document.getElementById('queueForm').style.display = 'block';
-          document.getElementById('queueStatus').style.display = 'none';
-
-          // Clear waiting timer
-          if (queueWaitingInterval) {
-            clearInterval(queueWaitingInterval);
-            queueWaitingInterval = null;
-          }
-
-          // Clear stored queue data when not in queue
-          localStorage.removeItem('queueJoinTime');
-          localStorage.removeItem('queueGamemode');
-        }
-      } catch (error) {
-        console.error('Error in queue realtime listener:', error);
-      }
-    });
-
-  // Also listen for tester availability changes to update stats
-  const availabilityRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('testerAvailability');
-  const availabilityListener = availabilityRef.on('value', async () => {
-    try {
-      // If user is in queue, update the statistics
-      const queueSnapshot = await (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('queue')
-        .orderByChild('userId')
-        .equalTo(userId)
-        .once('value');
-
-      if (queueSnapshot.exists()) {
-        const queueData = queueSnapshot.val();
-        const queueEntryKey = Object.keys(queueData)[0];
-        const queueEntry = queueData[queueEntryKey];
-        await updateQueueStatistics(queueEntry);
-      }
-    } catch (error) {
-      console.error('Error updating queue stats on availability change:', error);
-    }
-  });
-
-  // Store cleanup function
-  window.dashboardQueueCleanup = () => {
-    queueRef.off('value', queueListener);
-    availabilityRef.off('value', availabilityListener);
-  };
-}
-
-/**
- * Set up realtime listener for user's active matches
- */
-function setupRealtimeActiveMatchListener() {
-  const userId = AppState.getUserId();
-  if (!userId) return;
-
-  // Listen for matches where user is player
-  const playerMatchesRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('matches').orderByChild('playerId').equalTo(userId);
-  const playerMatchListener = playerMatchesRef.on('value', (snapshot) => {
-    handleMatchUpdate(snapshot, 'player');
-  });
-
-  // Listen for matches where user is tester
-  const testerMatchesRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('matches').orderByChild('testerId').equalTo(userId);
-  const testerMatchListener = testerMatchesRef.on('value', (snapshot) => {
-    handleMatchUpdate(snapshot, 'tester');
-  });
-
-  // Store listener references for cleanup
-  window.playerMatchListener = playerMatchListener;
-  window.testerMatchListener = testerMatchListener;
-}
-
-/**
- * Handle match updates for both players and testers
- */
-function handleMatchUpdate(snapshot, userRole) {
-      try {
-        const matches = snapshot.val() || {};
-        let foundActiveMatch = null;
-
-    // Find the first active, non-finalized match
-        for (const matchId in matches) {
-          const match = matches[matchId];
-          if (match.status === 'active' && !match.finalized) {
-            foundActiveMatch = { ...match, id: matchId };
-            break;
-          }
-        }
-
-        // Update active match display
-        if (foundActiveMatch) {
-          activeMatch = foundActiveMatch;
-          document.getElementById('activeMatchCard').style.display = 'block';
-
-      const userId = AppState.getUserId();
-          const isPlayer = foundActiveMatch.playerId === userId;
-          const opponent = isPlayer ? foundActiveMatch.testerUsername : foundActiveMatch.playerUsername;
-
-      // Check if this is a new match (not already displayed)
-      const wasAlreadyActive = document.getElementById('activeMatchCard').style.display !== 'none' &&
-                               document.getElementById('activeMatchCard').innerHTML.includes('Match Found!');
-
-          document.getElementById('activeMatchInfo').innerHTML = `
-            <div class="alert alert-success">
-              <h4><i class="fas fa-gamepad"></i> Match Found!</h4>
-              <p><strong>Gamemode:</strong> ${foundActiveMatch.gamemode.toUpperCase()}</p>
-              <p><strong>Opponent:</strong> ${escapeHtml(opponent)}</p>
-              <p><strong>Region:</strong> ${foundActiveMatch.region}</p>
-              <p><strong>Server IP:</strong> ${escapeHtml(foundActiveMatch.serverIP)}</p>
-            </div>
-          `;
-
-      // Open testing page immediately for new matches (both players and testers).
-      if (!wasAlreadyActive && !sessionStorage.getItem('testingPageOpen')) {
-        openTestingPage();
-        return;
-      }
-        } else {
-          // No active match
-          activeMatch = null;
-          document.getElementById('activeMatchCard').style.display = 'none';
-        }
-      } catch (error) {
-    console.error('Error in match realtime listener:', error);
-      }
-}
-
-/**
- * Set up realtime listener for user profile changes
- */
-function setupRealtimeProfileListener() {
-  const userId = AppState.getUserId();
-  if (!userId) return;
-
-  const userRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref(`users/${userId}`);
-  const profileListener = userRef.on('value', async (snapshot) => {
-    try {
-      if (snapshot.exists()) {
-        const profile = snapshot.val();
-
-        // Update AppState profile
-        AppState.setProfile(profile);
-
-        // Update cooldowns display
-        await loadQueueCooldowns();
-
-        // Update tester status if applicable
-        if (AppState.isTierTester()) {
-          await loadTesterStatus();
-        }
-
-        // Update queue status
-        await checkQueueStatus();
-      }
-    } catch (error) {
-        console.error('Error in profile realtime listener:', error);
-      }
-    });
-
-  // Store listener reference for cleanup
-  window.profileListener = profileListener;
-}
-
-/**
- * Set up realtime dashboard statistics
- */
-function setupRealtimeDashboardStats() {
-  // References to Firebase listeners for cleanup
-  let queueListener = null;
-  let matchesListener = null;
-  let availabilityListener = null;
-
-  // Aggregate data storage
-  let queueData = {};
-  let activeMatches = {};
-  let availabilityData = {};
-
-  /**
-   * Aggregate and update dashboard stats
-   */
-  function updateStatsFromRealtimeData() {
-    try {
-      // Count players queued by gamemode
-      const playersQueued = {};
-      Object.values(queueData).forEach(entry => {
-        if (entry.status === 'waiting') {
-          const gamemode = entry.gamemode;
-          if (!playersQueued[gamemode]) playersQueued[gamemode] = 0;
-          playersQueued[gamemode]++;
-        }
-      });
-
-      // Count active matches
-      const activeMatchesCount = Object.keys(activeMatches).length;
-
-      // Count testers available by gamemode
-      const testersAvailable = {};
-      Object.values(availabilityData).forEach(availability => {
-        if (availability.available) {
-          const gamemodeList = Array.isArray(availability.gamemodes) && availability.gamemodes.length > 0
-            ? availability.gamemodes
-            : (availability.gamemode ? [availability.gamemode] : []);
-          gamemodeList.forEach(gamemode => {
-            if (!testersAvailable[gamemode]) testersAvailable[gamemode] = 0;
-            testersAvailable[gamemode]++;
-          });
-        }
-      });
-
-      const stats = {
-        playersQueued,
-        testersAvailable,
-        activeMatchesCount,
-        totalQueuedPlayers: Object.values(playersQueued).reduce((sum, count) => sum + count, 0),
-        totalAvailableTesters: Object.values(testersAvailable).reduce((sum, count) => sum + count, 0)
-      };
-
-      updateDashboardStats(stats);
-
-      // Also update notification checking
-      previousStats = stats;
-
-    } catch (error) {
-      console.error('Error aggregating realtime dashboard stats:', error);
-    }
-  }
-
-  // Set up queue listener
-  const queueRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('queue');
-  queueListener = queueRef.on('value', (snapshot) => {
-    queueData = snapshot.val() || {};
-    updateStatsFromRealtimeData();
-  });
-
-  // Set up matches listener (only active matches)
-  const matchesRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('matches');
-  matchesListener = matchesRef.orderByChild('status').equalTo('active').on('value', (snapshot) => {
-    activeMatches = snapshot.val() || {};
-    updateStatsFromRealtimeData();
-  });
-
-  // Set up tester availability listener
-  const availabilityRef = (typeof getDatabase === 'function' ? getDatabase() : firebase.database()).ref('testerAvailability');
-  availabilityListener = availabilityRef.on('value', (snapshot) => {
-    availabilityData = snapshot.val() || {};
-    updateStatsFromRealtimeData();
-  });
-
-  // Return cleanup function
-  return function cleanup() {
-    if (queueListener) {
-      queueRef.off('value', queueListener);
-    }
-    if (matchesListener) {
-      matchesRef.off('value', matchesListener);
-    }
-    if (availabilityListener) {
-      availabilityRef.off('value', availabilityListener);
-    }
-  };
-}
-
-/**
- * Load dashboard statistics (fallback for initial load)
+ * Load dashboard statistics
  */
 async function loadDashboardStats() {
   try {
@@ -2172,10 +2006,10 @@ async function updateDashboardStats(stats) {
     let statusColor = '';
     
     if (testersAvailable > 0) {
-      statusText = `Available for ${gamemode.name}`;
+      statusText = `Tier tester queued for ${gamemode.name}`;
       statusColor = 'var(--success-color)';
     } else if (playersQueued > 0) {
-      statusText = `Waiting for Tester in ${gamemode.name}...`;
+      statusText = `Waiting for a tier tester in ${gamemode.name}...`;
       statusColor = 'var(--warning-color)';
     } else {
       statusText = `No Queue Activity`;
@@ -2197,7 +2031,7 @@ async function updateDashboardStats(stats) {
             <div class="gamemode-stat-value">${playersQueued}</div>
           </div>
           <div class="gamemode-stat-testers">
-            <div class="gamemode-stat-label">Available</div>
+            <div class="gamemode-stat-label">Tier Testers</div>
             <div class="gamemode-stat-value">${testersAvailable}</div>
           </div>
         </div>
@@ -2207,10 +2041,6 @@ async function updateDashboardStats(stats) {
 
   gamemodeStatsContainer.innerHTML = gamemodeStatsHtml;
 }
-
-// ===== Real-time Notification Checking =====
-
-let previousStats = null;
 
 /**
  * Toggle testing info section
@@ -2254,15 +2084,8 @@ function updateCooldownDisplays() {
 
   // Update remaining times for active cooldowns
   userCooldowns.forEach(cooldown => {
-    const lastTestedTime = new Date(cooldown.lastTested);
-    const elapsed = Date.now() - lastTestedTime;
-    const cooldownMs = 60 * 60 * 1000; // 1 hour
-    const remainingMs = cooldownMs - elapsed;
-
-    if (remainingMs > 0) {
-      cooldown.remainingMs = remainingMs;
-      }
-    });
+    cooldown.remainingMs = Math.max(0, (cooldown.remainingMs || 0) - 1000);
+  });
 
   // Remove expired cooldowns
   userCooldowns = userCooldowns.filter(cooldown => cooldown.remainingMs > 0);
@@ -2273,29 +2096,40 @@ function updateCooldownDisplays() {
   }
 
   cooldownsContainer.innerHTML = `
-    <div class="cooldown-section">
-      <h5 class="cooldown-title">
-        <i class="fas fa-clock"></i> Queue Cooldowns
-      </h5>
+    <div class="cooldown-dashboard-panel">
+      <div class="cooldown-dashboard-header">
+        <div>
+          <h5 class="cooldown-title"><i class="fas fa-clock"></i> Queue Cooldowns</h5>
+          <p class="cooldown-subtitle">Each timer shows the exact event that triggered the cooldown.</p>
+        </div>
+      </div>
       <div class="cooldown-list">
         ${userCooldowns.map(cooldown => `
-          <div class="cooldown-item">
-            <div class="cooldown-info">
-              <span class="cooldown-gamemode">${cooldown.gamemode.toUpperCase()}</span>
+          <div class="cooldown-item cooldown-item-detailed">
+            <div class="cooldown-info cooldown-info-detailed">
+              <div>
+                <span class="cooldown-gamemode">${cooldown.gamemode.toUpperCase()}</span>
+                <div class="cooldown-trigger-label">${escapeHtml(cooldown.eventLabel || 'Cooldown active')}</div>
+              </div>
               <span class="cooldown-timer" id="cooldown-${cooldown.gamemode}">${formatTimeRemaining(cooldown.remainingMs)}</span>
             </div>
             <div class="cooldown-progress">
-              <div class="cooldown-progress-bar" style="width: ${(cooldown.remainingMs / (60 * 60 * 1000)) * 100}%"></div>
+              <div class="cooldown-progress-bar" style="width: ${(cooldown.remainingMs / (30 * 60 * 1000)) * 100}%"></div>
             </div>
+            <div class="cooldown-meta-row">
+              <span><strong>Triggered:</strong> ${cooldown.startedAt ? new Date(cooldown.startedAt).toLocaleString() : 'Unknown'}</span>
+              <span><strong>Expires:</strong> ${cooldown.expiresAt ? new Date(cooldown.expiresAt).toLocaleString() : 'Unknown'}</span>
+            </div>
+            <div class="cooldown-reason-text">${escapeHtml(cooldown.reason || 'Cooldown active')}</div>
           </div>
         `).join('')}
       </div>
       <div class="cooldown-note">
-        <small>You cannot queue for these gamemodes until the cooldown expires</small>
+        <small>You cannot queue as the player for these gamemodes until the cooldown expires.</small>
       </div>
     </div>
   `;
-  }
+}
 
 /**
  * Load user cooldowns from backend
@@ -2334,135 +2168,15 @@ function getCooldownTimeRemaining(gamemode) {
  * Format time remaining as MM:SS
  */
 function formatTimeRemaining(ms) {
-  if (ms <= 0) return '00:00';
+  if (ms <= 0) return '00:00:00';
 
   const totalSeconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
 
-  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
-
-// ===== Firebase Connection Management =====
-
-let connectionCleanupTimers = {};
-let pageVisibilityListener = null;
-
-/**
- * Initialize connection management
- */
-function initConnectionManagement() {
-  // Listen for page visibility changes
-  pageVisibilityListener = () => {
-    if (document.hidden) {
-      // Page became hidden, start cleanup timers
-      startConnectionCleanupTimers();
-    } else {
-      // Page became visible, restart connections
-      restartRealtimeConnections();
-    }
-  };
-
-  document.addEventListener('visibilitychange', pageVisibilityListener);
-
-  // Initial state
-  if (document.hidden) {
-    startConnectionCleanupTimers();
-  }
-}
-
-/**
- * Start cleanup timers for inactive connections
- */
-function startConnectionCleanupTimers() {
-  // Clean up after 3 minutes of inactivity
-  const cleanupDelay = 3 * 60 * 1000; // 3 minutes
-
-  // Queue connections
-  if (window.dashboardQueueCleanup) {
-    connectionCleanupTimers.queue = setTimeout(() => {
-      console.log('Cleaning up queue realtime connections due to inactivity');
-      if (window.dashboardQueueCleanup) {
-        window.dashboardQueueCleanup();
-        window.dashboardQueueCleanup = null;
-    }
-    }, cleanupDelay);
-  }
-
-  // Match connections
-  if (window.dashboardStatsCleanup) {
-    connectionCleanupTimers.stats = setTimeout(() => {
-      console.log('Cleaning up stats realtime connections due to inactivity');
-      if (window.dashboardStatsCleanup) {
-        window.dashboardStatsCleanup();
-        window.dashboardStatsCleanup = null;
-      }
-    }, cleanupDelay);
-  }
-}
-
-/**
- * Restart realtime connections when page becomes active
- */
-function restartRealtimeConnections() {
-  // Clear any pending cleanup timers
-  Object.values(connectionCleanupTimers).forEach(timer => clearTimeout(timer));
-  connectionCleanupTimers = {};
-
-  // Restart connections if they were cleaned up
-  if (!window.dashboardQueueCleanup) {
-    console.log('Restarting queue realtime connections');
-    setupRealtimeQueueListener();
-  }
-
-  if (!window.dashboardStatsCleanup) {
-    console.log('Restarting stats realtime connections');
-    setupRealtimeDashboardStats();
-  }
-}
-
-/**
- * Cleanup connection management
- */
-function cleanupConnectionManagement() {
-  if (pageVisibilityListener) {
-    document.removeEventListener('visibilitychange', pageVisibilityListener);
-  }
-
-  Object.values(connectionCleanupTimers).forEach(timer => clearTimeout(timer));
-  connectionCleanupTimers = {};
-}
-
-// Stats are now updated in real-time, no polling needed
-
-// Clean up realtime listeners when page unloads
-window.addEventListener('beforeunload', () => {
-  // Best-effort cleanup for optional realtime listeners (if enabled elsewhere)
-  try {
-    if (window.dashboardStatsCleanup) {
-      window.dashboardStatsCleanup();
-    }
-    if (typeof getDatabase === 'function' || (typeof firebase !== 'undefined' && firebase?.database)) {
-      const db = typeof getDatabase === 'function' ? getDatabase() : firebase.database();
-      // Clean up match listeners
-      if (window.playerMatchListener) {
-        const playerMatchesRef = db.ref('matches').orderByChild('playerId').equalTo(AppState.getUserId());
-        playerMatchesRef.off('value', window.playerMatchListener);
-      }
-      if (window.testerMatchListener) {
-        const testerMatchesRef = db.ref('matches').orderByChild('testerId').equalTo(AppState.getUserId());
-        testerMatchesRef.off('value', window.testerMatchListener);
-      }
-      if (window.profileListener) {
-        const userRef = db.ref(`users/${AppState.getUserId()}`);
-        userRef.off('value', window.profileListener);
-      }
-    }
-  } catch (e) {
-    // ignore
-  }
-});
-
 
 /**
  * Check for user warnings and display them
@@ -2642,50 +2356,13 @@ async function loadAvailablePlayersForTesting(gamemode) {
   const availablePlayersList = document.getElementById('availablePlayersList');
   const noAvailablePlayers = document.getElementById('noAvailablePlayers');
 
-  availablePlayersSection.style.display = 'block';
-  availablePlayersList.innerHTML = '<div class="spinner"></div><p class="text-muted mt-2">Loading available players...</p>';
-  noAvailablePlayers.style.display = 'none';
-
-  try {
-    // Get players from HT3 testing queue for this gamemode
-    const ht3QueueRef = db.ref('ht3TestingQueue');
-    const snapshot = await ht3QueueRef.once('value');
-    const ht3Queue = snapshot.val() || {};
-
-    // Filter players for this gamemode
-    const availablePlayers = Object.values(ht3Queue).filter(player =>
-      player.gamemode === gamemode && player.status === 'eligible'
-    );
-
-    if (availablePlayers.length === 0) {
-      noAvailablePlayers.style.display = 'block';
-      availablePlayersList.innerHTML = '';
-      return;
-    }
-
-    // Display available players
-    availablePlayersList.innerHTML = availablePlayers.map(player => `
-      <div class="card mb-3">
-        <div class="card-body">
-          <div class="row align-items-center">
-            <div class="col-md-6">
-              <h5 class="mb-1">${escapeHtml(player.username)}</h5>
-              <p class="text-muted mb-0">Passed evaluation: ${new Date(player.evaluationPassedAt).toLocaleDateString()}</p>
-            </div>
-            <div class="col-md-6 text-right">
-              <button class="btn btn-success btn-sm" onclick="startHT3Test('${player.playerId}', '${gamemode}', '${player.username}')">
-                <i class="fas fa-play"></i> Start Test
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    `).join('');
-
-  } catch (error) {
-    console.error('Error loading available players:', error);
-    availablePlayersList.innerHTML = '<p class="text-danger">Error loading players. Please try again.</p>';
+  if (!availablePlayersSection || !availablePlayersList || !noAvailablePlayers) {
+    return;
   }
+
+  availablePlayersSection.style.display = 'block';
+  availablePlayersList.innerHTML = '<p class="text-muted mt-2">HT3 browser queue access has been removed. Use backend/admin tools for this flow.</p>';
+  noAvailablePlayers.style.display = 'none';
 }
 
 /**
@@ -2693,6 +2370,13 @@ async function loadAvailablePlayersForTesting(gamemode) {
  */
 async function startHT3Test(playerId, gamemode, playerUsername) {
   try {
+    await Swal.fire({
+      icon: 'info',
+      title: 'HT3 Browser Flow Disabled',
+      text: 'Direct HT3 queue access from the browser was removed for security. Use the backend or admin tools for this flow.'
+    });
+    return;
+
     const firstTo = CONFIG?.FIRST_TO?.[gamemode] || 3;
     // Confirm the test
     const result = await Swal.fire({
@@ -3049,7 +2733,7 @@ async function showTierTesterBanner() {
 /**
  * Show server selection popup
  */
-async function showServerSelectionPopup() {
+async function showServerSelectionPopup(targetInputId = 'serverIP') {
   try {
     // Fetch whitelisted servers
     const response = await apiService.getWhitelistedServers();
@@ -3066,7 +2750,7 @@ async function showServerSelectionPopup() {
     // Create server selection HTML
     const serversHtml = response.servers.map(server => `
       <div style="padding: 1rem; margin-bottom: 0.5rem; background: rgba(52, 152, 219, 0.05); border: 1px solid rgba(52, 152, 219, 0.2); border-radius: 8px; cursor: pointer; transition: all 0.2s ease;" 
-           onclick="selectServer('${escapeHtml(server.ip)}')"
+         onclick="selectServer('${escapeHtml(server.ip)}', '${escapeHtml(targetInputId)}')"
            onmouseover="this.style.background='rgba(52, 152, 219, 0.1)'; this.style.borderColor='rgba(52, 152, 219, 0.3)'"
            onmouseout="this.style.background='rgba(52, 152, 219, 0.05)'; this.style.borderColor='rgba(52, 152, 219, 0.2)'">
         <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -3109,8 +2793,8 @@ async function showServerSelectionPopup() {
 /**
  * Select a server from the popup
  */
-function selectServer(serverIp) {
-  const serverIpInput = document.getElementById('serverIP');
+function selectServer(serverIp, targetInputId = 'serverIP') {
+  const serverIpInput = document.getElementById(targetInputId);
   if (serverIpInput) {
     serverIpInput.value = serverIp;
   }

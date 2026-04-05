@@ -118,6 +118,30 @@ function deriveDatabaseUrl(serviceAccount) {
   return null;
 }
 
+function extractProjectIdFromDatabaseUrl(databaseURL) {
+  if (!databaseURL || typeof databaseURL !== 'string') {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(databaseURL);
+    const host = parsed.hostname.toLowerCase();
+    const firstLabel = host.split('.')[0] || '';
+
+    // Common forms:
+    // - <project-id>-default-rtdb.firebaseio.com
+    // - <project-id>-default-rtdb.<region>.firebasedatabase.app
+    // - <project-id>.firebaseio.com
+    if (firstLabel.endsWith('-default-rtdb')) {
+      return firstLabel.slice(0, -'-default-rtdb'.length) || null;
+    }
+
+    return firstLabel || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function loadRuntimeConfig() {
   loadDotEnv();
 
@@ -139,6 +163,14 @@ function loadRuntimeConfig() {
   const databaseURL = deriveDatabaseUrl(serviceAccount);
   if (!databaseURL) {
     throw new Error('Firebase database URL could not be determined. Set DATABASE_URL or add databaseURL to the service account config.');
+  }
+
+  const serviceProjectId = String(serviceAccount.project_id || '').trim();
+  const databaseProjectId = extractProjectIdFromDatabaseUrl(databaseURL);
+  if (serviceProjectId && databaseProjectId && serviceProjectId !== databaseProjectId) {
+    throw new Error(
+      `Firebase project mismatch: service account project_id "${serviceProjectId}" does not match DATABASE_URL project "${databaseProjectId}" (${databaseURL}).`
+    );
   }
 
   return {

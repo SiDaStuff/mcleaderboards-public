@@ -4680,7 +4680,7 @@ async function handleManualFinalization(match, result) {
   const lastQueueJoins = playerUserProfile.lastQueueJoins || {};
   lastQueueJoins[match.gamemode] = new Date().toISOString();
 
-  // 48-hour testing cooldown for the tested player
+  // 30-minute testing cooldown for the tested player
   const lastTestCompletions = playerUserProfile.lastTestCompletions || {};
   lastTestCompletions[match.gamemode] = new Date().toISOString();
 

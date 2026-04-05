@@ -1,36 +1,30 @@
 // MC Leaderboards - Database Restore Script
-// Restores database from a backup file
+// Restores the Realtime Database from the latest or a specified Firestore backup.
 
-const admin = require('firebase-admin');
-const { loadRuntimeConfig } = require('../config');
-const fs = require('fs');
-const path = require('path');
 const readline = require('readline');
-
-const { serviceAccount, config } = loadRuntimeConfig();
-
-// Initialize Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: config.databaseURL
-});
-
-const db = admin.database();
+const {
+  listRealtimeDatabaseBackups,
+  restoreRealtimeDatabaseFromFirestoreBackup
+} = require('./firestore-rtdb-backup-utils');
 
 /**
  * Restore database from backup
  */
-async function restoreDatabase(backupFile) {
+async function restoreDatabase(backupId) {
   try {
-    // Check if backup file exists
-    if (!fs.existsSync(backupFile)) {
-      console.error(`Error: Backup file not found: ${backupFile}`);
+    const backups = await listRealtimeDatabaseBackups(5);
+    if (!backups.length && !backupId) {
+      console.error('Error: No Firestore Realtime Database backups were found.');
       process.exit(1);
     }
-    
-    // Read backup file
-    console.log(`Reading backup file: ${backupFile}...`);
-    const backupData = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+
+    const selectedBackup = backupId
+      ? { backupId, createdAt: 'Unknown (loaded by id)', chunkCount: 'Unknown' }
+      : backups[0];
+
+    console.log(`Preparing to restore backup: ${selectedBackup.backupId}`);
+    console.log(`Created at: ${selectedBackup.createdAt}`);
+    console.log(`Chunks: ${selectedBackup.chunkCount}`);
     
     // Confirm restoration
     const rl = readline.createInterface({
@@ -51,9 +45,9 @@ async function restoreDatabase(backupFile) {
     
     // Restore data
     console.log('\nRestoring database...');
-    await db.ref('/').set(backupData);
+    const result = await restoreRealtimeDatabaseFromFirestoreBackup(selectedBackup.backupId);
     
-    console.log('✓ Database restored successfully!');
+    console.log(`✓ Database restored successfully from Firestore backup ${result.backupId}!`);
     process.exit(0);
   } catch (error) {
     console.error('Error restoring database:', error);
@@ -61,15 +55,9 @@ async function restoreDatabase(backupFile) {
   }
 }
 
-// Get backup file from command line argument
-const backupFile = process.argv[2];
-
-if (!backupFile) {
-  console.error('Usage: node restore-database.js <backup-file-path>');
-  console.error('Example: node restore-database.js ../../backups/backup-2024-01-15T10-00-00-000Z.json');
-  process.exit(1);
-}
+// Optional backup id from command line argument. If omitted, restore the latest Firestore backup.
+const backupId = process.argv[2] || null;
 
 // Run restore
-restoreDatabase(backupFile);
+restoreDatabase(backupId);
 
