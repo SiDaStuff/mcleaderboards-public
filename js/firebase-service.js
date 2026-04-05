@@ -155,6 +155,12 @@ function initializeFirebase() {
     }
 
     // Initialize Firebase Auth using our app.
+    if (typeof fb.auth !== 'function') {
+      console.error('Firebase Auth SDK not loaded. Ensure firebase-auth-compat.js is included.');
+      firebaseUnavailable = true;
+      if (typeof window !== 'undefined') window._mclbFirebaseUnavailable = true;
+      return false;
+    }
     firebaseAuth = fb.auth(firebaseApp);
 
     firebaseInitialized = true;
@@ -171,30 +177,10 @@ function initializeFirebase() {
 }
 
 /**
- * Wait for Firebase SDK to be available (synchronous with small delays)
- * Note: This should rarely be needed as initialization happens async
+ * Check if Firebase SDK is available (non-blocking).
+ * Returns true only if the namespace is already present – never spins.
  */
 function waitForFirebaseSync(maxWaitMs = 2000) {
-  if (getFirebaseNamespace()) {
-    return true;
-  }
-  
-  const startTime = Date.now();
-  const checkInterval = 10; // Check every 10ms
-  
-  while (!getFirebaseNamespace() && (Date.now() - startTime) < maxWaitMs) {
-    // Use a small delay to avoid blocking the thread completely
-    const now = Date.now();
-    const elapsed = now - startTime;
-    if (elapsed < maxWaitMs) {
-      // Simple delay using Date.now() comparison
-      const targetTime = now + checkInterval;
-      while (Date.now() < targetTime && !getFirebaseNamespace()) {
-        // Small delay
-      }
-    }
-  }
-  
   return !!getFirebaseNamespace();
 }
 
@@ -203,8 +189,8 @@ function waitForFirebaseSync(maxWaitMs = 2000) {
  */
 function getAuth() {
   if (!firebaseAuth) {
-    waitForFirebaseSync();
-    if (!firebaseAuth) {
+    // Try immediate init if SDK is already loaded
+    if (getFirebaseNamespace() && !firebaseAuth) {
       initializeFirebase();
     }
   }
@@ -226,8 +212,7 @@ function getDatabase() {
  */
 function getApp() {
   if (!firebaseApp) {
-    waitForFirebaseSync();
-    if (!firebaseApp) {
+    if (getFirebaseNamespace() && !firebaseApp) {
       initializeFirebase();
     }
   }

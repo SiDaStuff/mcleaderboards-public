@@ -22,15 +22,20 @@
   "dependencies": {
     "compression": "^1.8.1",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.1.5",
-    "express-slow-down": "^2.0.1",
-    "firebase-admin": "^12.5.0",
-    "helmet": "^7.1.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "express-slow-down": "^2.0.3",
+    "firebase-admin": "^13.4.0",
+    "helmet": "^8.1.0",
     "morgan": "^1.10.0",
-     "redis": "^4.6.0"
+    "redis": "^4.7.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "nodemon": "^3.1.9"
+  },
+  "overrides": {
+    "minimatch": ">=9.0.0",
+    "picomatch": ">=4.0.0",
+    "@tootallnate/once": ">=3.0.1"
   }
 }

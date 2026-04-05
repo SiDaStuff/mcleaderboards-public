@@ -352,9 +352,14 @@ async function recomputeAllSecurityScores() {
   });
 
   let computed = 0;
-  for (const userId of userIds) {
-    const score = await computeAndStoreSecurityScore(userId);
-    if (score) computed++;
+  const BATCH_SIZE = 10;
+  const userIdArray = Array.from(userIds);
+  for (let i = 0; i < userIdArray.length; i += BATCH_SIZE) {
+    const batch = userIdArray.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map((userId) => computeAndStoreSecurityScore(userId))
+    );
+    computed += results.filter((r) => r.status === 'fulfilled' && r.value).length;
   }
 
   return computed;
@@ -1701,6 +1706,8 @@ async function ensureMinecraftUuidLinkedForUser(userId, profileInput = null) {
     const normalizedCurrent = normalizeMinecraftUsername(currentUsername);
     const normalizedCanonical = normalizeMinecraftUsername(canonicalUsername);
 
+    const batchUpdates = {};
+
     for (const [playerId, player] of Object.entries(players)) {
       const normalizedPlayerUsername = normalizeMinecraftUsername(player?.username);
       const matchesUser = (player?.userId && player.userId === userId)
@@ -1708,16 +1715,16 @@ async function ensureMinecraftUuidLinkedForUser(userId, profileInput = null) {
 
       if (!matchesUser) continue;
 
-      const playerUpdates = {
-        minecraftUUID: resolvedUuid,
-        updatedAt: new Date().toISOString()
-      };
+      batchUpdates[`${playerId}/minecraftUUID`] = resolvedUuid;
+      batchUpdates[`${playerId}/updatedAt`] = new Date().toISOString();
 
       if (canonicalUsername && player?.username !== canonicalUsername) {
-        playerUpdates.username = canonicalUsername;
+        batchUpdates[`${playerId}/username`] = canonicalUsername;
       }
+    }
 
-      await playersRef.child(playerId).update(playerUpdates);
+    if (Object.keys(batchUpdates).length > 0) {
+      await playersRef.update(batchUpdates);
     }
 
     return {
