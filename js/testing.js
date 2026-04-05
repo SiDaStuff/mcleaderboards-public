@@ -162,7 +162,7 @@ async function loadMatch() {
     updateBothJoinedStatus();
   } catch (error) {
     console.error('Error loading match:', error);
-    showCustomModal('Error', error.message || 'Failed to load match. Please refresh the page and try again.', null);
+    showCustomModal('Error', escapeHtml(error.message || 'Failed to load match. Please refresh the page and try again.'), null);
   }
 }
 
@@ -404,14 +404,14 @@ async function handleMarkMatchStarted() {
     } else {
       btn.disabled = false;
       btn.textContent = '<i class="fas fa-play"></i> Mark Match as Started';
-      showCustomModal('Error', result.message || 'Failed to mark match as started', null);
+      showCustomModal('Error', escapeHtml(result.message || 'Failed to mark match as started'), null);
     }
   } catch (error) {
     console.error('Error marking match as started:', error);
     const btn = document.getElementById('markStartedBtn');
     btn.disabled = false;
     btn.textContent = '<i class="fas fa-play"></i> Mark Match as Started';
-    showCustomModal('Error', error.message || 'Error marking match as started', null);
+    showCustomModal('Error', escapeHtml(error.message || 'Error marking match as started'), null);
   }
 }
 

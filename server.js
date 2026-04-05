@@ -3107,7 +3107,7 @@ function scheduleMatchTimer(timerMap, matchId, delayMs, callback) {
     try {
       await callback();
     } catch (error) {
-      console.error(`Timer execution error for match ${matchId}:`, error);
+      console.error('Timer execution error for match', matchId, ':', error);
     }
   }, delayMs);
 
@@ -3511,10 +3511,10 @@ app.post('/api/tester/availability', verifyAuthAndNotBanned, verifyTester, async
       // Trigger immediate matchmaking for this gamemode to auto-pair the tester
       setImmediate(async () => {
         try {
-          console.log(`🎯 Auto-pairing tester ${req.user.uid} for gamemode ${gamemode}`);
+          console.log('🎯 Auto-pairing tester', req.user.uid, 'for gamemode', gamemode);
           await attemptMatchmakingForGamemode(gamemode);
         } catch (error) {
-          console.error(`Error during auto-pairing for gamemode ${gamemode}:`, error);
+          console.error('Error during auto-pairing for gamemode', gamemode, ':', error);
         }
       });
 
@@ -4427,10 +4427,10 @@ async function handlePlayerJoinTimeout(matchId) {
       });
     } else {
       // Player did join, no action needed
-      console.log(`Match ${matchId}: Player joined in time, no timeout action needed`);
+      console.log('Match', matchId, ': Player joined in time, no timeout action needed');
     }
   } catch (error) {
-    console.error(`Error handling player join timeout for match ${matchId}:`, error);
+    console.error('Error handling player join timeout for match', matchId, ':', error);
   }
 }
 
@@ -4467,10 +4467,10 @@ async function handleMatchStartCountdown(matchId) {
       console.log(`Match ${matchId} auto-finalized due to not being marked as started within 5 minutes`);
     } else {
       // Match was started in time, no action needed
-      console.log(`Match ${matchId}: Match was started in time, no countdown action needed`);
+      console.log('Match', matchId, ': Match was started in time, no countdown action needed');
     }
   } catch (error) {
-    console.error(`Error handling match start countdown for match ${matchId}:`, error);
+    console.error('Error handling match start countdown for match', matchId, ':', error);
   }
 }
 
@@ -6899,7 +6899,7 @@ app.post('/api/admin/judgment-day/execute', verifyAuth, verifyAdmin, async (req,
         });
 
       } catch (error) {
-        console.error(`Error processing alt group ${report.groupId}:`, error);
+        console.error('Error processing alt group', report.groupId, ':', error);
         results.push({
           groupId: report.groupId,
           status: 'error',

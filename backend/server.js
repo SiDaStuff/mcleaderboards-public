@@ -3112,7 +3112,7 @@ async function checkBanned(req, res, next) {
 
         if (banExpires <= now) {
           // Ban has expired, remove ban fields
-          console.log(`Auto-unbanning expired ban for user: ${req.user.uid}`);
+          console.log('Auto-unbanning expired ban for user:', req.user.uid);
           await db.ref(`users/${req.user.uid}`).update({
             banned: null,
             bannedAt: null,
@@ -3524,7 +3524,7 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
 
     // Remove expired verifications
     if (expiredVerifications.length > 0) {
-      console.log(`Cleaning up ${expiredVerifications.length} expired verifications for user ${req.user.uid}`);
+      console.log('Cleaning up', expiredVerifications.length, 'expired verifications for user', req.user.uid);
       for (const key of expiredVerifications) {
         await pendingVerificationsRef.child(key).remove();
       }
@@ -4465,7 +4465,7 @@ app.post('/api/auth/register', requireRecaptcha, async (req, res) => {
       );
 
       if (reportResult) {
-        console.log(`Suspicious registration detected: ${altDetection.reason} (Group flagged ${reportResult.flagCount} times)`);
+      console.log('Suspicious registration detected:', altDetection.reason, '(Group flagged', reportResult.flagCount, 'times)');
       }
       // Continue with registration instead of blocking
     }
@@ -5658,13 +5658,13 @@ async function handleMatchStartCountdownTimeout(matchId) {
       return;
     }
 
-    console.log(`Match ${matchId}: Start countdown expired, finalizing as draw`);
+    console.log('Match', matchId, ': Start countdown expired, finalizing as draw');
     await finalizeMatchAsDrawWithoutScoring(matchId, match, {
       type: 'draw_timeout',
       reason: 'Match was not marked as started within 5 minutes.'
     });
   } catch (error) {
-    console.error(`Error handling match start countdown timeout for match ${matchId}:`, error);
+    console.error('Error handling match start countdown timeout for match', matchId, ':', error);
   }
 }
 
@@ -5673,7 +5673,7 @@ function scheduleMatchStartCountdownTimeout(matchId, delayMs = MATCH_START_TIMEO
     try {
       await handleMatchStartCountdownTimeout(matchId);
     } catch (error) {
-      console.error(`Error in scheduled match start countdown timeout for match ${matchId}:`, error);
+      console.error('Error in scheduled match start countdown timeout for match', matchId, ':', error);
     }
   }, delayMs);
 }
@@ -8047,7 +8047,7 @@ app.post('/api/match/:matchId/pagestats', verifyAuth, async (req, res) => {
     
     // FIX #2: If both players have now joined, mark timeout as handled (no need to check later)
     if (pagestats.playerJoined && pagestats.testerJoined && !match.timeoutHandled) {
-      console.log(`✅ Both players joined match ${matchId}, cancelling timeout check`);
+      console.log('Both players joined match', matchId, ', cancelling timeout check');
       await matchRef.update({ timeoutHandled: true });
     }
 
@@ -8065,10 +8065,10 @@ app.post('/api/match/:matchId/pagestats', verifyAuth, async (req, res) => {
       const PLAYER_JOIN_TIMEOUT_MS = 3 * 60 * 1000;
       setTimeout(async () => {
         try {
-          console.log(`⏰ Checking player join timeout for match ${matchId}...`);
+          console.log('⏰ Checking player join timeout for match', matchId, '...');
           await handlePlayerJoinTimeout(matchId);
         } catch (error) {
-          console.error(`❌ Error handling player join timeout for match ${matchId}:`, error);
+          console.error('Error handling player join timeout for match', matchId, ':', error);
         }
       }, PLAYER_JOIN_TIMEOUT_MS);
     }
@@ -8882,10 +8882,10 @@ async function handlePlayerJoinTimeout(matchId) {
       ]);
     } else {
       // Player did join, no action needed
-      console.log(`Match ${matchId}: Player joined in time, no timeout action needed`);
+      console.log('Match', matchId, ': Player joined in time, no timeout action needed');
     }
   } catch (error) {
-    console.error(`Error handling player join timeout for match ${matchId}:`, error);
+    console.error('Error handling player join timeout for match', matchId, ':', error);
   }
 }
 
@@ -9280,9 +9280,9 @@ async function handleManualFinalization(match, result) {
 
   // Check for zero rating changes (shouldn't happen unless it's a draw)
   if (playerResult.ratingChange === 0 && testerResult.ratingChange === 0) {
-    console.error(`[FINALIZATION] ERROR: Both players got 0 rating change! Match ${match.matchId}`);
-    console.error(`[FINALIZATION] Player: ${playerRating} (RD: ${playerRDUpdated}), Tester: ${testerRating} (RD: ${testerRDUpdated})`);
-    console.error(`[FINALIZATION] Score: ${playerScore}-${testerScore}, Glicko2Score: ${playerGlicko2Score}`);
+    console.error('[FINALIZATION] ERROR: Both players got 0 rating change! Match', match.matchId);
+    console.error('[FINALIZATION] Player:', playerRating, 'RD:', playerRDUpdated, 'Tester:', testerRating, 'RD:', testerRDUpdated);
+    console.error('[FINALIZATION] Score:', playerScore + '-' + testerScore, 'Glicko2Score:', playerGlicko2Score);
   }
 
   // Get title changes
@@ -9297,7 +9297,7 @@ async function handleManualFinalization(match, result) {
   // Check for rating manipulation before updating (ToS Section 5)
   const manipulationCheck = await detectRatingManipulation(match.playerId, match.gamemode, result);
   if (manipulationCheck.suspicious && manipulationCheck.severity === 'high') {
-    console.warn(`[SECURITY] Rating manipulation detected for user ${match.playerId}:`, manipulationCheck.patterns);
+    console.warn('[SECURITY] Rating manipulation detected for user', match.playerId, ':', manipulationCheck.patterns);
     // Check and flag account if needed
     await checkAndFlagSuspiciousAccount(match.playerId);
   }
@@ -9305,7 +9305,7 @@ async function handleManualFinalization(match, result) {
   // Check for match rigging (ToS Section 4)
   const riggingCheck = await detectMatchRigging(match, result);
   if (riggingCheck.suspicious && riggingCheck.severity === 'high') {
-    console.warn(`[SECURITY] Match rigging detected for match ${match.matchId}:`, riggingCheck.patterns);
+    console.warn('[SECURITY] Match rigging detected for match', match.matchId, ':', riggingCheck.patterns);
     // Flag both accounts for review
     await checkAndFlagSuspiciousAccount(match.playerId);
     await checkAndFlagSuspiciousAccount(match.testerId);
@@ -9316,12 +9316,12 @@ async function handleManualFinalization(match, result) {
   const testerAnomalies = await detectAccountAnomalies(match.testerId);
   
   if (playerAnomalies.suspicious && playerAnomalies.severity === 'high') {
-    console.warn(`[SECURITY] Account anomalies detected for player ${match.playerId}:`, playerAnomalies.anomalies);
+    console.warn('[SECURITY] Account anomalies detected for player', match.playerId, ':', playerAnomalies.anomalies);
     await checkAndFlagSuspiciousAccount(match.playerId);
   }
   
   if (testerAnomalies.suspicious && testerAnomalies.severity === 'high') {
-    console.warn(`[SECURITY] Account anomalies detected for tester ${match.testerId}:`, testerAnomalies.anomalies);
+    console.warn('[SECURITY] Account anomalies detected for tester', match.testerId, ':', testerAnomalies.anomalies);
     await checkAndFlagSuspiciousAccount(match.testerId);
   }
 
@@ -15043,7 +15043,7 @@ app.post('/api/admin/judgment-day/execute', verifyAuth, verifyAdmin, async (req,
         });
 
       } catch (error) {
-        console.error(`Error processing alt group ${report.groupId}:`, error);
+        console.error('Error processing alt group', report.groupId, ':', error);
         results.push({
           groupId: report.groupId,
           status: 'error',

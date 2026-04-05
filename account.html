@@ -1880,7 +1880,7 @@
                 const auth = getAccountAuthInstance();
                 const user = auth?.currentUser || AppState.currentUser || null;
                 const providerIds = (user?.providerData?.map(p => p.providerId) || []);
-                const hasGoogle = providerIds.includes('google.com');
+                const hasGoogle = providerIds.some(id => id === 'google.com');
 
                 const statusEl = document.getElementById('connectedAccountsStatus');
                 const btnEl = document.getElementById('linkGoogleBtn');

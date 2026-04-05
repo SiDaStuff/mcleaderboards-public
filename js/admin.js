@@ -3039,26 +3039,26 @@ document.getElementById('manualRatingForm')?.addEventListener('submit', async (e
       contentDiv.innerHTML = `
         <div class="alert alert-success">
           <h5>Ratings Updated Successfully!</h5>
-          <p><strong>Gamemode:</strong> ${CONFIG.GAMEMODES.find(g => g.id === gamemode)?.name || gamemode}</p>
-          <p><strong>Score:</strong> ${player1Score} - ${player2Score}</p>
+          <p><strong>Gamemode:</strong> ${escapeHtml(CONFIG.GAMEMODES.find(g => g.id === gamemode)?.name || gamemode)}</p>
+          <p><strong>Score:</strong> ${escapeHtml(String(player1Score))} - ${escapeHtml(String(player2Score))}</p>
           <div class="row mt-3">
             <div class="col-md-6">
               <div class="card">
                 <div class="card-body">
-                  <h6>${response.results.player1.username}</h6>
-                  <p class="mb-1">Old Rating: ${response.results.player1.oldRating}</p>
-                  <p class="mb-1">New Rating: ${response.results.player1.newRating}</p>
-                  <p class="mb-0"><strong>Change: ${response.results.player1.ratingChange > 0 ? '+' : ''}${response.results.player1.ratingChange}</strong></p>
+                  <h6>${escapeHtml(String(response.results.player1.username))}</h6>
+                  <p class="mb-1">Old Rating: ${escapeHtml(String(response.results.player1.oldRating))}</p>
+                  <p class="mb-1">New Rating: ${escapeHtml(String(response.results.player1.newRating))}</p>
+                  <p class="mb-0"><strong>Change: ${response.results.player1.ratingChange > 0 ? '+' : ''}${escapeHtml(String(response.results.player1.ratingChange))}</strong></p>
                 </div>
               </div>
             </div>
             <div class="col-md-6">
               <div class="card">
                 <div class="card-body">
-                  <h6>${response.results.player2.username}</h6>
-                  <p class="mb-1">Old Rating: ${response.results.player2.oldRating}</p>
-                  <p class="mb-1">New Rating: ${response.results.player2.newRating}</p>
-                  <p class="mb-0"><strong>Change: ${response.results.player2.ratingChange > 0 ? '+' : ''}${response.results.player2.ratingChange}</strong></p>
+                  <h6>${escapeHtml(String(response.results.player2.username))}</h6>
+                  <p class="mb-1">Old Rating: ${escapeHtml(String(response.results.player2.oldRating))}</p>
+                  <p class="mb-1">New Rating: ${escapeHtml(String(response.results.player2.newRating))}</p>
+                  <p class="mb-0"><strong>Change: ${response.results.player2.ratingChange > 0 ? '+' : ''}${escapeHtml(String(response.results.player2.ratingChange))}</strong></p>
                 </div>
               </div>
             </div>
@@ -4989,8 +4989,8 @@ async function loadSecurityScores() {
 
   try {
     const riskFilter = document.getElementById('securityRiskFilter')?.value || '';
-    const url = `/api/admin/security-scores?limit=100${riskFilter ? `&riskLevel=${encodeURIComponent(riskFilter)}` : ''}`;
-    const data = await apiService.get(url.replace('/api/', ''));
+    const url = `/admin/security-scores?limit=100${riskFilter ? `&riskLevel=${encodeURIComponent(riskFilter)}` : ''}`;
+    const data = await apiService.get(url);
 
     const scores = (data.scores || []).sort((a, b) => (b.score || 0) - (a.score || 0));
 
@@ -5062,7 +5062,7 @@ async function loadSecurityScores() {
 
 async function viewPlayerSecurityDetail(userId, username) {
   try {
-    const data = await apiService.get(`admin/security-scores/${encodeURIComponent(userId)}`);
+    const data = await apiService.get(`/admin/security-scores/${encodeURIComponent(userId)}`);
 
     const factorRows = (data.factors || []).map(f => {
       const sev = f.severity || 'medium';
