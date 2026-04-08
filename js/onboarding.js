@@ -9,6 +9,73 @@ let currentDisplayedStep = 1; // Only for UI state, not persistent
 let verificationCodeCache = null; // Cache verification code result
 let verificationCodeCacheTime = 0; // Cache timestamp
 
+// Real-time SSE connection for onboarding
+function startOnboardingSSE() {
+  const userId = AppState.currentUser?.uid || AppState.getProfile?.()?.uid;
+  if (!userId) return;
+  const sseUrl = `/api/user/${userId}/stream`;
+  const evtSource = new EventSource(sseUrl, { withCredentials: true });
+
+  evtSource.onopen = () => {
+    console.log('Onboarding SSE connected');
+  };
+  evtSource.onerror = (e) => {
+    console.warn('Onboarding SSE error', e);
+    // Optionally, try to reconnect after a delay
+  };
+
+  evtSource.addEventListener('onboarding', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.completed) {
+      showThemedPopup('Onboarding Complete!', 'You have completed onboarding. Redirecting to dashboard...');
+      setTimeout(() => { window.location.href = 'dashboard.html'; }, 2000);
+    }
+  });
+  evtSource.addEventListener('profile', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.profile) {
+      AppState.setProfile(data.profile);
+    }
+  });
+  evtSource.addEventListener('notifications', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.notifications) {
+      handleRealtimeNotifications(data.notifications);
+    }
+  });
+  evtSource.addEventListener('ping', () => {}); // Heartbeat
+}
+
+function handleRealtimeNotifications(notifications) {
+  Object.values(notifications).forEach((n) => {
+    if (!n || !n.id) return;
+    showThemedPopup(n.title || 'Notification', n.message || 'You have a new update.');
+  });
+}
+
+function showThemedPopup(title, message) {
+  if (typeof Swal !== 'undefined') {
+    Swal.fire({
+      icon: 'info',
+      title: `<span style=\"color:var(--primary-color)\">${title}</span>`,
+      html: `<div style=\"color:var(--text-color)\">${message}</div>`,
+      background: 'var(--background-color, #181a1b)',
+      color: 'var(--text-color, #e0e0e0)',
+      showConfirmButton: false,
+      timer: 4000,
+      toast: true,
+      position: 'top-end',
+      customClass: {
+        popup: 'mclb-themed-popup',
+        title: 'mclb-themed-popup-title',
+        content: 'mclb-themed-popup-content'
+      }
+    });
+  } else {
+    alert(title + '\n' + message);
+  }
+}
+
 /**
  * Generate new verification code
  */
@@ -167,6 +234,9 @@ async function initOnboarding() {
     return;
   }
 
+  // Start real-time onboarding SSE
+  startOnboardingSSE();
+
   // Check current onboarding status
   try {
     const profile = await apiService.getProfile();
@@ -202,6 +272,46 @@ async function initOnboarding() {
       console.log('Onboarding: User fully verified, showing step 3');
       currentDisplayedStep = 3;
       await showStep3();
+    } else if (profile.minecraftVerified && profile.minecraftUsername && !profile.region) {
+      // Force-linked: username verified but no region selected yet — skip to step 1 with username locked
+      console.log('Onboarding: Force-linked user detected (verified but no region), showing step 1 with username locked');
+      currentDisplayedStep = 1;
+      showStep1();
+      // Lock the username field and update the form for region-only selection
+      const usernameInput = document.getElementById('minecraftUsername');
+      if (usernameInput) {
+        usernameInput.value = profile.minecraftUsername;
+        usernameInput.disabled = true;
+        usernameInput.style.opacity = '0.7';
+      }
+      const linkBtn = document.getElementById('linkAccountBtn');
+      if (linkBtn) {
+        linkBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Continue';
+        linkBtn.onclick = async (event) => {
+          event.preventDefault();
+          const regionSelect = document.getElementById('region');
+          const region = regionSelect ? regionSelect.value : '';
+          if (!region) {
+            Swal.fire({ icon: 'warning', title: 'Region Required', text: 'Please select your gaming region to continue.' });
+            return;
+          }
+          linkBtn.disabled = true;
+          linkBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+          try {
+            await apiService.put('/users/me', { region });
+            apiService.clearCache('/users/me');
+            const updatedProfile = await apiService.getProfileQuick();
+            AppState.setProfile(updatedProfile);
+            currentDisplayedStep = 3;
+            await showStep3();
+          } catch (error) {
+            console.error('Error saving region:', error);
+            Swal.fire({ icon: 'error', title: 'Error', text: 'Failed to save region. Please try again.' });
+            linkBtn.disabled = false;
+            linkBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Continue';
+          }
+        };
+      }
     } else if (profile.minecraftUsername && profile.region) {
       console.log('Onboarding: User has Minecraft data, checking verification status');
       // Has username/region, check if there's an active verification code

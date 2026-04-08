@@ -10,6 +10,8 @@ class ApiService {
     this.cache = new Map(); // Response cache
     this.pendingRequests = new Map(); // Request deduplication
     this.cacheTimeout = 30000; // 30 seconds cache timeout
+    this.maxCacheSize = 100; // Maximum cached responses
+    this._refreshingToken = null; // Mutex for token refresh
   }
 
   formatRateLimitRetryText(retryAtMs) {
@@ -218,8 +220,13 @@ class ApiService {
                 const auth = typeof getAuth === 'function' ? getAuth() : firebase.auth();
                 const currentUser = auth.currentUser;
                 if (currentUser && retryCount < 1) {
-                  // Force refresh the token
-                  const newToken = await currentUser.getIdToken(true);
+                  // Use mutex to prevent concurrent token refreshes
+                  if (!this._refreshingToken) {
+                    this._refreshingToken = currentUser.getIdToken(true).finally(() => {
+                      this._refreshingToken = null;
+                    });
+                  }
+                  const newToken = await this._refreshingToken;
                   this.setToken(newToken);
                   console.log('Token refreshed successfully');
                   // Retry the request once with the new token
@@ -230,6 +237,7 @@ class ApiService {
                 }
               } catch (refreshError) {
                 console.error('Failed to refresh token:', refreshError);
+                this._refreshingToken = null;
                 // Redirect to login if refresh fails
                 if (typeof window !== 'undefined') {
                   window.location.href = 'login.html';
@@ -245,6 +253,11 @@ class ApiService {
         
         // Cache successful GET responses
         if (shouldCache && response.ok) {
+          // Evict oldest entries if cache is full
+          if (this.cache.size >= this.maxCacheSize) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+          }
           this.cache.set(cacheKey, {
             data: data,
             timestamp: Date.now()
@@ -404,6 +417,17 @@ class ApiService {
     if (limit) {
       params.push(`limit=${limit}`);
     }
+
+    // Pass showProvisional setting to backend
+    try {
+      const stored = localStorage.getItem('mclb_leaderboard_settings');
+      if (stored) {
+        const settings = JSON.parse(stored);
+        if (settings.showProvisional) {
+          params.push('showProvisional=true');
+        }
+      }
+    } catch (e) { /* ignore */ }
     
     endpoint += params.join('&');
     return this.get(endpoint);
@@ -1602,8 +1626,8 @@ class ApiService {
   /**
    * Admin: Resolve user report
    */
-  async resolveUserReport(reportId, notes) {
-    return this.post(`/admin/reports/user/${reportId}/resolve`, { notes });
+  async resolveUserReport(reportId, notes, action) {
+    return this.post(`/admin/reports/user/${reportId}/resolve`, { notes, action });
   }
 
   /**
@@ -1625,6 +1649,59 @@ class ApiService {
    */
   async removeSecurityWhitelist(accountId) {
     return this.delete(`/admin/security/whitelist/${accountId}`);
+  }
+
+  // ===== Inbox System =====
+
+  /**
+   * Get inbox messages for current user
+   */
+  async getInboxMessages() {
+    return this.get('/inbox/messages');
+  }
+
+  /**
+   * Get unread inbox message count
+   */
+  async getInboxUnreadCount() {
+    return this.get('/inbox/unread-count');
+  }
+
+  /**
+   * Mark an inbox message as read
+   */
+  async markInboxRead(messageId) {
+    return this.post(`/inbox/messages/${messageId}/read`);
+  }
+
+  /**
+   * Mark all inbox messages as read
+   */
+  async markAllInboxRead() {
+    return this.post('/inbox/messages/read-all');
+  }
+
+  /**
+   * Delete an inbox message
+   */
+  async deleteInboxMessage(messageId) {
+    return this.delete(`/inbox/messages/${messageId}`);
+  }
+
+  // ===== Admin Inbox & Resolve =====
+
+  /**
+   * Admin: Send message to a user's inbox
+   */
+  async adminSendInboxMessage(data) {
+    return this.post('/admin/inbox/send', data);
+  }
+
+  /**
+   * Admin: Resolve match violation (revert ratings + blacklist + notify)
+   */
+  async resolveMatchViolation(data) {
+    return this.post('/admin/resolve-violation', data);
   }
 
 }

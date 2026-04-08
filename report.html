@@ -7,6 +7,7 @@
     <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
 
     <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/animations.css">
     <link rel="stylesheet" href="assets/fonts/local-fonts.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="js/loading-overlay.js"></script>
@@ -204,20 +205,9 @@
                 </div>
 
                 <div class="card mb-4">
-                    <div class="card-header">
-                        <h2 class="card-title"><i class="fas fa-history"></i> Your Last 5 Reports</h2>
-                    </div>
-                    <div class="card-body">
-                        <div id="myRecentReportsList">
-                            <div class="spinner"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
                     <div class="card-body">
                         <div class="alert alert-info">
-                            <strong>Important:</strong> False reports may result in reporting restrictions. Submit only genuine violations.
+                            <strong>Note:</strong> You'll receive an inbox notification if action is taken on your report. False reports may result in reporting restrictions.
                         </div>
 
                         <div class="form-group">
@@ -254,7 +244,6 @@
                 <a href="support.html">Support</a>
                 <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
-                <a href="api-docs.html">API Docs</a>
             </div>
             <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
         </div>
@@ -270,6 +259,7 @@
     <script src="js/firebase-auth-service.js" defer></script>
     <script src="js/auth-guard.js" defer></script>
     <script src="js/navigation.js" defer></script>
+    <script src="js/ui-enhancements.js" defer></script>
 
     <script>
         const REPORT_TEMPLATES = [
@@ -295,6 +285,21 @@
             return status.charAt(0).toUpperCase() + status.slice(1);
         }
 
+        function formatTimeAgoShort(dateStr) {
+            if (!dateStr) return '';
+            const now = new Date();
+            const date = new Date(dateStr);
+            const seconds = Math.floor((now - date) / 1000);
+            if (seconds < 60) return 'just now';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return `${minutes}m ago`;
+            const hours = Math.floor(minutes / 60);
+            if (hours < 24) return `${hours}h ago`;
+            const days = Math.floor(hours / 24);
+            if (days < 7) return `${days}d ago`;
+            return date.toLocaleDateString();
+        }
+
         async function loadMyRecentReports() {
             const list = document.getElementById('myRecentReportsList');
             if (!list) return;
@@ -309,10 +314,13 @@
                     <div style="padding: 0.65rem 0; border-bottom: 1px solid var(--border-color);">
                         <div style="display:flex; justify-content:space-between; gap:0.5rem; align-items:center;">
                             <strong>${report.reportedPlayer || 'Unknown'}</strong>
-                            <span class="badge badge-secondary">${formatReportStatus(report.status)}</span>
+                            <span class="report-status-badge ${(report.status || 'pending').toLowerCase()}">
+                                <i class="fas ${report.status === 'resolved' ? 'fa-circle-check' : report.status === 'dismissed' ? 'fa-circle-xmark' : 'fa-clock'}"></i>
+                                ${formatReportStatus(report.status)}
+                            </span>
                         </div>
                         <div style="font-size:0.85rem; color:var(--text-muted); margin-top:0.2rem;">
-                            ${report.category || 'other'} • ${new Date(report.createdAt).toLocaleString()}
+                            ${report.category || 'other'} • ${formatTimeAgoShort(report.createdAt)}
                         </div>
                     </div>
                 `).join('');
@@ -399,6 +407,8 @@
 
                 const resp = await apiService.submitPlayerReport(reportData);
                 if (!resp?.success) throw new Error(resp?.message || 'Failed to submit report');
+
+                if (typeof Toast !== 'undefined') Toast.success('Report submitted successfully');
 
                 await Swal.fire({
                     icon: 'success',

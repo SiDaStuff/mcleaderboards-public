@@ -37,7 +37,10 @@ const ADMIN_TAB_REQUIREMENTS = {
   matches: ['matches:view'],
   operations: ['matches:view'],
   'security-scores': ['audit:view'],
-  'staff-roles': ['settings:manage']
+  'staff-roles': ['settings:manage'],
+  'resolve': ['blacklist:manage'],
+  'send-message': ['users:manage'],
+  'punish': ['blacklist:manage']
 };
 
 let staffRoleCatalog = [];
@@ -228,6 +231,8 @@ function switchTab(tab) {
     loadStaffRoles();
   } else if (tab === 'support') {
     loadSupportTickets();
+  } else if (tab === 'punish') {
+    initPunishTab();
   }
 
 }
@@ -3891,6 +3896,9 @@ if (typeof window !== 'undefined') {
   window.deleteAdminMatch = deleteAdminMatch;
   window.revertAdminMatch = revertAdminMatch;
   window.openFinalizeDialog = openFinalizeDialog;
+  window.addPunishUsername = addPunishUsername;
+  window.removePunishUsername = removePunishUsername;
+  window.executePunishment = executePunishment;
 }
 
 // NOTE: The global export block above must be closed before defining additional functions.
@@ -4486,46 +4494,107 @@ async function loadUserReports() {
     const response = await apiService.getUserReports(playerFilter, categoryFilter, statusFilter);
     
     if (!response || !response.reports) {
-      listDiv.innerHTML = '<div class="alert alert-info">No user reports found</div>';
+      listDiv.innerHTML = '<div class="empty-state"><i class="fas fa-flag empty-state-icon"></i><p class="empty-state-title">No user reports found</p><p class="empty-state-desc">Try adjusting your filters</p></div>';
       return;
     }
 
     const reports = response.reports || [];
     if (reports.length === 0) {
-      listDiv.innerHTML = '<div class="empty-state"><p class="text-muted">No user reports</p></div>';
+      listDiv.innerHTML = '<div class="empty-state"><i class="fas fa-inbox empty-state-icon"></i><p class="empty-state-title">No reports</p><p class="empty-state-desc">No user reports match the current filters</p></div>';
       return;
     }
 
-    listDiv.innerHTML = reports.map(report => `
-      <div class="card mb-3">
-        <div class="card-body">
-          <div class="row">
-            <div class="col-md-8">
-              <h5>Report against ${escapeHtml(report.reportedPlayer || 'Unknown')}</h5>
-              <p class="text-muted"><small>By: ${escapeHtml(report.reporterEmail || 'Anonymous')}</small></p>
-              <p><strong>Category:</strong> <span class="badge badge-info">${report.category || 'Other'}</span></p>
-              <p><strong>Status:</strong> <span class="badge badge-${report.status === 'pending' ? 'warning' : report.status === 'resolved' ? 'success' : 'secondary'}">${report.status || 'pending'}</span></p>
-              <p><strong>Description:</strong> ${escapeHtml((report.description || '').substring(0, 100))}...</p>
-              <p class="text-muted">Submitted: ${new Date(report.createdAt || Date.now()).toLocaleString()}</p>
-            </div>
-            <div class="col-md-4">
-              <div class="d-flex flex-column gap-2">
-                <button class="btn btn-info btn-sm" onclick="viewUserReport('${report.id}')">
-                  <i class="fas fa-eye"></i> View Details
-                </button>
-                <button class="btn btn-success btn-sm" onclick="markUserReportResolved('${report.id}')">
-                  <i class="fas fa-check"></i> Mark Resolved
-                </button>
+    const pendingCount = reports.filter(r => r.status === 'pending').length;
+    const resolvedCount = reports.filter(r => r.status === 'resolved').length;
+
+    listDiv.innerHTML = `
+      <div style="display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap;">
+        <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 8px; padding: 0.5rem 0.85rem; font-size: 0.85rem;">
+          <i class="fas fa-clock" style="color: #f59e0b;"></i> <strong>${pendingCount}</strong> pending
+        </div>
+        <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px; padding: 0.5rem 0.85rem; font-size: 0.85rem;">
+          <i class="fas fa-check-circle" style="color: #10b981;"></i> <strong>${resolvedCount}</strong> resolved
+        </div>
+        <div style="background: rgba(139, 148, 158, 0.12); border: 1px solid rgba(139, 148, 158, 0.3); border-radius: 8px; padding: 0.5rem 0.85rem; font-size: 0.85rem;">
+          <i class="fas fa-list" style="color: #8b949e;"></i> <strong>${reports.length}</strong> total
+        </div>
+      </div>
+    ` + reports.map((report, idx) => {
+      const statusColor = report.status === 'pending' ? '#f59e0b' : report.status === 'resolved' ? '#10b981' : '#8b949e';
+      const statusBg = report.status === 'pending' ? 'rgba(245, 158, 11, 0.12)' : report.status === 'resolved' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(139, 148, 158, 0.12)';
+      const categoryIcons = {
+        alt_account: 'fa-users', chat_abuse: 'fa-comment-slash', unfair_play: 'fa-skull-crossbones',
+        match_throwing: 'fa-hand-fist', impersonation: 'fa-user-secret', other: 'fa-question-circle'
+      };
+      const categoryIcon = categoryIcons[report.category] || 'fa-flag';
+      const hasEvidence = report.hasEvidence || (report.evidenceLinks && report.evidenceLinks.length > 0);
+      const timeAgo = formatAdminTimeAgo(report.createdAt);
+
+      return `
+      <div class="card mb-3" style="border-left: 3px solid ${statusColor}; animation: staggerFadeIn 0.3s ease forwards; animation-delay: ${idx * 0.04}s; opacity: 0;">
+        <div class="card-body" style="padding: 1rem;">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+              <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                <i class="fas ${categoryIcon}" style="color: var(--accent-color); font-size: 1.1rem;"></i>
+                <strong style="font-size: 1rem;">${escapeHtml(report.reportedPlayer || 'Unknown')}</strong>
+                <span style="background: ${statusBg}; color: ${statusColor}; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.72rem; font-weight: 600;">
+                  ${(report.status || 'pending').toUpperCase()}
+                </span>
+                ${hasEvidence ? '<span style="background: rgba(59, 130, 246, 0.12); color: #3b82f6; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.72rem; font-weight: 600;"><i class="fas fa-paperclip"></i> Evidence</span>' : ''}
               </div>
+              <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.4rem;">
+                <span style="background: var(--tertiary-bg); padding: 0.15rem 0.45rem; border-radius: 4px; font-size: 0.78rem;">${escapeHtml(report.category || 'other')}</span>
+                <span style="margin-left: 0.5rem; color: var(--text-muted);">reported by ${escapeHtml(report.reporterEmail || 'Anonymous')}</span>
+              </div>
+              <p style="font-size: 0.88rem; color: var(--text-secondary); margin: 0.4rem 0; line-height: 1.4;">${escapeHtml((report.description || '').substring(0, 200))}${(report.description || '').length > 200 ? '...' : ''}</p>
+              <div style="display: flex; gap: 0.75rem; font-size: 0.78rem; color: var(--text-muted); margin-top: 0.4rem; flex-wrap: wrap;">
+                <span><i class="fas fa-clock"></i> ${timeAgo}</span>
+                ${report.matchId ? `<span><i class="fas fa-gamepad"></i> Match: ${escapeHtml(report.matchId.substring(0, 12))}...</span>` : ''}
+                ${report.reviewedAt ? `<span><i class="fas fa-gavel"></i> Resolved ${formatAdminTimeAgo(report.reviewedAt)}</span>` : ''}
+                ${report.actionTaken ? `<span><i class="fas fa-bolt"></i> ${escapeHtml(report.actionTaken)}</span>` : ''}
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 0.4rem; flex-shrink: 0;">
+              <button class="btn btn-info btn-sm" onclick="viewUserReport('${report.id}')" style="font-size: 0.8rem;">
+                <i class="fas fa-eye"></i> Details
+              </button>
+              ${report.status === 'pending' ? `
+                <button class="btn btn-success btn-sm" onclick="markUserReportResolved('${report.id}')" style="font-size: 0.8rem;">
+                  <i class="fas fa-gavel"></i> Resolve
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick="dismissUserReport('${report.id}')" style="font-size: 0.78rem; background: transparent; border: 1px solid var(--border-color);">
+                  <i class="fas fa-times"></i> Dismiss
+                </button>
+              ` : ''}
             </div>
           </div>
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   } catch (error) {
     console.error('Error loading user reports:', error);
-    listDiv.innerHTML = `<div class="alert alert-error">Error loading reports: ${escapeHtml(error.message)}</div>`;
+    listDiv.innerHTML = `<div class="alert alert-error"><i class="fas fa-exclamation-triangle"></i> Error loading reports: ${escapeHtml(error.message)}</div>`;
   }
+}
+
+/**
+ * Format time ago for admin pages
+ */
+function formatAdminTimeAgo(dateStr) {
+  if (!dateStr) return 'Unknown';
+  const now = new Date();
+  const date = new Date(dateStr);
+  const seconds = Math.floor((now - date) / 1000);
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  return date.toLocaleDateString();
 }
 
 /**
@@ -4725,49 +4794,86 @@ async function viewUserReport(reportId) {
     const conversation = Array.isArray(messageReport?.conversationSnapshot) ? messageReport.conversationSnapshot : [];
     const messageDetail = messageReport?.reportedMessage || null;
 
-    await Swal.fire({
-      title: `Report Details - ${escapeHtml(report.reportedPlayer)}`,
+    const statusColor = report.status === 'pending' ? '#f59e0b' : report.status === 'resolved' ? '#10b981' : '#8b949e';
+    const statusLabel = (report.status || 'pending').toUpperCase();
+
+    const swalResult = await Swal.fire({
+      title: `Report: ${escapeHtml(report.reportedPlayer || 'Unknown')}`,
+      width: '640px',
       html: `
-        <div style="text-align: left;">
-          <p><strong>Category:</strong> ${escapeHtml(report.category)}</p>
-          <p><strong>Reported By:</strong> ${escapeHtml(report.reporterEmail || 'Anonymous')}</p>
-          <p><strong>Status:</strong> ${escapeHtml(report.status || 'pending')}</p>
-          ${report.reportedUUID ? `<p><strong>Reported UUID:</strong> ${escapeHtml(report.reportedUUID)}</p>` : ''}
-          ${report.matchId ? `<p><strong>Match ID:</strong> ${escapeHtml(report.matchId)}</p>` : ''}
-          ${report.hasEvidence ? '<p><strong>Evidence:</strong> Provided</p>' : '<p><strong>Evidence:</strong> None</p>'}
+        <div style="text-align: left; font-size: 0.9rem; line-height: 1.6;">
+          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
+            <span style="background: rgba(${report.status === 'pending' ? '245,158,11' : report.status === 'resolved' ? '16,185,129' : '139,148,158'}, 0.15); color: ${statusColor}; padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600;">${statusLabel}</span>
+            <span style="background: var(--tertiary-bg, #24292e); padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.75rem;">${escapeHtml(report.category || 'other')}</span>
+            ${report.hasEvidence || evidenceLinks.length > 0 ? '<span style="background: rgba(59,130,246,0.12); color: #3b82f6; padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600;"><i class="fas fa-paperclip"></i> Has Evidence</span>' : ''}
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 1rem; margin-bottom: 1rem; padding: 0.75rem; background: var(--tertiary-bg, #24292e); border-radius: 8px; font-size: 0.85rem;">
+            <div><strong>Reported Player:</strong> ${escapeHtml(report.reportedPlayer || 'Unknown')}</div>
+            <div><strong>Reporter:</strong> ${escapeHtml(report.reporterEmail || 'Anonymous')}</div>
+            ${report.reportedUUID ? `<div><strong>UUID:</strong> <code style="font-size: 0.78rem;">${escapeHtml(report.reportedUUID)}</code></div>` : ''}
+            ${report.matchId ? `<div><strong>Match ID:</strong> <code style="font-size: 0.78rem;">${escapeHtml(report.matchId)}</code></div>` : ''}
+            <div><strong>Submitted:</strong> ${new Date(report.createdAt).toLocaleString()}</div>
+            ${report.reviewedAt ? `<div><strong>Resolved:</strong> ${new Date(report.reviewedAt).toLocaleString()}</div>` : ''}
+          </div>
+
+          <div style="margin-bottom: 1rem;">
+            <strong>Description:</strong>
+            <div style="background: var(--tertiary-bg, #24292e); padding: 0.75rem; border-radius: 8px; margin-top: 0.35rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">${escapeHtml(report.description || 'No description provided')}</div>
+          </div>
+
           ${evidenceLinks.length > 0 ? `
-            <p><strong>Evidence Links:</strong></p>
-            <ul>
-              ${evidenceLinks.map(link => `<li><a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link)}</a></li>`).join('')}
-            </ul>
+            <div style="margin-bottom: 1rem;">
+              <strong>Evidence Links:</strong>
+              <div style="margin-top: 0.35rem;">
+                ${evidenceLinks.map(link => `<div style="padding: 0.25rem 0;"><a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; word-break: break-all;"><i class="fas fa-external-link-alt" style="font-size: 0.75rem;"></i> ${escapeHtml(link)}</a></div>`).join('')}
+              </div>
+            </div>
           ` : ''}
+
           ${messageDetail ? `
-            <p><strong>Reported Message:</strong></p>
-            <div style="background: var(--bg-color); padding: 0.75rem; border-radius: 8px; margin-bottom: 0.75rem;">
-              <p style="margin: 0 0 0.35rem 0;"><strong>${escapeHtml(messageDetail.username || 'Unknown')}:</strong> ${escapeHtml(messageDetail.text || '')}</p>
-              <small class="text-muted">${new Date(messageDetail.timestamp || Date.now()).toLocaleString()}</small>
+            <div style="margin-bottom: 1rem;">
+              <strong>Reported Message:</strong>
+              <div style="background: var(--tertiary-bg, #24292e); padding: 0.75rem; border-radius: 8px; margin-top: 0.35rem; border-left: 3px solid #ef4444;">
+                <strong>${escapeHtml(messageDetail.username || 'Unknown')}:</strong> ${escapeHtml(messageDetail.text || '')}
+                <div style="font-size: 0.78rem; color: var(--text-muted, #8b949e); margin-top: 0.25rem;">${new Date(messageDetail.timestamp || Date.now()).toLocaleString()}</div>
+              </div>
             </div>
           ` : ''}
-          <p><strong>Description:</strong></p>
-          <p style="background: var(--bg-color); padding: 1rem; border-radius: 8px;">${escapeHtml(report.description)}</p>
+
           ${conversation.length > 0 ? `
-            <p><strong>Conversation Snapshot (${conversation.length} messages):</strong></p>
-            <div style="max-height: 220px; overflow-y: auto; background: var(--bg-color); padding: 0.75rem; border-radius: 8px;">
-              ${conversation.map(msg => `
-                <div style="padding: 0.35rem 0; border-bottom: 1px solid var(--border-color);">
-                  <strong>${escapeHtml(msg.username || 'Unknown')}:</strong> ${escapeHtml(msg.text || '')}
-                  <div><small class="text-muted">${new Date(msg.timestamp || Date.now()).toLocaleString()}</small></div>
-                </div>
-              `).join('')}
+            <div style="margin-bottom: 1rem;">
+              <strong>Conversation Snapshot (${conversation.length} messages):</strong>
+              <div style="max-height: 180px; overflow-y: auto; background: var(--tertiary-bg, #24292e); padding: 0.75rem; border-radius: 8px; margin-top: 0.35rem;">
+                ${conversation.map(msg => `
+                  <div style="padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.06);">
+                    <strong>${escapeHtml(msg.username || 'Unknown')}:</strong> ${escapeHtml(msg.text || '')}
+                    <div style="font-size: 0.7rem; color: var(--text-muted, #8b949e);">${new Date(msg.timestamp || Date.now()).toLocaleString()}</div>
+                  </div>
+                `).join('')}
+              </div>
             </div>
           ` : ''}
-          ${report.reviewNotes ? `<p><strong>Review Notes:</strong> ${escapeHtml(report.reviewNotes)}</p>` : ''}
-          ${report.actionTaken ? `<p><strong>Action Taken:</strong> ${escapeHtml(report.actionTaken)}</p>` : ''}
-          <p class="text-muted"><small>Submitted: ${new Date(report.createdAt).toLocaleString()}</small></p>
+
+          ${report.reviewNotes ? `
+            <div style="margin-bottom: 0.75rem; padding: 0.75rem; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 8px;">
+              <strong><i class="fas fa-gavel"></i> Resolution Notes:</strong> ${escapeHtml(report.reviewNotes)}
+              ${report.actionTaken ? `<div style="margin-top: 0.35rem;"><strong>Action:</strong> ${escapeHtml(report.actionTaken)}</div>` : ''}
+            </div>
+          ` : ''}
         </div>
       `,
-      showConfirmButton: true
+      showConfirmButton: true,
+      confirmButtonText: report.status === 'pending' ? '<i class="fas fa-gavel"></i> Resolve This Report' : 'Close',
+      confirmButtonColor: report.status === 'pending' ? '#10b981' : '#6b7280',
+      showCancelButton: report.status === 'pending',
+      cancelButtonText: 'Close'
     });
+
+    // If admin clicked resolve on a pending report
+    if (report.status === 'pending' && swalResult?.isConfirmed) {
+      markUserReportResolved(reportId);
+    }
   } catch (error) {
     Swal.fire('Error', error.message, 'error');
   }
@@ -4779,22 +4885,90 @@ async function viewUserReport(reportId) {
 async function markUserReportResolved(reportId) {
   const result = await Swal.fire({
     icon: 'question',
-    title: 'Mark as Resolved?',
-    input: 'textarea',
-    inputLabel: 'Resolution notes',
-    inputPlaceholder: 'Enter resolution notes...',
+    title: 'Resolve Report',
+    html: `
+      <div style="text-align: left; font-size: 0.9rem;">
+        <label style="font-weight: 600; display: block; margin-bottom: 0.35rem;">Action Taken</label>
+        <select id="swal-resolve-action" class="swal2-select" style="width: 100%; padding: 0.5rem; border-radius: 6px; border: 1px solid var(--border-color, #ccc); background: var(--tertiary-bg, #24292e); color: var(--text-primary, #f3f4f6); margin-bottom: 0.75rem;">
+          <option value="reviewed">Reviewed (no action)</option>
+          <option value="warned">Warning Issued</option>
+          <option value="blacklisted">Player Blacklisted</option>
+          <option value="dismissed">Dismissed (not valid)</option>
+        </select>
+        <label style="font-weight: 600; display: block; margin-bottom: 0.35rem;">Resolution Notes</label>
+        <textarea id="swal-resolve-notes" class="swal2-textarea" placeholder="Describe what was found and what action was taken..." style="width: 100%; min-height: 80px; border-radius: 6px; border: 1px solid var(--border-color, #ccc); background: var(--tertiary-bg, #24292e); color: var(--text-primary, #f3f4f6); padding: 0.5rem; resize: vertical;"></textarea>
+        <p style="font-size: 0.78rem; color: var(--text-muted, #8b949e); margin-top: 0.35rem;">
+          <i class="fas fa-info-circle"></i> Both the reporter and reported player will receive an inbox notification about this resolution.
+        </p>
+      </div>
+    `,
     showCancelButton: true,
-    confirmButtonText: 'Resolve',
-    cancelButtonText: 'Cancel'
+    confirmButtonText: '<i class="fas fa-gavel"></i> Resolve',
+    cancelButtonText: 'Cancel',
+    confirmButtonColor: '#10b981',
+    preConfirm: () => {
+      const action = document.getElementById('swal-resolve-action')?.value || 'reviewed';
+      const notes = document.getElementById('swal-resolve-notes')?.value || '';
+      if (!notes.trim()) {
+        Swal.showValidationMessage('Please provide resolution notes');
+        return false;
+      }
+      return { action, notes };
+    }
+  });
+
+  if (!result.isConfirmed || !result.value) return;
+
+  try {
+    const response = await apiService.resolveUserReport(reportId, result.value.notes, result.value.action);
+
+    if (response.success) {
+      Swal.fire({
+        icon: 'success',
+        title: 'Report Resolved',
+        text: `Report resolved with action: ${result.value.action}. Both players have been notified.`,
+        timer: 3000,
+        showConfirmButton: false
+      });
+      loadUserReports();
+    }
+  } catch (error) {
+    Swal.fire('Error', error.message, 'error');
+  }
+}
+
+/**
+ * Dismiss a user report (mark as resolved with dismissed action)
+ */
+async function dismissUserReport(reportId) {
+  const result = await Swal.fire({
+    icon: 'warning',
+    title: 'Dismiss Report?',
+    input: 'textarea',
+    inputLabel: 'Reason for dismissal',
+    inputPlaceholder: 'Why is this report being dismissed?',
+    inputValidator: (value) => {
+      if (!value || !value.trim()) return 'Please provide a reason for dismissal';
+    },
+    showCancelButton: true,
+    confirmButtonText: '<i class="fas fa-times"></i> Dismiss',
+    cancelButtonText: 'Cancel',
+    confirmButtonColor: '#6b7280'
   });
 
   if (!result.isConfirmed) return;
 
   try {
-    const response = await apiService.resolveUserReport(reportId, result.value);
+    const response = await apiService.resolveUserReport(reportId, result.value, 'dismissed');
 
     if (response.success) {
-      Swal.fire('Success', 'Report marked as resolved', 'success');
+      Swal.fire({
+        icon: 'success',
+        title: 'Report Dismissed',
+        text: 'The reporter has been notified.',
+        timer: 2000,
+        showConfirmButton: false
+      });
       loadUserReports();
     }
   } catch (error) {
@@ -4813,6 +4987,189 @@ function supportStatusBadge(status) {
   if (status === 'closed') return '<span class="badge badge-secondary">Closed</span>';
   return `<span class="badge badge-secondary">${safe}</span>`;
 }
+
+// ===== Punish Tab =====
+
+const punishUsernames = [];
+
+function initPunishTab() {
+  renderPunishUsernames();
+  updatePunishPreview();
+}
+
+function addPunishUsername() {
+  const input = document.getElementById('punishUsernameInput');
+  const raw = (input.value || '').trim();
+  if (!raw) return;
+
+  // Basic Minecraft username validation (3-16 chars, alphanumeric + underscore)
+  if (raw.length < 3 || raw.length > 16 || /[^a-zA-Z0-9_]/.test(raw)) {
+    Swal.fire({ icon: 'warning', title: 'Invalid Username', text: 'Minecraft usernames must be 3-16 characters (letters, numbers, underscores).' });
+    return;
+  }
+
+  const normalized = raw.toLowerCase();
+  if (punishUsernames.some(u => u.toLowerCase() === normalized)) {
+    Swal.fire({ icon: 'info', title: 'Duplicate', text: 'This username is already in the list.' });
+    return;
+  }
+
+  punishUsernames.push(raw);
+  input.value = '';
+  input.focus();
+  renderPunishUsernames();
+  updatePunishPreview();
+}
+
+function removePunishUsername(index) {
+  punishUsernames.splice(index, 1);
+  renderPunishUsernames();
+  updatePunishPreview();
+}
+
+function renderPunishUsernames() {
+  const container = document.getElementById('punishUsernameList');
+  if (!container) return;
+
+  if (punishUsernames.length === 0) {
+    container.innerHTML = '<span class="text-muted" style="padding:0.5rem;">No usernames added yet</span>';
+  } else {
+    container.innerHTML = punishUsernames.map((name, i) =>
+      `<span class="punish-username-chip">
+        <i class="fas fa-user"></i> ${escapeHtml(name)}
+        <button type="button" onclick="removePunishUsername(${i})" title="Remove">&times;</button>
+      </span>`
+    ).join('');
+  }
+}
+
+function updatePunishPreview() {
+  const preview = document.getElementById('punishPreview');
+  const content = document.getElementById('punishPreviewContent');
+  const executeBtn = document.getElementById('punishExecuteBtn');
+  const reason = (document.getElementById('punishReason')?.value || '').trim();
+  const ban = document.getElementById('punishBanAccounts')?.checked;
+  const duration = document.getElementById('punishDuration')?.value;
+
+  if (punishUsernames.length === 0) {
+    preview.style.display = 'none';
+    executeBtn.disabled = true;
+    return;
+  }
+
+  executeBtn.disabled = false;
+  preview.style.display = 'block';
+
+  const durText = duration === 'permanent' ? 'Permanent' : `${Math.round(Number(duration) / 24)} days`;
+
+  content.innerHTML = `
+    <ul style="margin:0; padding-left:1.25rem; color:var(--text-color);">
+      <li><strong>${punishUsernames.length}</strong> account(s) targeted</li>
+      <li>All finalized matches will be <strong>reverted</strong></li>
+      <li>Inbox messages will be <strong>sent to all affected players</strong></li>
+      ${ban ? `<li>Accounts will be <strong>blacklisted</strong> (${escapeHtml(durText)})</li>` : '<li>Accounts will <strong>NOT</strong> be blacklisted</li>'}
+      ${reason ? `<li>Reason: <em>${escapeHtml(reason)}</em></li>` : '<li class="text-muted">No reason provided</li>'}
+    </ul>
+  `;
+}
+
+async function executePunishment() {
+  const reason = (document.getElementById('punishReason')?.value || '').trim();
+  const ban = document.getElementById('punishBanAccounts')?.checked;
+  const duration = document.getElementById('punishDuration')?.value;
+
+  if (punishUsernames.length === 0) {
+    Swal.fire({ icon: 'warning', title: 'No Usernames', text: 'Add at least one username to punish.' });
+    return;
+  }
+
+  if (!reason) {
+    Swal.fire({ icon: 'warning', title: 'Reason Required', text: 'Please provide a reason for the punishment.' });
+    return;
+  }
+
+  const durText = duration === 'permanent' ? 'permanently' : `for ${Math.round(Number(duration) / 24)} days`;
+  const confirm = await Swal.fire({
+    icon: 'warning',
+    title: 'Confirm Punishment',
+    html: `<p>This will:</p>
+      <ul style="text-align:left;">
+        <li>Revert all finalized matches for <strong>${punishUsernames.length}</strong> account(s)</li>
+        <li>Send inbox messages to all affected opponents</li>
+        ${ban ? `<li>Blacklist all accounts <strong>${durText}</strong></li>` : ''}
+      </ul>
+      <p><strong>This action cannot be undone.</strong></p>`,
+    showCancelButton: true,
+    confirmButtonText: 'Execute',
+    confirmButtonColor: '#dc3545',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!confirm.isConfirmed) return;
+
+  const executeBtn = document.getElementById('punishExecuteBtn');
+  const resultsDiv = document.getElementById('punishResults');
+  const resultsContent = document.getElementById('punishResultsContent');
+
+  executeBtn.disabled = true;
+  executeBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Executing...';
+  resultsDiv.style.display = 'block';
+  resultsContent.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const response = await apiService.post('/admin/bulk-punish', {
+      usernames: punishUsernames,
+      reason,
+      ban,
+      durationHours: duration === 'permanent' ? 0 : Number(duration)
+    });
+
+    if (response.success) {
+      const r = response.results || {};
+      let html = `<div class="alert alert-success"><i class="fas fa-check-circle"></i> Punishment executed successfully.</div>`;
+      html += `<ul style="color:var(--text-color);">`;
+      html += `<li><strong>${r.matchesReverted || 0}</strong> match(es) reverted</li>`;
+      html += `<li><strong>${r.messagesSent || 0}</strong> inbox message(s) sent</li>`;
+      html += `<li><strong>${r.accountsBlacklisted || 0}</strong> account(s) blacklisted</li>`;
+      if (r.errors && r.errors.length > 0) {
+        html += `<li class="text-danger"><strong>${r.errors.length}</strong> error(s):</li>`;
+        r.errors.forEach(e => { html += `<li class="text-muted" style="margin-left:1rem;">${escapeHtml(e)}</li>`; });
+      }
+      html += `</ul>`;
+      resultsContent.innerHTML = html;
+
+      // Clear the form
+      punishUsernames.length = 0;
+      document.getElementById('punishReason').value = '';
+      renderPunishUsernames();
+      updatePunishPreview();
+    } else {
+      throw new Error(response.message || 'Unknown error');
+    }
+  } catch (error) {
+    resultsContent.innerHTML = `<div class="alert alert-danger"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(error.message)}</div>`;
+  } finally {
+    executeBtn.disabled = false;
+    executeBtn.innerHTML = '<i class="fas fa-gavel"></i> Execute Punishment';
+  }
+}
+
+// Wire up preview updates on input changes
+document.addEventListener('DOMContentLoaded', () => {
+  const reasonInput = document.getElementById('punishReason');
+  const banCheckbox = document.getElementById('punishBanAccounts');
+  const durationSelect = document.getElementById('punishDuration');
+  const usernameInput = document.getElementById('punishUsernameInput');
+
+  if (reasonInput) reasonInput.addEventListener('input', updatePunishPreview);
+  if (banCheckbox) banCheckbox.addEventListener('change', updatePunishPreview);
+  if (durationSelect) durationSelect.addEventListener('change', updatePunishPreview);
+  if (usernameInput) {
+    usernameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addPunishUsername(); }
+    });
+  }
+});
 
 async function loadSupportTickets() {
   const listEl = document.getElementById('supportTicketsList');
@@ -5112,6 +5469,7 @@ window.removeFromWhitelist = removeFromWhitelist;
 window.resolveNoshowReport = resolveNoshowReport;
 window.viewUserReport = viewUserReport;
 window.markUserReportResolved = markUserReportResolved;
+window.dismissUserReport = dismissUserReport;
 window.loadSecurityWhitelist = loadSecurityWhitelist;
 window.loadTierTesterApplications = loadTierTesterApplications;
 window.approveTierTesterApplication = approveTierTesterApplication;
@@ -5132,6 +5490,151 @@ window.replySupportTicket = replySupportTicket;
 window.updateSupportTicketStatus = updateSupportTicketStatus;
 window.loadSecurityScores = loadSecurityScores;
 window.viewPlayerSecurityDetail = viewPlayerSecurityDetail;
+window.handleResolveViolation = handleResolveViolation;
+window.handleAdminSendMessage = handleAdminSendMessage;
+window.applyMessageTemplate = applyMessageTemplate;
+
+// ===== Resolve Match Violation =====
+
+async function handleResolveViolation(event) {
+  event.preventDefault();
+  const username = document.getElementById('resolveUsername')?.value?.trim();
+  const matchId = document.getElementById('resolveMatchId')?.value?.trim();
+  const reason = document.getElementById('resolveReason')?.value?.trim();
+  const blacklistType = document.getElementById('resolveBlacklistType')?.value;
+
+  if (!username || !matchId || !reason) {
+    Swal.fire({ icon: 'error', title: 'Missing Fields', text: 'All fields are required.' });
+    return;
+  }
+
+  const confirmed = await Swal.fire({
+    icon: 'warning',
+    title: 'Confirm Resolution',
+    html: `<p>This will:</p>
+      <ul style="text-align:left;font-size:0.9rem;">
+        <li>Revert rating changes from match <strong>${escapeHtml(matchId)}</strong></li>
+        <li>Blacklist <strong>${escapeHtml(username)}</strong> (${blacklistType === 'permanent' ? 'permanently' : blacklistType + ' hours'})</li>
+        <li>Send inbox notices to both players</li>
+      </ul>`,
+    showCancelButton: true,
+    confirmButtonText: 'Resolve',
+    cancelButtonText: 'Cancel'
+  });
+
+  if (!confirmed.isConfirmed) return;
+
+  const btn = document.getElementById('resolveSubmitBtn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...'; }
+
+  try {
+    const durationHours = blacklistType === 'permanent' ? 0 : parseInt(blacklistType) || 0;
+    const res = await apiService.resolveMatchViolation({
+      username,
+      matchId,
+      reason,
+      blacklistDurationHours: durationHours
+    });
+
+    if (res.success) {
+      Swal.fire({ icon: 'success', title: 'Resolved', text: res.message || 'Match violation resolved. Both players have been notified.' });
+      document.getElementById('resolveForm')?.reset();
+    } else {
+      Swal.fire({ icon: 'error', title: 'Error', text: res.message || 'Failed to resolve.' });
+    }
+  } catch (error) {
+    console.error('Resolve error:', error);
+    Swal.fire({ icon: 'error', title: 'Error', text: error.message || 'Failed to resolve match violation.' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-gavel"></i> Resolve & Revert Ratings'; }
+  }
+}
+
+// ===== Admin Send Message =====
+
+const MESSAGE_TEMPLATES = {
+  welcome: {
+    title: 'Welcome to MC Leaderboards!',
+    body: 'Welcome to MC Leaderboards! We\'re glad to have you. Make sure to check out the rules page and set up your Minecraft account in your profile to start competing.\n\nIf you have questions, visit the support page or reach out to staff.\n\nGood luck on the leaderboards!'
+  },
+  policy_reminder: {
+    title: 'Policy Reminder',
+    body: 'This is a friendly reminder about our community policies. Please ensure you are following our rules and terms of service at all times.\n\nRepeated violations may result in warnings or account restrictions.\n\nIf you have any questions, feel free to contact support.'
+  },
+  account_review: {
+    title: 'Account Under Review',
+    body: 'Your account has been flagged for review by our moderation team. During this review period, some features may be temporarily limited.\n\nThis is a routine process and does not necessarily indicate a violation. We will notify you once the review is complete.\n\nIf you believe this is in error, please contact support.'
+  },
+  restriction_lifted: {
+    title: 'Account Restriction Lifted',
+    body: 'Good news! A previous restriction on your account has been lifted. You now have full access to all platform features.\n\nPlease continue to follow our community guidelines to maintain good standing.\n\nThank you for your patience.'
+  },
+  rating_restored: {
+    title: 'Rating Adjustment Applied',
+    body: 'We have applied a rating adjustment to your account. This may be due to a resolved dispute or corrective action taken against another player.\n\nPlease check your profile for updated ratings.'
+  },
+  thank_report: {
+    title: 'Thank You for Your Report',
+    body: 'Thank you for submitting a report. Our moderation team has reviewed it and taken appropriate action.\n\nWe appreciate your help in keeping MC Leaderboards fair and competitive.\n\nNote: We cannot share specific details about actions taken against other players for privacy reasons.'
+  },
+  tester_accepted: {
+    title: 'Tier Tester Application Accepted',
+    body: 'Congratulations! Your Tier Tester application has been approved. You now have access to tester tools and can begin conducting tier tests.\n\nPlease review the tester guidelines and maintain professional conduct during all tests.\n\nWelcome to the team!'
+  },
+  tester_denied: {
+    title: 'Tier Tester Application Update',
+    body: 'Thank you for your interest in becoming a Tier Tester. After careful review, we are unable to approve your application at this time.\n\nYou are welcome to apply again in the future once you feel you meet the requirements.\n\nThank you for your understanding.'
+  }
+};
+
+function applyMessageTemplate() {
+  const templateKey = document.getElementById('msgTemplate')?.value;
+  if (!templateKey || !MESSAGE_TEMPLATES[templateKey]) {
+    return;
+  }
+  const template = MESSAGE_TEMPLATES[templateKey];
+  const titleEl = document.getElementById('msgTitle');
+  const bodyEl = document.getElementById('msgBody');
+  if (titleEl) titleEl.value = template.title;
+  if (bodyEl) bodyEl.value = template.body;
+}
+
+async function handleAdminSendMessage(event) {
+  event.preventDefault();
+  const userId = document.getElementById('msgTargetUserId')?.value?.trim();
+  const title = document.getElementById('msgTitle')?.value?.trim();
+  const body = document.getElementById('msgBody')?.value?.trim();
+  const type = document.getElementById('msgType')?.value || 'admin_message';
+
+  if (!userId || !title || !body) {
+    Swal.fire({ icon: 'error', title: 'Missing Fields', text: 'All fields are required.' });
+    return;
+  }
+
+  const btn = document.getElementById('sendMsgBtn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...'; }
+
+  try {
+    const res = await apiService.adminSendInboxMessage({
+      userId,
+      title,
+      message: body,
+      type
+    });
+
+    if (res.success) {
+      Swal.fire({ icon: 'success', title: 'Sent', text: 'Message delivered to user\'s inbox.' });
+      document.getElementById('sendMessageForm')?.reset();
+    } else {
+      Swal.fire({ icon: 'error', title: 'Error', text: res.message || 'Failed to send message.' });
+    }
+  } catch (error) {
+    console.error('Send message error:', error);
+    Swal.fire({ icon: 'error', title: 'Error', text: error.message || 'Failed to send message.' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Message'; }
+  }
+}
 
 // Initialize on page load
 if (document.readyState === 'loading') {

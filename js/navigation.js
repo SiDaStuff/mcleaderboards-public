@@ -35,6 +35,38 @@ function syncMobileNavOffset() {
 }
 
 /**
+ * Rebuild navigation with icons and inbox (Apple-style header)
+ * Called once on DOMContentLoaded to inject proper nav items
+ */
+function rebuildNavigation() {
+  const navbarNav = document.getElementById('navbarNav');
+  if (!navbarNav || navbarNav.dataset.rebuilt === 'true') return;
+  navbarNav.dataset.rebuilt = 'true';
+
+  // Detect which page is active
+  const path = window.location.pathname.split('/').pop() || 'index.html';
+
+  const isActive = (page) => path === page ? ' class="active"' : '';
+
+  const authed = AppState.isAuthenticated();
+
+  navbarNav.innerHTML = `
+    <li><a href="index.html"${isActive('index.html')}><i class="fas fa-trophy"></i><span class="nav-label"> Leaderboards</span></a></li>
+    <li><a href="dashboard.html" id="navDashboard" style="${authed ? '' : 'display:none'}"${isActive('dashboard.html')}><i class="fas fa-gamepad"></i><span class="nav-label"> Dashboard</span></a></li>
+    <li><a href="inbox.html" id="navInbox" style="${authed ? '' : 'display:none'}"${isActive('inbox.html')}><i class="fas fa-inbox"></i><span class="nav-label"> Inbox</span><span class="inbox-badge d-none" id="navInboxBadge"></span></a></li>
+    <li><a href="account.html" id="navAccount" style="${authed ? '' : 'display:none'}"${isActive('account.html')}><i class="fas fa-circle-user"></i><span class="nav-label"> Account</span></a></li>
+    <li><a href="admin.html" id="navAdmin" class="d-none"><i class="fas fa-shield-halved"></i><span class="nav-label"> Admin</span></a></li>
+    <li><a href="login.html" id="navLogin" style="${authed ? 'display:none' : ''}"${isActive('login.html')}><i class="fas fa-right-to-bracket"></i><span class="nav-label"> Login</span></a></li>
+    <li><a href="#" id="navLogout" style="${authed ? '' : 'display:none'}" onclick="handleLogout()"><i class="fas fa-right-from-bracket"></i><span class="nav-label"> Logout</span></a></li>
+  `;
+
+  // Re-attach mobile menu close listeners
+  navbarNav.querySelectorAll('a').forEach((link) => {
+    link.addEventListener('click', () => closeMobileMenu());
+  });
+}
+
+/**
  * Update navigation based on auth state
  */
 function updateNavigation() {
@@ -46,22 +78,52 @@ function updateNavigation() {
   const navDashboard = document.getElementById('navDashboard');
   const navAccount = document.getElementById('navAccount');
   const navAdmin = document.getElementById('navAdmin');
+  const navInbox = document.getElementById('navInbox');
 
   if (isAuthenticated) {
-    if (navLogin) navLogin.classList.add('d-none');
-    if (navLogout) navLogout.classList.remove('d-none');
-    if (navDashboard) navDashboard.style.display = 'block';
-    if (navAccount) navAccount.style.display = 'block';
+    if (navLogin) navLogin.style.display = 'none';
+    if (navLogout) navLogout.style.display = '';
+    if (navDashboard) navDashboard.style.display = '';
+    if (navAccount) navAccount.style.display = '';
+    if (navInbox) navInbox.style.display = '';
     
     if (isAdmin && navAdmin) {
-      navAdmin.classList.remove('d-none');
+      navAdmin.style.display = '';
+    } else if (navAdmin) {
+      navAdmin.style.display = 'none';
     }
+
+    // Fetch inbox unread count
+    updateInboxBadge();
   } else {
-    if (navLogin) navLogin.classList.remove('d-none');
-    if (navLogout) navLogout.classList.add('d-none');
+    if (navLogin) navLogin.style.display = '';
+    if (navLogout) navLogout.style.display = 'none';
     if (navDashboard) navDashboard.style.display = 'none';
     if (navAccount) navAccount.style.display = 'none';
-    if (navAdmin) navAdmin.classList.add('d-none');
+    if (navInbox) navInbox.style.display = 'none';
+    if (navAdmin) navAdmin.style.display = 'none';
+  }
+}
+
+/**
+ * Fetch and update the inbox unread badge in the navbar
+ */
+async function updateInboxBadge() {
+  try {
+    if (typeof apiService === 'undefined') return;
+    const res = await apiService.getInboxUnreadCount();
+    const count = res?.unreadCount || 0;
+    const badge = document.getElementById('navInboxBadge');
+    if (badge) {
+      if (count > 0) {
+        badge.textContent = count > 99 ? '99+' : count;
+        badge.classList.remove('d-none');
+      } else {
+        badge.classList.add('d-none');
+      }
+    }
+  } catch (e) {
+    // Silently fail - badge just won't show
   }
 }
 
@@ -116,6 +178,7 @@ window.addEventListener('resize', () => {
 
 document.addEventListener('DOMContentLoaded', () => {
   syncMobileNavOffset();
+  rebuildNavigation();
 
   const hamburgerBtn = document.getElementById('hamburgerBtn');
   if (hamburgerBtn) {

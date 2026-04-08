@@ -10,8 +10,12 @@ let hasLoadedGamemodeActivity = false;
 let hasLoadedNotificationSettings = false;
 let hasLoadedQueueCooldowns = false;
 let dashboardInitialized = false;
-let notificationPollInterval = null;
+let notificationPollInterval = null; // legacy, removed
+let dashboardRefreshInterval = null; // legacy, removed
+let cooldownDisplayInterval = null;
+let joinQueueButtonInterval = null;
 const seenNotificationIds = new Set();
+const MAX_SEEN_NOTIFICATIONS = 500;
 const DASHBOARD_ACTIVE_MATCH_POLL_MS = 5000;
 
 const DASHBOARD_ADMIN_CAPABILITY_MATRIX = {
@@ -31,6 +35,32 @@ const DASHBOARD_ADMIN_TAB_REQUIREMENTS = {
   servers: ['settings:manage'],
   'staff-roles': ['settings:manage']
 };
+
+// Restore configureUnifiedQueueExperience for dashboard UI
+function configureUnifiedQueueExperience() {
+  const title = document.getElementById('queueCardTitle');
+  const subtitle = document.getElementById('queueCardSubtitle');
+  const flowMessage = document.getElementById('queueFlowMessage');
+  const testerOptions = document.getElementById('testerQueueOptions');
+
+  if (isTierTesterUser()) {
+    if (title) title.textContent = 'Join Shared Queue';
+    if (subtitle) subtitle.textContent = 'Use the same shared queue as everyone else. Your tier tester preference is applied automatically.';
+    if (flowMessage) {
+      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select your gamemodes and regions, choose a whitelisted server, then join the same live queue players use.';
+    }
+    if (testerOptions) testerOptions.style.display = 'block';
+  } else {
+    if (title) title.textContent = 'Join Shared Queue';
+    if (subtitle) subtitle.textContent = 'One shared queue for players and tier testers.';
+    if (flowMessage) {
+      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select one or more gamemodes and regions, choose a whitelisted server, then join queue.';
+    }
+    if (testerOptions) testerOptions.style.display = 'none';
+  }
+
+  updateJoinQueueButtonState();
+}
 
 function getDashboardAdminCapabilities(profile = {}) {
   const contextCapabilities = Array.isArray(profile?.adminContext?.capabilities) ? profile.adminContext.capabilities : null;
@@ -75,43 +105,6 @@ function isTierTesterUser() {
 
 function getJoinQueueButtonLabel() {
   return isTierTesterUser() ? 'Join as Tier Tester' : 'Join Shared Queue';
-}
-
-function configureUnifiedQueueExperience() {
-  const title = document.getElementById('queueCardTitle');
-  const subtitle = document.getElementById('queueCardSubtitle');
-  const flowMessage = document.getElementById('queueFlowMessage');
-  const testerOptions = document.getElementById('testerQueueOptions');
-
-  if (isTierTesterUser()) {
-    if (title) title.textContent = 'Join Shared Queue';
-    if (subtitle) subtitle.textContent = 'Use the same shared queue as everyone else. Your tier tester preference is applied automatically.';
-    if (flowMessage) {
-      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select your gamemodes and regions, choose a whitelisted server, then join the same live queue players use.';
-    }
-    if (testerOptions) testerOptions.style.display = 'block';
-  } else {
-    if (title) title.textContent = 'Join Shared Queue';
-    if (subtitle) subtitle.textContent = 'One shared queue for players and tier testers.';
-    if (flowMessage) {
-      flowMessage.innerHTML = '<strong>Queue flow:</strong> Select one or more gamemodes and regions, choose a whitelisted server, then join queue.';
-    }
-    if (testerOptions) testerOptions.style.display = 'none';
-  }
-
-  updateJoinQueueButtonState();
-}
-
-async function loadSharedQueueSettings() {
-  try {
-    const profile = await getCachedProfile();
-    const stayInQueueCheckbox = document.getElementById('stayInQueueAfterMatch');
-    if (stayInQueueCheckbox && profile?.stayInQueueAfterMatch !== undefined) {
-      stayInQueueCheckbox.checked = profile.stayInQueueAfterMatch;
-    }
-  } catch (error) {
-    console.error('Error loading shared queue settings:', error);
-  }
 }
 
 function renderGamemodeSelectionControls() {
@@ -286,7 +279,7 @@ async function initDashboard() {
   };
   
   // Start interval (don't run immediately since we just loaded everything above)
-  setInterval(refreshDashboard, refreshInterval);
+  dashboardRefreshInterval = setInterval(refreshDashboard, refreshInterval);
   startActiveMatchPolling();
 
   // Show tier tester application banner if user doesn't have tester role
@@ -697,44 +690,104 @@ window.saveNotificationSettings = async function saveNotificationSettings() {
 /**
  * Set up real-time notification listener
  */
-function setupNotificationListener() {
-  if (!AppState.currentUser || typeof apiService === 'undefined') return;
-  if (notificationPollInterval) {
-    clearInterval(notificationPollInterval);
-    notificationPollInterval = null;
-  }
 
-  const pollNotifications = async () => {
-    if (document.visibilityState !== 'visible') return;
-    try {
-      const resp = await apiService.getNotifications(20, true);
-      const notifications = Array.isArray(resp?.notifications) ? resp.notifications : [];
-      // Oldest first to preserve order of events.
-      notifications.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+// Real-time SSE connection for dashboard
+function startDashboardSSE() {
+  const userId = AppState.currentUser?.uid || AppState.getProfile?.()?.uid;
+  if (!userId) return;
+  const token = AppState.getAuthToken?.() || (firebase && firebase.auth && firebase.auth().currentUser ? firebase.auth().currentUser.getIdToken() : null);
+  const sseUrl = `/api/user/${userId}/stream`;
+  const evtSource = new EventSource(sseUrl, { withCredentials: true });
 
-      for (const n of notifications) {
-        if (!n || !n.id) continue;
-        if (seenNotificationIds.has(n.id)) continue;
-        seenNotificationIds.add(n.id);
-        await showNotification(n);
-        try {
-          if (typeof apiService.deleteNotification === 'function') {
-            await apiService.deleteNotification(n.id);
-          } else {
-            await apiService.markNotificationRead(n.id);
-          }
-        } catch (ackError) {
-          console.warn('Failed to acknowledge notification:', ackError);
-        }
-      }
-    } catch (error) {
-      console.warn('Notification poll failed:', error?.message || error);
-    }
+  evtSource.onopen = () => {
+    console.log('Dashboard SSE connected');
+  };
+  evtSource.onerror = (e) => {
+    console.warn('Dashboard SSE error', e);
+    // Optionally, try to reconnect after a delay
   };
 
-  // Run once immediately, then poll.
-  pollNotifications();
-  notificationPollInterval = setInterval(pollNotifications, 5000);
+  evtSource.addEventListener('profile', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.profile) {
+      AppState.setProfile(data.profile);
+      loadUserProfile();
+    }
+  });
+  evtSource.addEventListener('queue', (e) => {
+    const data = JSON.parse(e.data);
+    // Update queue UI instantly
+    if (data.entries) {
+      updateQueueUI(data.entries);
+    }
+  });
+  evtSource.addEventListener('matches', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.matches) {
+      updateMatchesUI(data.matches);
+    }
+  });
+  evtSource.addEventListener('notifications', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.notifications) {
+      handleRealtimeNotifications(data.notifications);
+    }
+  });
+  evtSource.addEventListener('onboarding', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.completed) {
+      showThemedPopup('Onboarding Complete!', 'You have completed onboarding.');
+    }
+  });
+  evtSource.addEventListener('ping', () => {}); // Heartbeat
+}
+
+function updateQueueUI(entries) {
+  // TODO: Update queue UI with new entries (match entry, queue status, etc.)
+  // Example: refresh queue table, show popups, etc.
+}
+
+function updateMatchesUI(matches) {
+  // TODO: Update match UI (cooldowns, timers, chat, etc.)
+  // Example: update match cards, timers, etc.
+}
+
+function handleRealtimeNotifications(notifications) {
+  // Show new notifications as themed popups
+  Object.values(notifications).forEach((n) => {
+    if (!n || !n.id) return;
+    if (seenNotificationIds.has(n.id)) return;
+    seenNotificationIds.add(n.id);
+    if (seenNotificationIds.size > MAX_SEEN_NOTIFICATIONS) {
+      const iterator = seenNotificationIds.values();
+      seenNotificationIds.delete(iterator.next().value);
+    }
+    showThemedPopup(n.title || 'Notification', n.message || 'You have a new update.');
+  });
+}
+
+function showThemedPopup(title, message) {
+  // Use SweetAlert2 with custom theme for consistency
+  if (typeof Swal !== 'undefined') {
+    Swal.fire({
+      icon: 'info',
+      title: `<span style="color:var(--primary-color)">${title}</span>`,
+      html: `<div style="color:var(--text-color)">${message}</div>`,
+      background: 'var(--background-color, #181a1b)',
+      color: 'var(--text-color, #e0e0e0)',
+      showConfirmButton: false,
+      timer: 4000,
+      toast: true,
+      position: 'top-end',
+      customClass: {
+        popup: 'mclb-themed-popup',
+        title: 'mclb-themed-popup-title',
+        content: 'mclb-themed-popup-content'
+      }
+    });
+  } else {
+    alert(title + '\n' + message);
+  }
 }
 
 /**
@@ -1148,7 +1201,8 @@ function updateJoinQueueButtonState() {
 }
 
 // Update button state every second during cooldown
-setInterval(updateJoinQueueButtonState, 1000);
+if (joinQueueButtonInterval) clearInterval(joinQueueButtonInterval);
+joinQueueButtonInterval = setInterval(updateJoinQueueButtonState, 1000);
 
 /**
  * Handle leave queue
@@ -2069,8 +2123,9 @@ let userCooldowns = [];
  * Start cooldown timer updates
  */
 function startCooldownTimers() {
-  // Update cooldowns every second
-  setInterval(updateCooldownDisplays, 1000);
+  // Update cooldowns every second (only one interval)
+  if (cooldownDisplayInterval) clearInterval(cooldownDisplayInterval);
+  cooldownDisplayInterval = setInterval(updateCooldownDisplays, 1000);
   // Initial update
   updateCooldownDisplays();
 }
@@ -2644,6 +2699,24 @@ window.addEventListener('beforeunload', () => {
   }
   if (mobileStatsAnimationInterval) {
     clearInterval(mobileStatsAnimationInterval);
+  }
+  if (dashboardRefreshInterval) {
+    clearInterval(dashboardRefreshInterval);
+  }
+  if (cooldownDisplayInterval) {
+    clearInterval(cooldownDisplayInterval);
+  }
+  if (joinQueueButtonInterval) {
+    clearInterval(joinQueueButtonInterval);
+  }
+  if (notificationPollInterval) {
+    clearInterval(notificationPollInterval);
+  }
+  if (activeMatchPollInterval) {
+    clearInterval(activeMatchPollInterval);
+  }
+  if (gamemodeStatsInterval) {
+    clearInterval(gamemodeStatsInterval);
   }
   sessionStorage.removeItem('testingPageOpen');
 });

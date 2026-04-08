@@ -941,6 +941,35 @@ function hasAdminAccess(profile = {}, email = '') {
   return Boolean(getAdminRole(profile, email));
 }
 
+/**
+ * Strip sensitive/internal fields from a match object before returning to non-admin clients.
+ * Admins receive the full raw match object.
+ */
+function sanitizeMatchForClient(match, matchId) {
+  if (!match) return null;
+  const {
+    playerEmail,
+    testerEmail,
+    ...safe
+  } = match;
+  if (matchId !== undefined) safe.matchId = matchId;
+  return safe;
+}
+
+// Fields that normal users are allowed to update on their own profile
+const ALLOWED_PROFILE_UPDATE_FIELDS = [
+  'displayName',
+  'bio',
+  'region',
+  'gamemodes',
+  'gamemodeSkillLevels',
+  'profilePicture',
+  'onboardingCompleted',
+  'retiredGamemodes',
+  'notificationPreferences',
+  'privacySettings',
+];
+
 // ===== Authentication Middleware =====
 
 /**
@@ -1738,6 +1767,20 @@ async function ensureMinecraftUuidLinkedForUser(userId, profileInput = null) {
   }
 }
 
+// Cache blacklist data for getUserModerationState to avoid reloading per-request
+const blacklistCache = { data: null, updatedAt: 0, ttl: 10000 }; // 10s TTL
+
+async function getBlacklistCached() {
+  const now = Date.now();
+  if (blacklistCache.data && (now - blacklistCache.updatedAt) < blacklistCache.ttl) {
+    return blacklistCache.data;
+  }
+  const snapshot = await db.ref('blacklist').once('value');
+  blacklistCache.data = snapshot.val() || {};
+  blacklistCache.updatedAt = now;
+  return blacklistCache.data;
+}
+
 async function getUserModerationState(userId, profileInput = null) {
   try {
     if (!userId) {
@@ -1752,12 +1795,12 @@ async function getUserModerationState(userId, profileInput = null) {
     const username = String(profile.minecraftUsername || '').toLowerCase();
   const minecraftUUID = normalizeMinecraftUUID(profile.minecraftUUID);
 
-    const [blacklistSnapshot, tempUnblockSnapshot] = await Promise.all([
-      db.ref('blacklist').once('value'),
+    const [blacklist, tempUnblockSnapshot] = await Promise.all([
+      getBlacklistCached(),
       db.ref(`tempUnblocks/${userId}`).once('value')
     ]);
 
-    const blacklist = blacklistSnapshot.val() || {};
+    // blacklist is already an object from cache
     const tempUnblock = tempUnblockSnapshot.val() || null;
 
     let activeBlacklistEntry = null;
@@ -1878,6 +1921,7 @@ async function detectRatingManipulation(userId, gamemode, matchResult) {
     const matchesSnapshot = await matchesRef
       .orderByChild('playerId')
       .equalTo(userId)
+      .limitToLast(100)
       .once('value');
     
     const allMatches = matchesSnapshot.val() || {};
@@ -2306,7 +2350,7 @@ async function detectMatchRigging(match, result) {
 async function detectImpersonation(userId, username, minecraftUsername) {
   try {
     const playersRef = db.ref('players');
-    const playersSnapshot = await playersRef.once('value');
+    const playersSnapshot = await playersRef.limitToFirst(1000).once('value');
     const players = playersSnapshot.val() || {};
 
     const suspiciousPatterns = [];
@@ -2743,7 +2787,7 @@ async function checkAndTerminateBlacklistedMatches() {
         } else if (playerBlacklisted) {
           const firstTo = match.firstTo || getFirstToForGamemode(match.gamemode);
           console.log(`Match ${matchId}: Player blacklisted, finalizing with tester win (0-${firstTo})`);
-          await handleManualFinalization(match, { playerScore: 0, testerScore: firstTo });
+          const ratingChanges = await handleManualFinalization(match, { playerScore: 0, testerScore: firstTo });
           await matchRef.update({
             status: 'ended',
             finalized: true,
@@ -2754,13 +2798,25 @@ async function checkAndTerminateBlacklistedMatches() {
               type: 'blacklist',
               playerScore: 0,
               testerScore: firstTo,
-              reason: 'Player blacklisted'
+              ratingChanges,
+              playerUsername: match.playerUsername,
+              gamemode: match.gamemode,
+              autoFinalized: true,
+              reason: 'Opponent was blacklisted — you have been awarded the win'
             }
+          });
+          // Notify the non-blacklisted tester
+          await createNotification(match.testerId, {
+            type: 'match_finalized',
+            title: 'Match Auto-Finalized',
+            message: `Your ${match.gamemode} match was auto-finalized because your opponent was blacklisted. You have been awarded the win. Rating: ${ratingChanges?.testerNewRating ?? 'N/A'} (${(ratingChanges?.testerRatingChange ?? 0) >= 0 ? '+' : ''}${ratingChanges?.testerRatingChange ?? 0})`,
+            matchId,
+            gamemode: match.gamemode
           });
         } else {
           const firstTo = match.firstTo || getFirstToForGamemode(match.gamemode);
           console.log(`Match ${matchId}: Tester blacklisted, finalizing with player win (${firstTo}-0)`);
-          await handleManualFinalization(match, { playerScore: firstTo, testerScore: 0 });
+          const ratingChanges = await handleManualFinalization(match, { playerScore: firstTo, testerScore: 0 });
           await matchRef.update({
             status: 'ended',
             finalized: true,
@@ -2771,8 +2827,20 @@ async function checkAndTerminateBlacklistedMatches() {
               type: 'blacklist',
               playerScore: firstTo,
               testerScore: 0,
-              reason: 'Tester blacklisted'
+              ratingChanges,
+              playerUsername: match.playerUsername,
+              gamemode: match.gamemode,
+              autoFinalized: true,
+              reason: 'Opponent was blacklisted — you have been awarded the win'
             }
+          });
+          // Notify the non-blacklisted player
+          await createNotification(match.playerId, {
+            type: 'match_finalized',
+            title: 'Match Auto-Finalized',
+            message: `Your ${match.gamemode} match was auto-finalized because your opponent was blacklisted. You have been awarded the win. Rating: ${ratingChanges?.playerNewRating ?? 'N/A'} (${(ratingChanges?.playerRatingChange ?? 0) >= 0 ? '+' : ''}${ratingChanges?.playerRatingChange ?? 0})`,
+            matchId,
+            gamemode: match.gamemode
           });
         }
       }
@@ -3161,6 +3229,100 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ===== Real-time User SSE Endpoint =====
+/**
+ * Generalized SSE endpoint for user/dashboard real-time events
+ * Streams: match entry, cooldowns, chat, timers, notifications, onboarding, etc.
+ * Endpoint: /api/user/:userId/stream
+ */
+app.get('/api/user/:userId/stream', verifyAuth, async (req, res) => {
+  try {
+    // Only allow the user to connect to their own stream (or admin)
+    const { userId } = req.params;
+    const authedUserId = req.user?.uid;
+    const isAdmin = hasAdminAccess(req.userProfile || {}, req.user?.email);
+    if (userId !== authedUserId && !isAdmin) {
+      return res.status(403).json({ error: true, message: 'Forbidden' });
+    }
+
+    // SSE headers
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+
+    let closed = false;
+    req.on('close', () => { closed = true; cleanup(); });
+
+    // Helper to send SSE event
+    function sendEvent(event, data) {
+      if (closed) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+
+    // Heartbeat to keep connection alive
+    const heartbeat = setInterval(() => sendEvent('ping', { ts: Date.now() }), 25000);
+
+    // Firebase listeners
+    const listeners = [];
+    const dbUserRef = db.ref(`users/${userId}`);
+    const dbQueueRef = db.ref('queue');
+    const dbNotificationsRef = db.ref(`notifications/${userId}`);
+    const dbOnboardingRef = db.ref(`users/${userId}/onboardingCompleted`);
+    const dbMatchesRef = db.ref('matches');
+
+    // User profile changes (region, cooldowns, etc.)
+    listeners.push(dbUserRef.on('value', (snap) => {
+      const profile = snap.val() || {};
+      sendEvent('profile', { profile });
+    }));
+
+    // Queue entry detection (match entry, queue status)
+    listeners.push(dbQueueRef.orderByChild('userId').equalTo(userId).on('value', (snap) => {
+      const entries = snap.val() || {};
+      sendEvent('queue', { entries });
+    }));
+
+    // Notifications (new notifications)
+    listeners.push(dbNotificationsRef.on('value', (snap) => {
+      const notifications = snap.val() || {};
+      sendEvent('notifications', { notifications });
+    }));
+
+    // Onboarding verification status
+    listeners.push(dbOnboardingRef.on('value', (snap) => {
+      sendEvent('onboarding', { completed: !!snap.val() });
+    }));
+
+    // Active matches, cooldowns, timers, chat, etc.
+    listeners.push(dbMatchesRef.orderByChild('playerId').equalTo(userId).on('value', (snap) => {
+      const matches = snap.val() || {};
+      sendEvent('matches', { matches });
+    }));
+    listeners.push(dbMatchesRef.orderByChild('testerId').equalTo(userId).on('value', (snap) => {
+      const matches = snap.val() || {};
+      sendEvent('matches', { matches });
+    }));
+
+    // Cleanup listeners
+    function cleanup() {
+      clearInterval(heartbeat);
+      dbUserRef.off();
+      dbQueueRef.off();
+      dbNotificationsRef.off();
+      dbOnboardingRef.off();
+      dbMatchesRef.off();
+    }
+  } catch (err) {
+    logger.error('SSE user stream error', { error: err });
+    if (!res.headersSent) res.status(500).json({ error: true, message: 'SSE error' });
+    try { res.end(); } catch (_) {}
+  }
+});
+
 // ===== User Routes =====
 
 /**
@@ -3289,11 +3451,27 @@ app.put('/api/users/me', verifyAuthAndNotBanned, requireRecaptcha, async (req, r
     // Get existing profile
     const snapshot = await userRef.once('value');
     const existing = snapshot.val() || {};
+
+    // Only allow whitelisted fields to prevent privilege escalation
+    const sanitizedUpdates = {};
+    for (const key of Object.keys(updates)) {
+      if (ALLOWED_PROFILE_UPDATE_FIELDS.includes(key)) {
+        sanitizedUpdates[key] = updates[key];
+      }
+    }
+
+    if (Object.keys(sanitizedUpdates).length === 0) {
+      return res.status(400).json({
+        error: true,
+        code: 'VALIDATION_ERROR',
+        message: 'No valid fields to update'
+      });
+    }
     
     // Merge updates
     const updated = {
       ...existing,
-      ...updates,
+      ...sanitizedUpdates,
       updatedAt: new Date().toISOString()
     };
     
@@ -3410,7 +3588,7 @@ app.get('/api/users/me/recent-matches', verifyAuthAndNotBanned, async (req, res)
 
     // Sort by most recent first and limit
     allMatches.sort((a, b) => new Date(b.finalizedAt || b.createdAt) - new Date(a.finalizedAt || a.createdAt));
-    const recentMatches = allMatches.slice(0, limit);
+    const recentMatches = allMatches.slice(0, limit).map(m => sanitizeMatchForClient(m));
 
     res.json({ matches: recentMatches });
   } catch (error) {
@@ -3618,14 +3796,17 @@ app.post('/api/users/me/minecraft', verifyAuthAndNotBanned, requireRecaptcha, as
 
 // ===== Player Routes =====
 
-// Cache for players endpoint (5 second TTL for high traffic)
+// Cache for players endpoint (15 second TTL for high traffic)
 const playersCache = {
   data: null,
   updatedAt: 0,
-  TTL: 5000, // 5 seconds
+  TTL: 15000, // 15 seconds - reduced DB load significantly
   blacklist: null,
   blacklistUpdatedAt: 0,
-  blacklistTTL: 30000 // 30 seconds for blacklist
+  blacklistTTL: 30000, // 30 seconds for blacklist
+  users: null,
+  usersUpdatedAt: 0,
+  usersTTL: 15000 // 15 seconds for users cache
 };
 
 // Prevent overlapping background jobs from piling up under load.
@@ -3642,9 +3823,17 @@ setInterval(() => {
   if (playersCache.data && (now - playersCache.updatedAt) > playersCache.TTL * 2) {
     playersCache.data = null;
   }
+  // Clear expired users cache
+  if (playersCache.users && (now - playersCache.usersUpdatedAt) > playersCache.usersTTL * 2) {
+    playersCache.users = null;
+  }
   // Clear expired blacklist cache
   if (playersCache.blacklist && (now - playersCache.blacklistUpdatedAt) > playersCache.blacklistTTL * 2) {
     playersCache.blacklist = null;
+  }
+  // Clear expired moderation blacklist cache
+  if (blacklistCache.data && (now - blacklistCache.updatedAt) > blacklistCache.ttl * 2) {
+    blacklistCache.data = null;
   }
   // Clear expired dashboard stats cache
   for (const key in dashboardGamemodeStatsCache) {
@@ -3660,7 +3849,8 @@ setInterval(() => {
  */
 app.get('/api/players', async (req, res) => {
   try {
-    const { gamemode, limit, offset } = req.query;
+    const { gamemode, limit, offset, showProvisional } = req.query;
+    const includeProvisional = showProvisional === 'true';
     const now = Date.now();
     
     // Check cache first (only for non-filtered requests or when cache is fresh)
@@ -3692,8 +3882,14 @@ app.get('/api/players', async (req, res) => {
             playersCache.blacklistUpdatedAt = now;
             return snap;
           }),
-      // Always load users (for retirement check AND role badge enrichment)
-      db.ref('users').once('value'),
+      // Load users with caching (for retirement check AND role badge enrichment)
+      (now - playersCache.usersUpdatedAt) < playersCache.usersTTL && playersCache.users
+        ? Promise.resolve({ val: () => playersCache.users })
+        : db.ref('users').once('value').then(snap => {
+            playersCache.users = snap.val() || {};
+            playersCache.usersUpdatedAt = now;
+            return snap;
+          }),
       db.ref('settings/staffRoles').once('value')
     ]);
     
@@ -3788,8 +3984,21 @@ app.get('/api/players', async (req, res) => {
       playersArray = playersArray.filter(player => {
         if (!player.gamemodeRatings || !player.gamemodeRatings[requestedGamemode]) return false;
         if (player.userId && retirementMap[player.userId] && retirementMap[player.userId][requestedGamemode]) return false;
+        // Require at least 5 matches to appear on gamemode leaderboard (unless provisional view)
+        if (!includeProvisional) {
+          const matchCount = Number(player.gamemodeMatchCount?.[requestedGamemode]) || 0;
+          if (matchCount < 5) return false;
+        }
         return true;
       });
+    } else {
+      // For overall leaderboard, require at least 5 total matches across all gamemodes
+      if (!includeProvisional) {
+        playersArray = playersArray.filter(player => {
+          const totalMatches = Object.values(player.gamemodeMatchCount || {}).reduce((sum, v) => sum + (Number(v) || 0), 0);
+          return totalMatches >= 5;
+        });
+      }
     }
 
     playersArray.sort((leftPlayer, rightPlayer) => {
@@ -4145,26 +4354,19 @@ app.post('/api/auth/check-ban', async (req, res) => {
     const userSnapshot = await usersRef.orderByChild('email').equalTo(email.toLowerCase()).once('value');
     const users = userSnapshot.val();
 
+    // Return identical response for "not found" and "not banned" to prevent account enumeration
+    const NOT_BANNED_RESPONSE = { banned: false, warnings: [], message: 'No active ban' };
+
     if (!users) {
-      // Email not found, not banned
-      return res.json({
-        banned: false,
-        warnings: [],
-        message: 'Email not banned'
-      });
+      return res.json(NOT_BANNED_RESPONSE);
     }
 
     const userId = Object.keys(users)[0];
     const userProfile = users[userId];
 
     if (!userProfile.banned) {
-      const warnings = Array.isArray(userProfile.warnings) ? userProfile.warnings : [];
-      const activeWarnings = warnings.filter(w => !w.acknowledged);
-      return res.json({
-        banned: false,
-        warnings: activeWarnings,
-        message: 'Email not banned'
-      });
+      // Don't leak warnings pre-login — they will be shown after authentication
+      return res.json(NOT_BANNED_RESPONSE);
     }
 
     // Check if ban has expired
@@ -4183,13 +4385,7 @@ app.post('/api/auth/check-ban', async (req, res) => {
           banReason: null
         });
 
-        const warnings = Array.isArray(userProfile.warnings) ? userProfile.warnings : [];
-        const activeWarnings = warnings.filter(w => !w.acknowledged);
-        return res.json({
-          banned: false,
-          warnings: activeWarnings,
-          message: 'Ban expired, account unbanned'
-        });
+        return res.json(NOT_BANNED_RESPONSE);
       }
     }
 
@@ -4321,6 +4517,15 @@ app.post('/api/admin/warn', adminLimiter, verifyAuth, verifyAdmin, async (req, r
       updatedAt: new Date().toISOString()
     });
 
+    // Send inbox notification about the warning
+    await sendInboxMessage(userId, {
+      title: 'Account Warning',
+      message: `You have received a warning on your account.\n\nReason: ${reason}\n\nPlease review our rules and ensure compliance. Continued violations may result in further action including account restrictions.\n\nIf you believe this was issued in error, contact support.`,
+      type: 'warning',
+      from: 'MC Leaderboards Moderation',
+      reason: reason
+    });
+
     // Log admin action
     await logAdminAction(req, req.user.uid, 'WARN_USER', userId, { reason });
 
@@ -4362,6 +4567,9 @@ app.get('/api/admin/audit-log', verifyAuth, verifyAdmin, async (req, res) => {
       auditLogRef = auditLogRef.endAt(endDate);
     }
 
+    // Limit the query to avoid loading entire audit log collection
+    const maxFetchLimit = Math.min((safeLimit + safeOffset) * 3, 1000);
+    auditLogRef = auditLogRef.limitToLast(action || adminUid || targetUserId || safeQ ? maxFetchLimit : safeLimit + safeOffset);
     const snapshot = await auditLogRef.once('value');
     let logs = [];
 
@@ -5271,6 +5479,7 @@ app.get('/api/queue/stats', verifyAuthAndNotBanned, async (req, res) => {
 // Cache is keyed by region (or 'all' for no filter)
 let dashboardGamemodeStatsCache = {};
 const DASHBOARD_GAMEMODE_STATS_TTL_MS = 8000; // shorter than 10s polling interval
+const MAX_DASHBOARD_CACHE_KEYS = 50; // Cap cache entries
 
 /**
  * GET /api/dashboard/gamemode-stats - Per-gamemode counts for dashboard widget
@@ -5284,6 +5493,11 @@ app.get('/api/dashboard/gamemode-stats', verifyAuthAndNotBanned, async (req, res
     // Create cache key based on region filter
     const cacheKey = regionFilter || 'all';
     if (!dashboardGamemodeStatsCache[cacheKey]) {
+      // Prevent unbounded cache growth
+      const keys = Object.keys(dashboardGamemodeStatsCache);
+      if (keys.length >= MAX_DASHBOARD_CACHE_KEYS) {
+        delete dashboardGamemodeStatsCache[keys[0]];
+      }
       dashboardGamemodeStatsCache[cacheKey] = { data: null, updatedAtMs: 0 };
     }
     
@@ -5734,10 +5948,19 @@ async function attemptMatchmaking() {
 
   const allUserIds = [...new Set(queueEntries.map((entry) => entry.userId))];
 
-  const [userSnapshots, playerSnapshots] = await Promise.all([
-    Promise.all(allUserIds.map((userId) => db.ref(`users/${userId}`).once('value'))),
-    Promise.all(allUserIds.map((userId) => db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value')))
-  ]);
+  // Batch user lookups with concurrency limit to avoid exhausting DB connections
+  const BATCH_SIZE = 20;
+  const userSnapshots = [];
+  const playerSnapshots = [];
+  for (let i = 0; i < allUserIds.length; i += BATCH_SIZE) {
+    const batch = allUserIds.slice(i, i + BATCH_SIZE);
+    const [uBatch, pBatch] = await Promise.all([
+      Promise.all(batch.map((userId) => db.ref(`users/${userId}`).once('value'))),
+      Promise.all(batch.map((userId) => db.ref('players').orderByChild('userId').equalTo(userId).limitToFirst(1).once('value')))
+    ]);
+    userSnapshots.push(...uBatch);
+    playerSnapshots.push(...pBatch);
+  }
 
   const userProfilesById = new Map();
   const ratingsByUserId = new Map();
@@ -6277,6 +6500,15 @@ app.post('/api/admin/tier-tester-applications/:id/approve', verifyAuthAndNotBann
       testerApprovedBy: adminId
     });
 
+    // Send congratulations inbox message to the applicant
+    await sendInboxMessage(application.userId, {
+      title: 'Tier Tester Application Approved!',
+      message: 'Congratulations! Your Tier Tester application has been approved.\n\nYou now have access to the Tier Tester queue and can begin testing players. Head to the Dashboard to set your availability and start matching with players.\n\nThank you for contributing to the MC Leaderboards community!',
+      type: 'system',
+      from: 'MC Leaderboards Staff',
+      metadata: { applicationId, event: 'tester_approved' }
+    });
+
     // Log admin action
     await logAdminAction(req, adminId, 'APPROVE_TESTER_APPLICATION', applicationId, {
       userId: application.userId,
@@ -6349,6 +6581,15 @@ app.post('/api/admin/tier-tester-applications/:id/deny', verifyAuthAndNotBanned,
       testerApplicationDenied: true,
       testerDenialReason: reviewNotes,
       testerDenialDate: new Date().toISOString()
+    });
+
+    // Send denial inbox message to the applicant
+    await sendInboxMessage(application.userId, {
+      title: 'Tier Tester Application Update',
+      message: `Thank you for your interest in becoming a Tier Tester. After careful review, your application was not approved at this time.\n\nFeedback: ${reviewNotes}\n\nYou are welcome to reapply in the future once applications reopen. If you have questions, please contact support.`,
+      type: 'system',
+      from: 'MC Leaderboards Staff',
+      metadata: { applicationId, event: 'tester_denied' }
     });
 
     // Log admin action
@@ -7325,6 +7566,51 @@ app.post('/api/admin/reports/user/:reportId/resolve', verifyAuthAndNotBanned, ve
       actionTaken: action || null
     });
 
+    // Send inbox message to the reporter
+    if (report.reporterId) {
+      const actionText = action === 'blacklisted' ? 'Action has been taken against the reported player.'
+        : action === 'warned' ? 'A warning has been issued to the reported player.'
+        : action === 'dismissed' ? 'After review, no action was deemed necessary at this time.'
+        : 'Your report has been reviewed by our moderation team.';
+      await sendInboxMessage(report.reporterId, {
+        title: 'Your Report Has Been Resolved',
+        message: `Your report against ${report.reportedPlayer || 'a player'} has been reviewed and resolved.\n\n${actionText}\n\nThank you for helping keep MC Leaderboards fair and safe.`,
+        type: 'report_resolved',
+        from: 'MC Leaderboards Moderation',
+        metadata: { reportId, action: action || 'reviewed' }
+      });
+    }
+
+    // Send inbox message to the reported player (look up their userId by username)
+    let reportedUserId = null;
+    if (report.reportedPlayer) {
+      const playerSnap = await db.ref('players').orderByChild('username').equalTo(report.reportedPlayer).limitToFirst(1).once('value');
+      const playerData = playerSnap.val();
+      if (playerData) {
+        const entry = Object.values(playerData)[0];
+        reportedUserId = entry?.userId || null;
+      }
+    }
+    if (reportedUserId) {
+      const reportedMsg = action === 'blacklisted'
+        ? 'After investigation, action has been taken on your account. Please review your inbox for details.'
+        : action === 'warned'
+        ? 'After investigation, a warning has been issued. Please review our rules to ensure compliance.'
+        : 'After investigation, no further action is being taken at this time.';
+      await sendInboxMessage(reportedUserId, {
+        title: 'Report Investigation Complete',
+        message: `A report filed against your account has been reviewed by our moderation team.\n\n${reportedMsg}\n\nIf you have questions, please contact support.`,
+        type: 'system',
+        from: 'MC Leaderboards Moderation',
+        metadata: { reportId }
+      });
+    }
+
+    // Update the reporter's index entry status
+    if (report.reporterId) {
+      await db.ref(`playerReportsByUser/${report.reporterId}/${reportId}/status`).set('resolved');
+    }
+
     // Log admin action
     await logAdminAction(req, req.user.uid, 'RESOLVE_PLAYER_REPORT', reportId, {
       reportedPlayer: report.reportedPlayer,
@@ -7422,6 +7708,17 @@ app.post('/api/admin/reports/noshow/:reportId/resolve', verifyAuthAndNotBanned, 
       resolvedAt: new Date().toISOString(),
       resolutionNotes: notes || ''
     });
+
+    // Send inbox message to the reported player about no-show resolution
+    if (report.playerId) {
+      await sendInboxMessage(report.playerId, {
+        title: 'No-Show Report Resolved',
+        message: `A no-show report on your account has been reviewed and resolved.\n\n${notes ? 'Notes: ' + notes + '\n\n' : ''}Please ensure you show up for scheduled matches in the future. Repeated no-shows may result in cooldowns or restrictions.`,
+        type: 'system',
+        from: 'MC Leaderboards Moderation',
+        metadata: { reportId, event: 'noshow_resolved' }
+      });
+    }
 
     // Log admin action
     await logAdminAction(req, req.user.uid, 'RESOLVE_NOSHOW_REPORT', reportId, {
@@ -7864,6 +8161,113 @@ app.get('/api/tester/reputation', verifyAuthAndNotBanned, verifyTester, async (r
   }
 });
 
+// ===== Match SSE (Server-Sent Events) =====
+
+// Track active SSE connections per match for broadcasting
+const matchSSEClients = new Map(); // matchId -> Set<{ res, userId }>
+
+/**
+ * GET /api/match/:matchId/stream - SSE stream for real-time match updates
+ * Requires authentication. Only match participants and admins can connect.
+ */
+app.get('/api/match/:matchId/stream', async (req, res) => {
+  try {
+    // Manual auth check (can't use middleware that calls next() for SSE)
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: true, message: 'Authentication required' });
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+    } catch {
+      return res.status(401).json({ error: true, message: 'Invalid token' });
+    }
+    const userId = decodedToken.uid;
+
+    const { matchId } = req.params;
+    const matchRef = db.ref(`matches/${matchId}`);
+    const snapshot = await matchRef.once('value');
+    const matchData = snapshot.val();
+    if (!matchData) {
+      return res.status(404).json({ error: true, message: 'Match not found' });
+    }
+
+    // Only participants and admins
+    const isParticipant = matchData.playerId === userId || matchData.testerId === userId;
+    if (!isParticipant) {
+      const profile = (await db.ref(`users/${userId}`).once('value')).val();
+      if (!hasAdminAccess(profile || {}, decodedToken.email)) {
+        return res.status(403).json({ error: true, message: 'Access denied' });
+      }
+    }
+
+    // Set up SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // Disable nginx buffering for this stream
+    });
+    res.flushHeaders();
+
+    // Send initial state
+    res.write(`data: ${JSON.stringify({ type: 'match', data: sanitizeMatchForClient(matchData, matchId) })}\n\n`);
+
+    // Register this client
+    if (!matchSSEClients.has(matchId)) {
+      matchSSEClients.set(matchId, new Set());
+    }
+    const client = { res, userId };
+    matchSSEClients.get(matchId).add(client);
+
+    // Listen for RTDB changes on this match
+    const onMatchChange = (snap) => {
+      try {
+        const updated = snap.val();
+        if (!updated) return;
+        res.write(`data: ${JSON.stringify({ type: 'match', data: sanitizeMatchForClient(updated, matchId) })}\n\n`);
+      } catch { /* client disconnected */ }
+    };
+    matchRef.on('value', onMatchChange);
+
+    // Listen for chat changes
+    const chatRef = db.ref(`matches/${matchId}/chat`);
+    const onChatChange = (snap) => {
+      try {
+        const chatData = snap.val() || {};
+        const messages = Object.entries(chatData)
+          .map(([messageId, msg]) => ({ ...msg, messageId }))
+          .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        res.write(`data: ${JSON.stringify({ type: 'chat', data: messages })}\n\n`);
+      } catch { /* client disconnected */ }
+    };
+    chatRef.on('value', onChatChange);
+
+    // Heartbeat to keep connection alive (every 30s)
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); }
+    }, 30000);
+
+    // Clean up on disconnect
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      matchRef.off('value', onMatchChange);
+      chatRef.off('value', onChatChange);
+      const clients = matchSSEClients.get(matchId);
+      if (clients) {
+        clients.delete(client);
+        if (clients.size === 0) matchSSEClients.delete(matchId);
+      }
+    });
+  } catch (error) {
+    logger.error('SSE stream error', { matchId: req.params.matchId, error });
+    if (!res.headersSent) {
+      res.status(500).json({ error: true, message: 'Stream error' });
+    }
+  }
+});
+
 // ===== Match Routes =====
 
 /**
@@ -7887,7 +8291,7 @@ app.get('/api/match/active', verifyAuthAndNotBanned, async (req, res) => {
     for (const matchId in matches) {
       const match = matches[matchId];
       if (match.playerId === req.user.uid || match.testerId === req.user.uid) {
-        return res.json({ hasMatch: true, match: { ...match, matchId } });
+        return res.json({ hasMatch: true, match: sanitizeMatchForClient(match, matchId) });
       }
     }
     
@@ -7920,14 +8324,15 @@ app.get('/api/match/:matchId', verifyAuthAndNotBanned, async (req, res) => {
       });
     }
     
-    // Verify user is participant
-    if (match.playerId !== req.user.uid && match.testerId !== req.user.uid) {
-      // Check if admin
+    // Verify user is participant or admin
+    const isParticipant = match.playerId === req.user.uid || match.testerId === req.user.uid;
+    let isAdmin = false;
+    if (!isParticipant) {
       const userRef = db.ref(`users/${req.user.uid}`);
       const userSnapshot = await userRef.once('value');
       const userProfile = userSnapshot.val();
-      
-      if (!userProfile || !userProfile.admin) {
+      isAdmin = hasAdminAccess(userProfile || {}, req.user.email);
+      if (!isAdmin) {
         return res.status(403).json({
           error: true,
           code: 'PERMISSION_DENIED',
@@ -7936,7 +8341,8 @@ app.get('/api/match/:matchId', verifyAuthAndNotBanned, async (req, res) => {
       }
     }
     
-    res.json({ ...match, matchId });
+    // Admins get full data; participants get sanitized data
+    res.json(isAdmin ? { ...match, matchId } : sanitizeMatchForClient(match, matchId));
   } catch (error) {
     console.error('Error getting match:', error);
     res.status(500).json({
@@ -8313,8 +8719,7 @@ app.get('/api/match/:matchId/messages', verifyAuthAndNotBanned, async (req, res)
       const userRef = db.ref(`users/${req.user.uid}`);
       const userSnapshot = await userRef.once('value');
       const userProfile = userSnapshot.val() || {};
-      const isAdminUser = Boolean(userProfile.admin === true || typeof userProfile.adminRole === 'string');
-      if (!isAdminUser) {
+      if (!hasAdminAccess(userProfile, req.user.email)) {
         return res.status(403).json({
           error: true,
           code: 'PERMISSION_DENIED',
@@ -8929,10 +9334,8 @@ async function checkMissedTimeouts() {
         if (now > expiresAt) {
           console.log(`⏰ Found expired match ${matchId} (expired ${Math.round((now - expiresAt) / 1000)}s ago)`);
           
-          // Mark as timeout handled to prevent duplicate processing
-          await matchesRef.child(matchId).update({ timeoutHandled: true });
-          
-          // Handle the inactivity
+          // handleMatchInactivity sets timeoutHandled internally — do NOT set it here
+          // or the re-read inside handleMatchInactivity will skip the match.
           await handleMatchInactivity(matchId);
           handledCount++;
         }
@@ -8971,26 +9374,18 @@ async function handleMatchInactivity(matchId) {
 
     console.log(`Match ${matchId} inactivity check: Player joined: ${playerJoined}, Tester joined: ${testerJoined}`);
 
-    // Case 1: Neither player joined - delete match (no finalization, no rating changes)
+    // Case 1: Neither player joined - cancel match (no finalization, no rating changes)
+    // Match will be cleaned up after 2 weeks by the scheduled cleanup
     if (!playerJoined && !testerJoined) {
-      console.log(`Match ${matchId}: Neither player joined within 3 minutes, deleting match`);
+      console.log(`Match ${matchId}: Neither player joined within 3 minutes, cancelling match`);
       await matchRef.update({
         status: 'cancelled',
         finalized: true,
         finalizedAt: new Date().toISOString(),
         reason: 'Neither player joined within 3 minutes',
-        deletedDueToInactivity: true
+        deletedDueToInactivity: true,
+        scheduledDeleteAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
       });
-      
-      // Delete the match entirely after a delay
-      setTimeout(async () => {
-        try {
-          await matchRef.remove();
-          console.log(`Match ${matchId}: Deleted from database`);
-        } catch (err) {
-          console.error(`Error deleting match ${matchId}:`, err);
-        }
-      }, 5000);
       return;
     }
 
@@ -9498,7 +9893,14 @@ async function containsProfanity(text) {
  * Create a notification for a user
  */
 async function createNotification(userId, notificationData) {
-  return null;
+  // Route to inbox system
+  return sendInboxMessage(userId, {
+    title: notificationData.title || 'Notification',
+    message: notificationData.message || '',
+    type: notificationData.type || 'system',
+    from: 'System',
+    metadata: notificationData
+  });
 }
 
 // Re-queue user into the same gamemode/region after finalization when they opted in.
@@ -10128,7 +10530,7 @@ app.post('/api/onboarding/save-preferences', verifyAuthAndNotBanned, requireReca
 /**
  * POST /api/admin/players/:playerId/rating - Admin endpoint to set player rating
  */
-app.post('/api/admin/players/:playerId/rating', adminLimiter, verifyAuth, verifyAdminOrTester, async (req, res) => {
+app.post('/api/admin/players/:playerId/rating', adminLimiter, verifyAuth, verifyAdmin, async (req, res) => {
   try {
 
     const { playerId } = req.params;
@@ -10345,6 +10747,15 @@ app.post('/api/onboarding/complete', verifyAuth, async (req, res) => {
       updatedAt: new Date().toISOString()
     });
 
+    // Send welcome inbox message
+    await sendInboxMessage(req.user.uid, {
+      title: 'Welcome to MC Leaderboards!',
+      message: `Welcome, ${userData.minecraftUsername}! Your account is all set up and ready to go.\n\nHere's how to get started:\n• Head to the Dashboard to join the queue and find matches\n• Check the Leaderboard to see where you stand\n• Visit the Rules page to understand our guidelines\n\nGood luck and have fun competing!`,
+      type: 'system',
+      from: 'MC Leaderboards',
+      metadata: { event: 'welcome' }
+    });
+
     console.log(`Onboarding completed for user ${req.user.uid} (${userData.email})`);
 
     res.json({ 
@@ -10462,6 +10873,352 @@ app.post('/api/notifications/:id/read', verifyAuth, async (req, res) => {
  */
 app.delete('/api/notifications/:id', verifyAuth, async (req, res) => {
   res.json({ success: true, removed: true });
+});
+
+/**
+ * DELETE /api/notifications/:id - Delete a notification
+ */
+app.delete('/api/notifications/:id', verifyAuth, async (req, res) => {
+  res.json({ success: true, removed: true });
+});
+
+// ===== Inbox System Routes =====
+
+/**
+ * Helper: Send an inbox message to a user
+ * Stores message in Firebase RTDB under inbox/{userId}/{messageId}
+ */
+async function sendInboxMessage(userId, messageData) {
+  if (!userId) return null;
+  const inboxRef = db.ref(`inbox/${userId}`);
+  const newMsgRef = inboxRef.push();
+  const message = {
+    id: newMsgRef.key,
+    title: messageData.title || 'Message',
+    message: messageData.message || '',
+    preview: (messageData.message || '').substring(0, 120),
+    type: messageData.type || 'system',
+    from: messageData.from || 'System',
+    read: false,
+    createdAt: new Date().toISOString(),
+    ...(messageData.htmlBody ? { htmlBody: messageData.htmlBody } : {}),
+    ...(messageData.ratingAdjustments ? { ratingAdjustments: messageData.ratingAdjustments } : {}),
+    ...(messageData.reason ? { reason: messageData.reason } : {}),
+    ...(messageData.metadata ? { metadata: messageData.metadata } : {})
+  };
+  await newMsgRef.set(message);
+  return message;
+}
+
+/**
+ * GET /api/inbox/messages - Get inbox messages for current user
+ */
+app.get('/api/inbox/messages', verifyAuth, async (req, res) => {
+  try {
+    const inboxRef = db.ref(`inbox/${req.user.uid}`);
+    const snapshot = await inboxRef.orderByChild('createdAt').limitToLast(100).once('value');
+    const rawMessages = snapshot.val() || {};
+    const messages = Object.values(rawMessages).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ success: true, messages, total: messages.length });
+  } catch (error) {
+    console.error('Error fetching inbox:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error fetching inbox' });
+  }
+});
+
+/**
+ * GET /api/inbox/unread-count - Get count of unread messages
+ */
+app.get('/api/inbox/unread-count', verifyAuth, async (req, res) => {
+  try {
+    const inboxRef = db.ref(`inbox/${req.user.uid}`);
+    const snapshot = await inboxRef.orderByChild('read').equalTo(false).once('value');
+    const count = snapshot.numChildren();
+    res.json({ success: true, unreadCount: count });
+  } catch (error) {
+    res.json({ success: true, unreadCount: 0 });
+  }
+});
+
+/**
+ * POST /api/inbox/messages/:id/read - Mark a message as read
+ */
+app.post('/api/inbox/messages/:id/read', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.ref(`inbox/${req.user.uid}/${id}/read`).set(true);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error marking message as read' });
+  }
+});
+
+/**
+ * POST /api/inbox/messages/read-all - Mark all messages as read
+ */
+app.post('/api/inbox/messages/read-all', verifyAuth, async (req, res) => {
+  try {
+    const inboxRef = db.ref(`inbox/${req.user.uid}`);
+    const snapshot = await inboxRef.once('value');
+    const messages = snapshot.val() || {};
+    const updates = {};
+    for (const msgId of Object.keys(messages)) {
+      updates[`${msgId}/read`] = true;
+    }
+    if (Object.keys(updates).length > 0) {
+      await inboxRef.update(updates);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error marking all as read' });
+  }
+});
+
+/**
+ * DELETE /api/inbox/messages/:id - Delete an inbox message
+ */
+app.delete('/api/inbox/messages/:id', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.ref(`inbox/${req.user.uid}/${id}`).remove();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error deleting message' });
+  }
+});
+
+/**
+ * POST /api/admin/inbox/send - Admin send message to a user's inbox
+ */
+app.post('/api/admin/inbox/send', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    const { userId, title, message, type } = req.body;
+
+    if (!userId || !title || !message) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'userId, title, and message are required' });
+    }
+
+    // Verify user exists
+    const userSnap = await db.ref(`users/${userId}`).once('value');
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: true, code: 'USER_NOT_FOUND', message: 'User not found' });
+    }
+
+    const adminSnap = await db.ref(`users/${req.user.uid}`).once('value');
+    const adminProfile = adminSnap.val() || {};
+    const adminName = adminProfile.minecraftUsername || 'Admin';
+
+    await sendInboxMessage(userId, {
+      title,
+      message,
+      type: type || 'admin_message',
+      from: adminName + ' (Staff)'
+    });
+
+    await logAdminAction(req, req.user.uid, 'SEND_INBOX_MESSAGE', userId, { title, type });
+
+    res.json({ success: true, message: 'Message sent successfully' });
+  } catch (error) {
+    console.error('Error sending admin message:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: 'Error sending message' });
+  }
+});
+
+/**
+ * POST /api/admin/resolve-violation - Resolve a match violation
+ * Reverts rating changes, blacklists offender, notifies both players
+ */
+app.post('/api/admin/resolve-violation', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'blacklist:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Blacklist manage capability required' });
+    }
+
+    const { username, matchId, reason, blacklistDurationHours } = req.body;
+
+    if (!username || !matchId || !reason) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'username, matchId, and reason are required' });
+    }
+
+    // 1. Get the match data
+    const matchRef = db.ref(`matches/${matchId}`);
+    const matchSnap = await matchRef.once('value');
+    const match = matchSnap.val();
+
+    if (!match) {
+      return res.status(404).json({ error: true, code: 'NOT_FOUND', message: 'Match not found' });
+    }
+
+    if (!match.finalized) {
+      return res.status(400).json({ error: true, code: 'NOT_FINALIZED', message: 'Match has not been finalized yet' });
+    }
+
+    // 2. Identify the offending player and the victim
+    const offenderUsername = username.toLowerCase();
+    let offenderId = null;
+    let victimId = null;
+    let offenderIsPlayer = false;
+
+    if (match.playerUsername && match.playerUsername.toLowerCase() === offenderUsername) {
+      offenderId = match.playerId;
+      victimId = match.testerId;
+      offenderIsPlayer = true;
+    } else if (match.testerUsername && match.testerUsername.toLowerCase() === offenderUsername) {
+      offenderId = match.testerId;
+      victimId = match.playerId;
+      offenderIsPlayer = false;
+    } else {
+      // Try to find by player lookup
+      const playerSnap = await db.ref('players').orderByChild('username').equalTo(username).limitToFirst(1).once('value');
+      const playerData = playerSnap.val() || {};
+      const playerEntry = Object.values(playerData)[0];
+      if (playerEntry) {
+        if (playerEntry.userId === match.playerId) {
+          offenderId = match.playerId;
+          victimId = match.testerId;
+          offenderIsPlayer = true;
+        } else if (playerEntry.userId === match.testerId) {
+          offenderId = match.testerId;
+          victimId = match.playerId;
+          offenderIsPlayer = false;
+        }
+      }
+    }
+
+    if (!offenderId) {
+      return res.status(404).json({ error: true, code: 'PLAYER_NOT_FOUND', message: 'Could not find the offending player in this match' });
+    }
+
+    // 3. Get finalization data to determine rating changes to revert
+    const finData = match.finalizationData || {};
+    const ratingChanges = finData.ratingChanges || {};
+    const gamemode = match.gamemode;
+
+    // 4. Revert rating changes for the victim
+    const ratingAdjustments = [];
+    if (gamemode && victimId) {
+      const victimPlayersSnap = await db.ref('players').orderByChild('userId').equalTo(victimId).limitToFirst(1).once('value');
+      const victimPlayers = victimPlayersSnap.val() || {};
+      const victimPlayerEntry = Object.entries(victimPlayers)[0];
+
+      if (victimPlayerEntry) {
+        const [victimPlayerId, victimPlayerData] = victimPlayerEntry;
+        const currentRating = victimPlayerData.gamemodeRatings?.[gamemode] || 1000;
+
+        // Calculate how much to restore
+        let ratingToRestore = 0;
+        if (offenderIsPlayer) {
+          // Offender was the player; victim was the tester
+          ratingToRestore = Math.abs(ratingChanges.testerRatingChange || 0);
+          if (ratingChanges.testerRatingChange < 0) {
+            // Tester lost rating - restore the loss
+            ratingToRestore = Math.abs(ratingChanges.testerRatingChange);
+          } else {
+            ratingToRestore = 0; // Tester gained, no need to restore
+          }
+        } else {
+          // Offender was the tester; victim was the player
+          ratingToRestore = Math.abs(ratingChanges.playerRatingChange || 0);
+          if (ratingChanges.playerRatingChange < 0) {
+            ratingToRestore = Math.abs(ratingChanges.playerRatingChange);
+          } else {
+            ratingToRestore = 0;
+          }
+        }
+
+        if (ratingToRestore > 0) {
+          const newRating = currentRating + ratingToRestore;
+          await db.ref(`players/${victimPlayerId}/gamemodeRatings/${gamemode}`).set(newRating);
+
+          ratingAdjustments.push({
+            gamemode: gamemode,
+            before: currentRating,
+            restored: ratingToRestore,
+            after: newRating
+          });
+        }
+      }
+    }
+
+    // 5. Blacklist the offender
+    const safeDuration = Number(blacklistDurationHours) > 0 ? Math.min(Number(blacklistDurationHours), 24 * 365) : 0;
+    const expiresAt = safeDuration > 0
+      ? new Date(Date.now() + safeDuration * 60 * 60 * 1000).toISOString()
+      : null;
+
+    const blacklistRef = db.ref('blacklist');
+    const newBlacklistRef = blacklistRef.push();
+    await newBlacklistRef.set({
+      username: username,
+      userId: offenderId,
+      reason: `[Auto-Resolve] ${reason}`,
+      addedAt: new Date().toISOString(),
+      addedBy: req.user.uid,
+      expiresAt,
+      disabledFunctions: {}
+    });
+
+    // 6. Send inbox notice to the VICTIM
+    if (victimId) {
+      const victimMessage = ratingAdjustments.length > 0
+        ? 'We have detected that one or more of your recent opponents has violated our policies. As compensation for potentially unfair rating losses, we have adjusted your ratings.'
+        : 'We have detected that one or more of your recent opponents has violated our policies. Your ratings were not negatively affected by this match.';
+
+      await sendInboxMessage(victimId, {
+        title: 'Match Rating Adjustment',
+        message: victimMessage,
+        type: 'rating_adjustment',
+        from: 'MC Leaderboards Moderation',
+        ratingAdjustments: ratingAdjustments,
+        reason: reason
+      });
+    }
+
+    // 7. Send inbox notice to the OFFENDER
+    if (offenderId) {
+      const durText = expiresAt
+        ? `Your account has been temporarily restricted until ${new Date(expiresAt).toLocaleDateString()}.`
+        : 'Your account has been permanently restricted.';
+
+      await sendInboxMessage(offenderId, {
+        title: 'Account Action: Policy Violation',
+        message: `Your account has been flagged for violating our policies in match ${matchId}.\n\n${durText}\n\nReason: ${reason}\n\nIf you believe this action was taken in error, please contact support.`,
+        type: 'blacklist',
+        from: 'MC Leaderboards Moderation',
+        reason: reason
+      });
+    }
+
+    // 8. Mark match as resolved
+    await matchRef.update({
+      resolved: true,
+      resolvedAt: new Date().toISOString(),
+      resolvedBy: req.user.uid,
+      resolveReason: reason,
+      ratingReverted: ratingAdjustments.length > 0
+    });
+
+    // 9. Log admin action
+    await logAdminAction(req, req.user.uid, 'RESOLVE_VIOLATION', offenderId, {
+      matchId,
+      username,
+      reason,
+      blacklistDurationHours: safeDuration,
+      ratingAdjustments,
+      victimId
+    });
+
+    await checkAndTerminateBlacklistedMatches();
+
+    res.json({
+      success: true,
+      message: 'Match violation resolved successfully. Ratings reverted, offender blacklisted, both players notified.',
+      ratingAdjustments
+    });
+  } catch (error) {
+    console.error('Error resolving violation:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: error.message || 'Error resolving violation' });
+  }
 });
 
 // ===== Plus Membership Routes =====
@@ -10754,20 +11511,26 @@ app.post('/api/plus/redeem-code', verifyAuth, requireRecaptcha, async (req, res)
     
     if (codeData.used === true) {
       if (codeData.usedBy === userId) {
-        const userSnapshot = await db.ref(`users/${userId}`).once('value');
-        return res.json({
-          success: true,
-          message: 'Code was already redeemed on this account.',
-          plus: userSnapshot.val()?.plus || null,
-          code,
-          alreadyRedeemed: true
+        // If the previous redemption is still pending (grant never completed), 
+        // skip the early return and fall through to the grant logic below.
+        if (codeData.redeemedPending !== true) {
+          const userSnapshot = await db.ref(`users/${userId}`).once('value');
+          return res.json({
+            success: true,
+            message: 'Code was already redeemed on this account.',
+            plus: userSnapshot.val()?.plus || null,
+            code,
+            alreadyRedeemed: true
+          });
+        }
+        // redeemedPending === true: fall through to complete the grant
+      } else {
+        return res.status(409).json({
+          error: true,
+          code: 'CODE_ALREADY_USED',
+          message: 'This code has already been used.'
         });
       }
-      return res.status(409).json({
-        error: true,
-        code: 'CODE_ALREADY_USED',
-        message: 'This code has already been used.'
-      });
     }
     
     if (codeData.assignedUserId && codeData.assignedUserId !== userId) {
@@ -12883,6 +13646,7 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
     };
 
     await newEntryRef.set(payload);
+    blacklistCache.data = null; // Invalidate cache
 
     if (resolvedUserId) {
       const historyRef = db.ref(`users/${resolvedUserId}/moderationHistory`).push();
@@ -12905,6 +13669,21 @@ app.post('/api/admin/blacklist', verifyAuth, verifyAdmin, async (req, res) => {
       expiresAt,
       disabledFunctions: normalizedDisabledFunctions
     });
+
+    // Send inbox notification about the blacklist
+    if (resolvedUserId) {
+      const durText = expiresAt
+        ? `Your account has been temporarily restricted until ${new Date(expiresAt).toLocaleDateString()}. Your access will be automatically restored after this date.`
+        : 'Your account has been permanently restricted from the platform.';
+
+      await sendInboxMessage(resolvedUserId, {
+        title: 'Account Restricted',
+        message: `Your account has been restricted.\n\n${durText}\n\nReason: ${payload.reason}\n\nIf you believe this action was taken in error, please contact support.`,
+        type: 'blacklist',
+        from: 'MC Leaderboards Moderation',
+        reason: payload.reason
+      });
+    }
     
     // Check and terminate any active matches for this blacklisted user
     await checkAndTerminateBlacklistedMatches();
@@ -12934,6 +13713,7 @@ app.delete('/api/admin/blacklist/:id', verifyAuth, verifyAdmin, async (req, res)
     const snapshot = await blacklistRef.once('value');
     const entry = snapshot.val() || null;
     await blacklistRef.remove();
+    blacklistCache.data = null; // Invalidate cache
 
     if (entry?.userId) {
       const historyRef = db.ref(`users/${entry.userId}/moderationHistory`).push();
@@ -12942,6 +13722,15 @@ app.delete('/api/admin/blacklist/:id', verifyAuth, verifyAdmin, async (req, res)
         reason: entry.reason || 'Removed by admin',
         by: req.user.uid,
         at: new Date().toISOString()
+      });
+
+      // Send inbox message notifying user their restriction has been lifted
+      await sendInboxMessage(entry.userId, {
+        title: 'Account Restriction Lifted',
+        message: 'Your account restriction has been removed. You now have full access to all MC Leaderboards features.\n\nPlease make sure to follow our community rules to avoid future restrictions.\n\nWelcome back!',
+        type: 'system',
+        from: 'MC Leaderboards Moderation',
+        metadata: { event: 'blacklist_removed' }
       });
     }
 
@@ -12958,6 +13747,230 @@ app.delete('/api/admin/blacklist/:id', verifyAuth, verifyAdmin, async (req, res)
       code: 'SERVER_ERROR',
       message: 'Error removing from blacklist'
     });
+  }
+});
+
+/**
+ * POST /api/admin/bulk-punish - Bulk punish accounts: revert matches, send inbox messages, blacklist
+ */
+app.post('/api/admin/bulk-punish', verifyAuth, verifyAdmin, async (req, res) => {
+  try {
+    if (!adminHasCapability(req, 'blacklist:manage')) {
+      return res.status(403).json({ error: true, code: 'PERMISSION_DENIED', message: 'Blacklist manage capability required' });
+    }
+
+    const { usernames, reason, ban, durationHours } = req.body;
+
+    if (!Array.isArray(usernames) || usernames.length === 0) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'At least one username is required' });
+    }
+
+    if (usernames.length > 50) {
+      return res.status(400).json({ error: true, code: 'VALIDATION_ERROR', message: 'Maximum 50 usernames per request' });
+    }
+
+    const safeReason = String(reason || 'Bulk punishment').trim().substring(0, 500);
+    const safeDuration = Number(durationHours) > 0 ? Math.min(Number(durationHours), 24 * 365) : 0;
+    const expiresAt = safeDuration > 0 ? new Date(Date.now() + safeDuration * 60 * 60 * 1000).toISOString() : null;
+
+    const results = { matchesReverted: 0, messagesSent: 0, accountsBlacklisted: 0, errors: [] };
+
+    // Load all users, players, and matches once
+    const [usersSnap, playersSnap, matchesSnap] = await Promise.all([
+      db.ref('users').once('value'),
+      db.ref('players').once('value'),
+      db.ref('matches').once('value')
+    ]);
+    const allUsers = usersSnap.val() || {};
+    const allPlayers = playersSnap.val() || {};
+    const allMatches = matchesSnap.val() || {};
+
+    // Build lookup maps
+    const usernameToUserId = {};
+    for (const [uid, user] of Object.entries(allUsers)) {
+      if (user.minecraftUsername) {
+        usernameToUserId[user.minecraftUsername.toLowerCase()] = uid;
+      }
+    }
+
+    const userIdToPlayerKey = {};
+    for (const [key, player] of Object.entries(allPlayers)) {
+      if (player.userId) {
+        userIdToPlayerKey[player.userId] = key;
+      }
+    }
+
+    // Normalize target usernames
+    const targetUsernames = usernames.map(u => String(u).trim()).filter(Boolean);
+    const targetUsernamesLower = new Set(targetUsernames.map(u => u.toLowerCase()));
+
+    // Find all user IDs for the target usernames
+    const targetUserIds = new Set();
+    for (const uname of targetUsernamesLower) {
+      if (usernameToUserId[uname]) {
+        targetUserIds.add(usernameToUserId[uname]);
+      }
+    }
+
+    // Find and revert all finalized matches where any target user was a participant
+    const affectedOpponents = new Map(); // opponentUserId -> [matchIds]
+    for (const [matchId, match] of Object.entries(allMatches)) {
+      if (!match.finalized || match.reverted) continue;
+
+      const playerIsTarget = targetUserIds.has(match.playerId) ||
+        targetUsernamesLower.has((match.playerUsername || '').toLowerCase());
+      const testerIsTarget = targetUserIds.has(match.testerId) ||
+        targetUsernamesLower.has((match.testerUsername || '').toLowerCase());
+
+      if (!playerIsTarget && !testerIsTarget) continue;
+
+      // Revert rating changes if they exist
+      const ratingChanges = match.finalizationData?.ratingChanges;
+      if (ratingChanges) {
+        try {
+          const { playerRatingChange, testerRatingChange, playerNewRating, testerNewRating } = ratingChanges;
+          const gamemode = match.gamemode;
+          const playerOldRating = (playerNewRating ?? 0) - (playerRatingChange ?? 0);
+          const testerOldRating = (testerNewRating ?? 0) - (testerRatingChange ?? 0);
+
+          for (const { userId, oldRating } of [
+            { userId: match.playerId, oldRating: playerOldRating },
+            { userId: match.testerId, oldRating: testerOldRating }
+          ]) {
+            if (!userId) continue;
+            const playerKey = userIdToPlayerKey[userId];
+            if (!playerKey) continue;
+            const player = allPlayers[playerKey];
+            const gamemodeRatings = { ...(player.gamemodeRatings || {}), [gamemode]: oldRating };
+            const overallRating = calculateOverallRating(gamemodeRatings);
+            const gamemodeMatchCount = { ...(player.gamemodeMatchCount || {}) };
+            if (gamemodeMatchCount[gamemode] > 0) gamemodeMatchCount[gamemode]--;
+
+            await db.ref(`players/${playerKey}`).update({ gamemodeRatings, overallRating, gamemodeMatchCount });
+            // Update our local copy for subsequent reverts
+            player.gamemodeRatings = gamemodeRatings;
+            player.gamemodeMatchCount = gamemodeMatchCount;
+          }
+
+          await db.ref(`matches/${matchId}`).update({
+            reverted: true,
+            revertedAt: new Date().toISOString(),
+            revertedBy: req.user.uid,
+            revertReason: safeReason
+          });
+
+          results.matchesReverted++;
+        } catch (err) {
+          results.errors.push(`Failed to revert match ${matchId}: ${err.message}`);
+        }
+      }
+
+      // Track opponents for notification
+      const opponentId = playerIsTarget ? match.testerId : match.playerId;
+      if (opponentId && !targetUserIds.has(opponentId)) {
+        if (!affectedOpponents.has(opponentId)) affectedOpponents.set(opponentId, []);
+        affectedOpponents.get(opponentId).push(matchId);
+      }
+    }
+
+    // Send inbox messages to all affected opponents
+    for (const [opponentId, matchIds] of affectedOpponents.entries()) {
+      try {
+        await sendInboxMessage(opponentId, {
+          title: 'Match Ratings Reverted',
+          message: `${matchIds.length} match(es) you participated in have had their ratings reverted due to policy enforcement against another player.\n\nYour rating has been restored to its pre-match value. No action is required from you.\n\nReason: ${safeReason}`,
+          type: 'system',
+          from: 'MC Leaderboards Moderation',
+          metadata: { event: 'bulk_punish_revert', matchIds, reason: safeReason }
+        });
+        results.messagesSent++;
+      } catch (err) {
+        results.errors.push(`Failed to message user ${opponentId}: ${err.message}`);
+      }
+    }
+
+    // Send inbox messages to the punished players
+    for (const uid of targetUserIds) {
+      try {
+        const durText = expiresAt
+          ? `Your account has been temporarily restricted until ${new Date(expiresAt).toLocaleDateString()}.`
+          : 'Your account has been permanently restricted.';
+
+        await sendInboxMessage(uid, {
+          title: 'Account Punished',
+          message: `Your account has been punished and all your match ratings have been reverted.\n\n${ban !== false ? durText : ''}\n\nReason: ${safeReason}\n\nIf you believe this was in error, contact support.`,
+          type: 'blacklist',
+          from: 'MC Leaderboards Moderation',
+          reason: safeReason
+        });
+        results.messagesSent++;
+      } catch (err) {
+        results.errors.push(`Failed to message target ${uid}: ${err.message}`);
+      }
+    }
+
+    // Blacklist accounts if requested
+    if (ban !== false) {
+      for (const uname of targetUsernames) {
+        try {
+          const resolvedUserId = usernameToUserId[uname.toLowerCase()] || null;
+          let resolvedMinecraftUUID = null;
+
+          const mojangProfile = await fetchMojangProfile(uname).catch(() => null);
+          if (mojangProfile) {
+            resolvedMinecraftUUID = mojangProfile.uuid;
+          }
+
+          const blacklistRef = db.ref('blacklist');
+          const newEntryRef = blacklistRef.push();
+          await newEntryRef.set({
+            username: mojangProfile?.username || uname,
+            userId: resolvedUserId,
+            minecraftUUID: resolvedMinecraftUUID,
+            reason: safeReason,
+            addedAt: new Date().toISOString(),
+            addedBy: req.user.uid,
+            expiresAt,
+            disabledFunctions: {}
+          });
+
+          if (resolvedUserId) {
+            await db.ref(`users/${resolvedUserId}/moderationHistory`).push().set({
+              type: 'blacklist_added',
+              reason: safeReason,
+              temporary: Boolean(expiresAt),
+              expiresAt,
+              by: req.user.uid,
+              at: new Date().toISOString()
+            });
+          }
+
+          results.accountsBlacklisted++;
+        } catch (err) {
+          results.errors.push(`Failed to blacklist ${uname}: ${err.message}`);
+        }
+      }
+
+      blacklistCache.data = null;
+      await checkAndTerminateBlacklistedMatches();
+    }
+
+    playersCache.data = null;
+    playersCache.updatedAt = 0;
+
+    await logAdminAction(req, req.user.uid, 'BULK_PUNISH', null, {
+      usernames: targetUsernames,
+      reason: safeReason,
+      ban: ban !== false,
+      durationHours: safeDuration,
+      matchesReverted: results.matchesReverted,
+      accountsBlacklisted: results.accountsBlacklisted
+    });
+
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Error executing bulk punishment:', error);
+    res.status(500).json({ error: true, code: 'SERVER_ERROR', message: error.message || 'Error executing bulk punishment' });
   }
 });
 
@@ -16857,10 +17870,61 @@ app.listen(PORT, async () => {
       await cleanupRetiredNotificationData();
       const backupResult = await createRealtimeDatabaseFirestoreBackup('scheduled');
       console.log(`[MAINTENANCE] RTDB backup stored in Firestore as ${backupResult.backupId}`);
+      
+      // Cleanup old security logs (keep last 30 days)
+      try {
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const oldSecLogs = await db.ref('securityLogs').orderByChild('detectedAt').endAt(thirtyDaysAgo).limitToFirst(500).once('value');
+        const toDelete = {};
+        oldSecLogs.forEach(snap => { toDelete[snap.key] = null; });
+        const secLogCount = Object.keys(toDelete).length;
+        if (secLogCount > 0) {
+          await db.ref('securityLogs').update(toDelete);
+          console.log(`[MAINTENANCE] Pruned ${secLogCount} old security logs`);
+        }
+      } catch (secLogErr) {
+        console.error('[MAINTENANCE] Security log cleanup error:', secLogErr);
+      }
+      
+      // Cleanup old audit logs (keep last 90 days)
+      try {
+        const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+        const oldAuditLogs = await db.ref('adminAuditLog').orderByChild('timestamp').endAt(ninetyDaysAgo).limitToFirst(500).once('value');
+        const toDeleteAudit = {};
+        oldAuditLogs.forEach(snap => { toDeleteAudit[snap.key] = null; });
+        const auditLogCount = Object.keys(toDeleteAudit).length;
+        if (auditLogCount > 0) {
+          await db.ref('adminAuditLog').update(toDeleteAudit);
+          console.log(`[MAINTENANCE] Pruned ${auditLogCount} old audit logs`);
+        }
+      } catch (auditErr) {
+        console.error('[MAINTENANCE] Audit log cleanup error:', auditErr);
+      }
     } catch (error) {
       console.error('Error in 48h Firebase maintenance:', error);
     } finally {
       maintenanceJobRunning = false;
     }
   }, 48 * 60 * 60 * 1000);
+
+  // Match cleanup: delete cancelled/ended matches older than 2 weeks (every 6 hours)
+  setInterval(async () => {
+    try {
+      const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+      const matchesSnap = await db.ref('matches').orderByChild('finalizedAt').endAt(twoWeeksAgo).limitToFirst(100).once('value');
+      const matches = matchesSnap.val() || {};
+      let deletedCount = 0;
+      for (const [matchId, match] of Object.entries(matches)) {
+        if (match && match.finalized && (match.status === 'cancelled' || match.status === 'ended' || match.deletedDueToInactivity)) {
+          await db.ref(`matches/${matchId}`).remove();
+          deletedCount++;
+        }
+      }
+      if (deletedCount > 0) {
+        console.log(`[CLEANUP] Deleted ${deletedCount} matches older than 2 weeks`);
+      }
+    } catch (error) {
+      console.error('Error in match cleanup:', error);
+    }
+  }, 6 * 60 * 60 * 1000);
 });

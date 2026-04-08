@@ -84,11 +84,14 @@
 
         <!-- Leaderboard -->
         <div class="card leaderboard-container" style="border-radius: 16px;">
-            <div class="card-header leaderboard-header">
+            <div class="card-header leaderboard-header" style="display: flex; justify-content: space-between; align-items: center;">
                 <h2 class="card-title" id="leaderboardTitle">
                     <i class="fas fa-medal"></i>
                     Overall Leaderboard
                 </h2>
+                <button onclick="openLeaderboardSettings()" class="lb-settings-btn" title="Leaderboard Settings">
+                    <i class="fas fa-sliders"></i>
+                </button>
             </div>
             <div class="card-body">
                 <div id="leaderboardContent">
@@ -127,7 +130,6 @@
                 <a href="support.html">Support</a>
                 <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
-                <a href="api-docs.html">API Docs</a>
             </div>
             <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
         </div>
@@ -145,6 +147,7 @@
     <script src="js/firebase-auth-service.js" defer></script>
     <script src="js/leaderboard.js" defer></script>
     <script src="js/navigation.js" defer></script>
+    <script src="js/ui-enhancements.js" defer></script>
 </body>
 </html>
 

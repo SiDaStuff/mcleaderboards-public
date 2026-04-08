@@ -13,6 +13,7 @@ let matchPollingInterval = null;
 let chatPollingInterval = null;
 let lastChatSignature = '';
 const chatMessageCache = new Map();
+let matchEventSource = null;
 
 function getRoleLabelForMatchUser(userId) {
   if (!match || !userId) return 'Participant';
@@ -121,6 +122,11 @@ async function initTesting() {
 
   await loadMatch();
   startSecureMatchPolling();
+
+  // If match is already finalized when page loads, show results immediately
+  if (match && match.finalized === true && match.finalizationData) {
+    handleMatchEnded();
+  }
 
   if (window.mclbLoadingOverlay) {
     window.mclbLoadingOverlay.updateStatus('Match ready!', 100);
@@ -608,6 +614,105 @@ function startSecureMatchPolling() {
   refreshMatchState({ silent: false });
   loadChatMessages();
 
+  // Try SSE first, fall back to polling
+  startMatchSSE();
+}
+
+/**
+ * Establish SSE connection for real-time match updates
+ */
+function startMatchSSE() {
+  if (matchEventSource) return; // already connected
+
+  const token = apiService.getToken();
+  if (!token || !matchId) {
+    // Fall back to polling if no token
+    startMatchPollingFallback();
+    return;
+  }
+
+  const baseUrl = CONFIG.API_BASE_URL.replace(/\/api$/, '');
+  const url = `${baseUrl}/api/match/${encodeURIComponent(matchId)}/stream`;
+
+  // EventSource doesn't support Authorization headers, so we use fetch-based SSE
+  const controller = new AbortController();
+  matchEventSource = { close: () => controller.abort(), _controller: controller };
+
+  (async () => {
+    try {
+      const response = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${token}` },
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`SSE failed: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              handleSSEEvent(event);
+            } catch { /* ignore parse errors */ }
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') return; // intentional close
+      console.warn('SSE connection lost, falling back to polling:', err.message);
+      matchEventSource = null;
+      startMatchPollingFallback();
+    }
+  })();
+}
+
+/**
+ * Handle incoming SSE event
+ */
+function handleSSEEvent(event) {
+  if (event.type === 'match') {
+    const updatedMatch = event.data;
+    if (!updatedMatch) return;
+
+    const previousStatus = match?.status;
+    const previousFinalized = match?.finalized === true;
+    match = updatedMatch;
+
+    renderMatch();
+    updateBothJoinedStatus();
+
+    if ((updatedMatch.status === 'ended' || updatedMatch.finalized === true) && (previousStatus !== 'ended' || !previousFinalized)) {
+      handleMatchEnded();
+    }
+
+    const abortBtn = document.getElementById('abortMatchBtn');
+    if (abortBtn && updatedMatch.finalized === true) {
+      abortBtn.style.display = 'none';
+    }
+  } else if (event.type === 'chat') {
+    renderChatMessages(event.data || []);
+  }
+}
+
+/**
+ * Fall back to polling if SSE is unavailable
+ */
+function startMatchPollingFallback() {
+  if (matchPollingInterval) return; // already polling
+
   matchPollingInterval = setInterval(() => {
     if (document.visibilityState === 'visible') {
       refreshMatchState();
@@ -622,6 +727,11 @@ function startSecureMatchPolling() {
 }
 
 function stopSecureMatchPolling() {
+  if (matchEventSource) {
+    matchEventSource.close();
+    matchEventSource = null;
+  }
+
   if (matchPollingInterval) {
     clearInterval(matchPollingInterval);
     matchPollingInterval = null;
@@ -1275,15 +1385,20 @@ function createLightStreams() {
 }
 
 /**
- * Create confetti animation
+ * Create confetti animation for rank-up
  */
 function createConfetti() {
+  if (typeof confetti === 'function') {
+    confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 }, zIndex: 10010, colors: ['#FFD700', '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4'] });
+    return;
+  }
+  // Fallback: DOM confetti if canvas-confetti not loaded
   const container = document.getElementById('confetti-container');
   if (!container) return;
 
   for (let i = 0; i < 100; i++) {
-    const confetti = document.createElement('div');
-    confetti.style.cssText = `
+    const piece = document.createElement('div');
+    piece.style.cssText = `
       position: absolute;
       width: 10px;
       height: 10px;
@@ -1293,14 +1408,8 @@ function createConfetti() {
       animation: confettiFall ${2 + Math.random() * 3}s linear ${Math.random() * 2}s both;
       transform: rotate(${Math.random() * 360}deg);
     `;
-    container.appendChild(confetti);
-
-    // Remove confetti after animation
-    setTimeout(() => {
-      if (confetti.parentNode) {
-        confetti.remove();
-      }
-    }, 5000);
+    container.appendChild(piece);
+    setTimeout(() => { if (piece.parentNode) piece.remove(); }, 5000);
   }
 }
 
@@ -1336,10 +1445,14 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
   const { playerScore, testerScore, ratingChanges, titleChanges } = finalizationData;
   const isDrawWithoutScoring = ['draw_vote', 'draw_timeout'].includes(finalizationData?.type);
   const drawSubtitle = finalizationData?.type === 'draw_timeout'
-    ? 'The 5 minute start window expired, so the match was finalized as a draw without rating changes.'
-    : 'Both participants agreed to end match without scoring.';
+    ? 'The start window expired — finalized as a draw.'
+    : 'Both participants agreed to end without scoring.';
 
-  // Note: last tested timestamp is now handled by backend during match finalization
+  const userId = AppState.getUserId();
+  const isPlayer = match.playerId === userId;
+  const playerWon = (playerScore || 0) > (testerScore || 0);
+  const youWon = (isPlayer && playerWon) || (!isPlayer && !playerWon);
+  const isDraw = (playerScore || 0) === (testerScore || 0);
 
   // Hide the testing interface and show results
   const mainContent = document.querySelector('main.container');
@@ -1347,176 +1460,133 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
     mainContent.style.display = 'none';
   }
 
-  // Create centered modal backdrop
+  // Create backdrop
   const backdrop = document.createElement('div');
   backdrop.id = 'matchResultsBackdrop';
   backdrop.style.cssText = `
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(0, 0, 0, 0.8);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    position: fixed; inset: 0;
+    background: rgba(10, 15, 25, 0.92);
+    display: flex; align-items: center; justify-content: center;
     z-index: 10000;
-    animation: fadeIn 0.5s ease-out;
+    animation: fadeIn 0.4s ease-out;
   `;
-
-  // Add confetti container
-  const confettiContainer = document.createElement('div');
-  confettiContainer.id = 'matchResultsConfetti';
-  confettiContainer.style.cssText = `
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-    z-index: 10001;
-  `;
-  backdrop.appendChild(confettiContainer);
-
   document.body.appendChild(backdrop);
 
-  // Create animated modal content
-  const modalContent = document.createElement('div');
-  modalContent.className = 'match-results-modal-animated';
-  modalContent.style.cssText = `
-    background: var(--secondary-bg);
+  // Determine accent — subtle and muted
+  const accentColor = isDrawWithoutScoring ? '#a8893a' : youWon ? '#3a9e7a' : '#5a7ebd';
+
+  // Build modal
+  const modal = document.createElement('div');
+  modal.className = 'match-results-modal-animated';
+  modal.style.cssText = `
+    background: #161b26;
+    border: 1px solid rgba(255,255,255,0.07);
     border-radius: 1rem;
-    padding: 3rem;
-    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
-    border: 1px solid var(--border-color);
-    max-width: 900px;
-    width: 90%;
-    max-height: 80vh;
-    overflow-y: auto;
-    animation: modalSlideIn 0.6s ease-out;
-    position: relative;
-    z-index: 10002;
+    max-width: 520px; width: 92%;
+    max-height: 85vh; overflow-y: auto;
+    animation: modalSlideIn 0.5s ease-out;
+    position: relative; z-index: 10002;
   `;
+  backdrop.appendChild(modal);
 
-  backdrop.appendChild(modalContent);
+  // Outcome
+  const outcomeIcon = isDrawWithoutScoring ? 'fa-handshake' : (youWon ? 'fa-trophy' : 'fa-flag');
+  const outcomeText = isDrawWithoutScoring ? 'Draw' : (youWon ? 'Victory' : 'Defeat');
+  const outcomeSubtext = isDrawWithoutScoring ? drawSubtitle : (youWon ? 'Well played!' : 'Better luck next time.');
 
-  let resultsHtml = `
-        <div class="match-results-header">
-          <div class="success-icon">
-            <i class="fas ${isDrawWithoutScoring ? 'fa-handshake' : 'fa-trophy'}"></i>
-          </div>
-          <h2>${isDrawWithoutScoring ? 'Match Ended As Draw' : 'Match Finalized!'}</h2>
-          <p class="match-results-subtitle">${isDrawWithoutScoring ? drawSubtitle : 'Your ratings have been updated based on the match results'}</p>
-        </div>
+  // Ratings
+  const yourOldRating = isPlayer ? ratingChanges?.playerOldRating : ratingChanges?.testerOldRating;
+  const yourNewRating = isPlayer ? ratingChanges?.playerNewRating : ratingChanges?.testerNewRating;
+  const yourChange = isPlayer ? ratingChanges?.playerRatingChange : ratingChanges?.testerRatingChange;
+  const opponentOldRating = isPlayer ? ratingChanges?.testerOldRating : ratingChanges?.playerOldRating;
+  const opponentNewRating = isPlayer ? ratingChanges?.testerNewRating : ratingChanges?.playerNewRating;
+  const opponentChange = isPlayer ? ratingChanges?.testerRatingChange : ratingChanges?.playerRatingChange;
+  const opponentName = isPlayer ? match.testerUsername : match.playerUsername;
 
-      <div class="match-results-details">
-        <div class="results-grid">
-          <div class="result-card">
-            <h3>Match Details</h3>
-            <div class="result-info">
-              <div class="info-row">
-                <span class="info-label">Gamemode:</span>
-                <span class="info-value">${match.gamemode.toUpperCase()}</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Player:</span>
-                <span class="info-value">${escapeHtml(match.playerUsername)}</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Tester:</span>
-                <span class="info-value">${escapeHtml(match.testerUsername)}</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Region:</span>
-                <span class="info-value">${match.region}</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Server:</span>
-                <span class="info-value">${escapeHtml(match.serverIP)}</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Final Score:</span>
-                <span class="info-value score-highlight">${playerScore || 0} - ${testerScore || 0}</span>
-              </div>
-            </div>
-          </div>
+  const changeColor = (val) => (val ?? 0) >= 0 ? '#5ec4a0' : '#d97070';
+  const changeBg = (val) => (val ?? 0) >= 0 ? 'rgba(94,196,160,0.1)' : 'rgba(217,112,112,0.1)';
+  const changePrefix = (val) => (val ?? 0) >= 0 ? '+' : '';
 
-          <div class="result-card">
-            <h3>Rating Changes</h3>
-            <div class="rating-changes">
-              <div class="rating-change-item" id="playerRatingItem">
-                <div class="player-info">
-                  <span class="player-name">${escapeHtml(match.playerUsername)}</span>
-                  <span class="player-role">(Player)</span>
-                </div>
-                <div class="rating-change">
-                  <span class="rating-value" id="playerRatingValue">${ratingChanges?.playerOldRating || ratingChanges?.playerNewRating || 'N/A'}</span>
-                  <span class="rating-diff ${ratingChanges?.playerRatingChange >= 0 ? 'positive' : 'negative'}" id="playerRatingDiff">
-                    ${ratingChanges?.playerRatingChange >= 0 ? '+' : ''}${ratingChanges?.playerRatingChange || 0}
-                  </span>
-                </div>
-              </div>
-              <div class="rating-change-item" id="testerRatingItem">
-                <div class="player-info">
-                  <span class="player-name">${escapeHtml(match.testerUsername)}</span>
-                  <span class="player-role">(Tester)</span>
-                </div>
-                <div class="rating-change">
-                  <span class="rating-value" id="testerRatingValue">${ratingChanges?.testerOldRating || ratingChanges?.testerNewRating || 'N/A'}</span>
-                  <span class="rating-diff ${ratingChanges?.testerRatingChange >= 0 ? 'positive' : 'negative'}" id="testerRatingDiff">
-                    ${ratingChanges?.testerRatingChange >= 0 ? '+' : ''}${ratingChanges?.testerRatingChange || 0}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
+  modal.innerHTML = `
+    <!-- Header -->
+    <div style="padding: 2rem 2rem 1.25rem; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.05);">
+      <i class="fas ${outcomeIcon}" style="font-size: 2rem; color: ${accentColor}; margin-bottom: 0.75rem; display: block;"></i>
+      <h2 style="margin: 0; color: #e8ecf1; font-size: 1.5rem; font-weight: 700;">${outcomeText}</h2>
+      <p style="margin: 0.4rem 0 0; color: #7a8494; font-size: 0.85rem;">${outcomeSubtext}</p>
+    </div>
+
+    <!-- Score -->
+    <div style="display: flex; align-items: center; justify-content: center; gap: 1.5rem; padding: 1.5rem 2rem;">
+      <div style="text-align: center;">
+        <div style="font-size: 0.7rem; color: #6b7688; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.3rem;">${escapeHtml(match.playerUsername)}</div>
+        <div style="font-size: 2.25rem; font-weight: 700; color: #e0e4ea; line-height: 1;">${playerScore || 0}</div>
+      </div>
+      <div style="font-size: 0.75rem; color: #3e4756; font-weight: 600; padding: 0.25rem 0.75rem; border: 1px solid rgba(255,255,255,0.06); border-radius: 1rem;">VS</div>
+      <div style="text-align: center;">
+        <div style="font-size: 0.7rem; color: #6b7688; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.3rem;">${escapeHtml(match.testerUsername)}</div>
+        <div style="font-size: 2.25rem; font-weight: 700; color: #e0e4ea; line-height: 1;">${testerScore || 0}</div>
+      </div>
+    </div>
+
+    ${!isDrawWithoutScoring && ratingChanges ? `
+    <!-- Ratings -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; padding: 0 1.5rem 1.5rem;">
+      <div style="background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.05); border-radius: 0.6rem; padding: 1rem; text-align: center;">
+        <div style="font-size: 0.65rem; color: #6b7688; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">Your Rating</div>
+        <div style="font-size: 1.4rem; font-weight: 600; color: #d0d5de;" id="playerRatingValue">${yourOldRating ?? yourNewRating ?? '—'}</div>
+        <div style="margin-top: 0.3rem;">
+          <span id="playerRatingDiff" style="display: inline-block; padding: 0.15rem 0.5rem; border-radius: 1rem; font-size: 0.8rem; font-weight: 600; background: ${changeBg(yourChange)}; color: ${changeColor(yourChange)};">
+            ${changePrefix(yourChange)}${yourChange ?? 0}
+          </span>
         </div>
       </div>
-
-        <div class="match-results-actions">
-          <button class="btn btn-secondary stay-on-page-btn" onclick="closeMatchResults()">
-            <i class="fas fa-times"></i> Stay on Testing Page
-          </button>
-          <button class="btn btn-primary return-dashboard-btn" onclick="returnToDashboard()">
-            <i class="fas fa-home"></i> Back to Dashboard
-          </button>
+      <div style="background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.05); border-radius: 0.6rem; padding: 1rem; text-align: center;">
+        <div style="font-size: 0.65rem; color: #6b7688; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;">${escapeHtml(opponentName)}</div>
+        <div style="font-size: 1.4rem; font-weight: 600; color: #d0d5de;" id="testerRatingValue">${opponentOldRating ?? opponentNewRating ?? '—'}</div>
+        <div style="margin-top: 0.3rem;">
+          <span id="testerRatingDiff" style="display: inline-block; padding: 0.15rem 0.5rem; border-radius: 1rem; font-size: 0.8rem; font-weight: 600; background: ${changeBg(opponentChange)}; color: ${changeColor(opponentChange)};">
+            ${changePrefix(opponentChange)}${opponentChange ?? 0}
+          </span>
         </div>
       </div>
     </div>
+    ` : ''}
+
+    <!-- Match Info -->
+    <div style="border-top: 1px solid rgba(255,255,255,0.05); padding: 1rem 1.5rem; display: flex; gap: 1.5rem; justify-content: center; flex-wrap: wrap;">
+      <span style="color: #6b7688; font-size: 0.8rem;"><i class="fas fa-gamepad" style="margin-right: 0.3rem; opacity: 0.6;"></i>${escapeHtml(match.gamemode.toUpperCase())}</span>
+      <span style="color: #6b7688; font-size: 0.8rem;"><i class="fas fa-globe" style="margin-right: 0.3rem; opacity: 0.6;"></i>${escapeHtml(match.region)}</span>
+      <span style="color: #6b7688; font-size: 0.8rem;"><i class="fas fa-server" style="margin-right: 0.3rem; opacity: 0.6;"></i>${escapeHtml(match.serverIP)}</span>
+    </div>
+
+    <!-- Actions -->
+    <div style="padding: 1rem 1.5rem 1.5rem; display: flex; gap: 0.6rem; justify-content: center;">
+      <button class="stay-on-page-btn" style="background: rgba(255,255,255,0.04); color: #8b95a5; border: 1px solid rgba(255,255,255,0.08); padding: 0.6rem 1.25rem; border-radius: 0.5rem; font-size: 0.85rem; font-weight: 500; cursor: pointer; transition: opacity 0.2s;">
+        Close
+      </button>
+      <button class="return-dashboard-btn" style="background: ${accentColor}; color: #fff; border: none; padding: 0.6rem 1.25rem; border-radius: 0.5rem; font-size: 0.85rem; font-weight: 500; cursor: pointer; transition: opacity 0.2s;">
+        Dashboard
+      </button>
+    </div>
   `;
 
-  modalContent.innerHTML = resultsHtml;
-
-  // Start rating animations after a delay
+  // Animate ratings and fire confetti after short delay
   setTimeout(() => {
     animateRatingChanges(ratingChanges);
-    createMatchResultsConfetti();
-  }, 1000);
-
-  // Add close functionality
-  backdrop.addEventListener('click', (e) => {
-    if (e.target === backdrop) {
-      closeMatchResults();
+    if (!isDrawWithoutScoring) {
+      fireMatchConfetti(youWon);
     }
+  }, 800);
+
+  // Close handlers
+  backdrop.addEventListener('click', (e) => {
+    if (e.target === backdrop) closeMatchResults();
   });
 
-  // Handle actions
-  const stayBtn = modalContent.querySelector('.stay-on-page-btn');
-  const dashboardBtn = modalContent.querySelector('.return-dashboard-btn');
-
-  if (stayBtn) {
-    stayBtn.onclick = () => {
-      backdrop.remove();
-      closeMatchResults();
-    };
-  }
-
-  if (dashboardBtn) {
-    dashboardBtn.onclick = () => {
-      backdrop.remove();
-      returnToDashboard();
-    };
-  }
+  const stayBtn = modal.querySelector('.stay-on-page-btn');
+  const dashboardBtn = modal.querySelector('.return-dashboard-btn');
+  if (stayBtn) stayBtn.onclick = () => { backdrop.remove(); closeMatchResults(); };
+  if (dashboardBtn) dashboardBtn.onclick = () => { backdrop.remove(); returnToDashboard(); };
 }
 
 /**
@@ -1525,13 +1595,22 @@ function showMatchResultsOverlay(finalizationData, apiResult) {
 function animateRatingChanges(ratingChanges) {
   if (!ratingChanges) return;
 
-  // Animate player rating
-  if (ratingChanges.playerOldRating !== undefined && ratingChanges.playerNewRating !== undefined) {
+  const userId = AppState.getUserId();
+  const isPlayerViewer = match?.playerId === userId;
+
+  // "Your" rating is in the playerRatingValue element; "Opponent" in testerRatingValue
+  const yourOld = isPlayerViewer ? ratingChanges.playerOldRating : ratingChanges.testerOldRating;
+  const yourNew = isPlayerViewer ? ratingChanges.playerNewRating : ratingChanges.testerNewRating;
+  const opponentOld = isPlayerViewer ? ratingChanges.testerOldRating : ratingChanges.playerOldRating;
+  const opponentNew = isPlayerViewer ? ratingChanges.testerNewRating : ratingChanges.playerNewRating;
+
+  // Animate your rating
+  if (yourOld !== undefined && yourNew !== undefined) {
     const playerRatingValue = document.getElementById('playerRatingValue');
     const playerRatingDiff = document.getElementById('playerRatingDiff');
 
     if (playerRatingValue && playerRatingDiff) {
-      animateNumberChange(playerRatingValue, ratingChanges.playerOldRating, ratingChanges.playerNewRating, 1000);
+      animateNumberChange(playerRatingValue, yourOld, yourNew, 1000);
       playerRatingDiff.style.opacity = '0';
       setTimeout(() => {
         playerRatingDiff.style.transition = 'opacity 0.5s ease-out';
@@ -1540,13 +1619,13 @@ function animateRatingChanges(ratingChanges) {
     }
   }
 
-  // Animate tester rating
-  if (ratingChanges.testerOldRating !== undefined && ratingChanges.testerNewRating !== undefined) {
+  // Animate opponent rating
+  if (opponentOld !== undefined && opponentNew !== undefined) {
     const testerRatingValue = document.getElementById('testerRatingValue');
     const testerRatingDiff = document.getElementById('testerRatingDiff');
 
     if (testerRatingValue && testerRatingDiff) {
-      animateNumberChange(testerRatingValue, ratingChanges.testerOldRating, ratingChanges.testerNewRating, 1000);
+      animateNumberChange(testerRatingValue, opponentOld, opponentNew, 1000);
       testerRatingDiff.style.opacity = '0';
       setTimeout(() => {
         testerRatingDiff.style.transition = 'opacity 0.5s ease-out';
@@ -1582,33 +1661,24 @@ function animateNumberChange(element, startValue, endValue, duration) {
 }
 
 /**
- * Create confetti for match results
+ * Fire confetti using canvas-confetti library
  */
-function createMatchResultsConfetti() {
-  const container = document.getElementById('matchResultsConfetti');
-  if (!container) return;
+function fireMatchConfetti(isWin) {
+  if (typeof confetti !== 'function') return;
 
-  for (let i = 0; i < 150; i++) {
-    const confetti = document.createElement('div');
-    confetti.style.cssText = `
-      position: absolute;
-      width: 10px;
-      height: 10px;
-      background: ${['#FFD700', '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9F43'][Math.floor(Math.random() * 7)]};
-      left: ${Math.random() * 100}%;
-      top: -10px;
-      animation: matchResultsConfettiFall ${2 + Math.random() * 4}s linear ${Math.random() * 2}s both;
-      transform: rotate(${Math.random() * 360}deg);
-      border-radius: ${Math.random() > 0.5 ? '50%' : '0'};
-    `;
-    container.appendChild(confetti);
+  const defaults = { disableForReducedMotion: true, zIndex: 10010 };
 
-    // Remove confetti after animation
+  if (isWin) {
+    // Celebration burst from both sides
+    const fire = (opts) => confetti({ ...defaults, ...opts });
+    fire({ particleCount: 40, spread: 55, origin: { x: 0.25, y: 0.6 }, colors: ['#5ec4a0', '#a8d8c8', '#ffffff'] });
+    fire({ particleCount: 40, spread: 55, origin: { x: 0.75, y: 0.6 }, colors: ['#5ec4a0', '#a8d8c8', '#ffffff'] });
     setTimeout(() => {
-      if (confetti.parentNode) {
-        confetti.remove();
-      }
-    }, 6000);
+      fire({ particleCount: 25, spread: 70, origin: { x: 0.5, y: 0.5 }, colors: ['#5ec4a0', '#d4af37', '#ffffff'] });
+    }, 400);
+  } else {
+    // Subtle single pop for losses
+    confetti({ ...defaults, particleCount: 15, spread: 40, origin: { x: 0.5, y: 0.6 }, colors: ['#5a7ebd', '#8ba4cc', '#c0cfe0'], gravity: 1.2 });
   }
 }
 

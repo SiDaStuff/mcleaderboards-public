@@ -8,6 +8,98 @@ let lastPlayersLoadTime = 0;
 const PLAYERS_CACHE_TTL = 50; // 50ms minimal cache
 let searchDebounceTimer = null;
 
+// Leaderboard settings (persisted to localStorage)
+const LEADERBOARD_SETTINGS_KEY = 'mclb_leaderboard_settings';
+const defaultLeaderboardSettings = {
+  showProvisional: false,
+  compactMode: false,
+  showRegion: false
+};
+
+function getLeaderboardSettings() {
+  try {
+    const stored = localStorage.getItem(LEADERBOARD_SETTINGS_KEY);
+    if (stored) return { ...defaultLeaderboardSettings, ...JSON.parse(stored) };
+  } catch (e) { /* ignore */ }
+  return { ...defaultLeaderboardSettings };
+}
+
+function saveLeaderboardSettings(settings) {
+  try {
+    localStorage.setItem(LEADERBOARD_SETTINGS_KEY, JSON.stringify(settings));
+  } catch (e) { /* ignore */ }
+}
+
+function updateLeaderboardSetting(key, value) {
+  const settings = getLeaderboardSettings();
+  settings[key] = value;
+  saveLeaderboardSettings(settings);
+}
+
+function openLeaderboardSettings() {
+  const settings = getLeaderboardSettings();
+  Swal.fire({
+    title: 'Leaderboard Settings',
+    html: `
+      <div style="text-align: left; display: flex; flex-direction: column; gap: 1rem;">
+        <label style="display: flex; align-items: center; gap: 0.75rem; cursor: pointer; padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);">
+          <input type="checkbox" id="setting-showProvisional" ${settings.showProvisional ? 'checked' : ''} style="width: 18px; height: 18px; accent-color: #1eb681;">
+          <div>
+            <div style="font-weight: 600; font-size: 0.95rem;">Show Provisional Players</div>
+            <div style="font-size: 0.82rem; opacity: 0.6;">Include players with fewer than 5 matches on the leaderboard</div>
+          </div>
+        </label>
+        <label style="display: flex; align-items: center; gap: 0.75rem; cursor: pointer; padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);">
+          <input type="checkbox" id="setting-compactMode" ${settings.compactMode ? 'checked' : ''} style="width: 18px; height: 18px; accent-color: #1eb681;">
+          <div>
+            <div style="font-weight: 600; font-size: 0.95rem;">Compact Mode</div>
+            <div style="font-size: 0.82rem; opacity: 0.6;">Reduce spacing for a denser leaderboard view</div>
+          </div>
+        </label>
+        <label style="display: flex; align-items: center; gap: 0.75rem; cursor: pointer; padding: 0.6rem 0;">
+          <input type="checkbox" id="setting-showRegion" ${settings.showRegion ? 'checked' : ''} style="width: 18px; height: 18px; accent-color: #1eb681;">
+          <div>
+            <div style="font-weight: 600; font-size: 0.95rem;">Show Region</div>
+            <div style="font-size: 0.82rem; opacity: 0.6;">Display player regions on leaderboard cards</div>
+          </div>
+        </label>
+      </div>
+    `,
+    confirmButtonText: 'Save',
+    showCancelButton: true,
+    cancelButtonText: 'Cancel',
+    preConfirm: () => {
+      return {
+        showProvisional: document.getElementById('setting-showProvisional')?.checked || false,
+        compactMode: document.getElementById('setting-compactMode')?.checked || false,
+        showRegion: document.getElementById('setting-showRegion')?.checked || false
+      };
+    }
+  }).then(async (result) => {
+    if (result.isConfirmed && result.value) {
+      const prevSettings = getLeaderboardSettings();
+      const provisionalChanged = prevSettings.showProvisional !== result.value.showProvisional;
+      saveLeaderboardSettings(result.value);
+      applyLeaderboardSettings();
+      if (provisionalChanged) {
+        // Reload from backend since filter changed
+        await loadPlayers();
+      } else {
+        filterPlayersByGamemode();
+        renderLeaderboard();
+      }
+    }
+  });
+}
+
+function applyLeaderboardSettings() {
+  const settings = getLeaderboardSettings();
+  const container = document.querySelector('.leaderboard-container');
+  if (container) {
+    container.classList.toggle('compact-mode', settings.compactMode);
+  }
+}
+
 // Autocomplete state
 let autocompleteDebounceTimer = null;
 
@@ -114,7 +206,7 @@ function showProvisionalTooltip(gamemode) {
     html: `
       <div style="text-align: left;">
         <p><strong>What does this mean?</strong></p>
-        <p>This player has played fewer than 10 matches in ${gamemode}, so their rating is considered "provisional".</p>
+        <p>This player has played fewer than 5 matches in ${gamemode}, so their rating is considered "provisional".</p>
         <p><strong>Why provisional?</strong></p>
         <ul style="text-align: left;">
           <li>Ratings with fewer matches are less reliable</li>
@@ -122,7 +214,29 @@ function showProvisionalTooltip(gamemode) {
           <li>Provisional ratings may change more significantly as more matches are played</li>
         </ul>
         <p><strong>When does it become stable?</strong></p>
-        <p>After playing 10+ matches in this gamemode, the provisional indicator will disappear.</p>
+        <p>After playing 5+ matches in this gamemode, the provisional indicator will disappear.</p>
+      </div>
+    `,
+    icon: 'info',
+    confirmButtonText: 'Got it!'
+  });
+}
+
+function showPlacingTooltip() {
+  Swal.fire({
+    title: 'Placing',
+    html: `
+      <div style="text-align: left;">
+        <p><strong>What does "Placing" mean?</strong></p>
+        <p>This player has started playing in this gamemode but hasn't completed enough matches to earn an official rating yet.</p>
+        <p><strong>How many matches are needed?</strong></p>
+        <p>Players need at least <strong>5 matches</strong> in a gamemode before their rating is displayed and they appear on the leaderboard.</p>
+        <p><strong>Why?</strong></p>
+        <ul style="text-align: left;">
+          <li>Prevents inaccurate ratings from a small sample size</li>
+          <li>Gives the Elo system enough data to place players fairly</li>
+          <li>Ensures leaderboard positions are meaningful</li>
+        </ul>
       </div>
     `,
     icon: 'info',
@@ -172,6 +286,7 @@ async function initLeaderboard() {
     loadBlacklist()
   ]);
   
+  applyLeaderboardSettings();
   renderGamemodeTabs();
   renderLeaderboard();
 
@@ -210,12 +325,22 @@ async function initLeaderboard() {
     }
   };
   
+  // Use setTimeout chain so interval respects visibility changes
+  let refreshTimerId = null;
+  const scheduleRefresh = () => {
+    refreshTimerId = setTimeout(async () => {
+      await refreshLeaderboard();
+      scheduleRefresh();
+    }, refreshInterval);
+  };
+  scheduleRefresh();
+
   // Adjust interval based on page visibility
   document.addEventListener('visibilitychange', () => {
     refreshInterval = document.visibilityState === 'visible' ? 30000 : hiddenInterval;
+    clearTimeout(refreshTimerId);
+    scheduleRefresh();
   });
-  
-  setInterval(refreshLeaderboard, refreshInterval);
 }
 
 /**
@@ -224,24 +349,24 @@ async function initLeaderboard() {
 function setupInfiniteScroll() {
   let scrollTimeout;
   
+  // Setup search input autocomplete (outside scroll handler to avoid duplicate listeners)
+  const searchInput = document.getElementById('searchInput');
+  if (searchInput) {
+    searchInput.addEventListener('input', handleSearchInput);
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleSearch();
+      }
+    });
+  }
+
   window.addEventListener('scroll', () => {
     // Debounce scroll events
     clearTimeout(scrollTimeout);
     scrollTimeout = setTimeout(() => {
       const scrollPosition = window.innerHeight + window.scrollY;
       const threshold = document.documentElement.scrollHeight - 500; // Load when 500px from bottom
-      
-    // Setup search input autocomplete
-    const searchInput = document.getElementById('searchInput');
-    if (searchInput) {
-      searchInput.addEventListener('input', handleSearchInput);
-      searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          handleSearch();
-        }
-      });
-    }
 
       if (scrollPosition >= threshold && hasMorePlayers && !isLoadingMore) {
         loadMorePlayers().then(() => {
@@ -617,16 +742,28 @@ function filterPlayersByGamemode() {
   const visiblePlayers = allPlayers.filter(player => !player.blacklisted);
 
   if (currentGamemode === 'overall') {
+    const settings = getLeaderboardSettings();
+    // For overall, require at least 5 total matches (unless showProvisional is on)
     filteredPlayers = sortPlayersForCurrentGamemode(visiblePlayers
+      .filter(player => {
+        if (settings.showProvisional) return true;
+        const totalMatches = Object.values(player.gamemodeMatchCount || {}).reduce((sum, v) => sum + (Number(v) || 0), 0);
+        return totalMatches >= 5;
+      })
       .map(player => ({
         ...player,
         overallRating: player.overallRating !== undefined ? player.overallRating : calculateOverallRating(player)
       })), 'overall');
   } else {
+    const settings = getLeaderboardSettings();
     filteredPlayers = sortPlayersForCurrentGamemode(visiblePlayers
       .filter(player => {
         const rating = player.gamemodeRatings?.[currentGamemode];
-        return rating !== undefined && rating !== null;
+        if (rating === undefined || rating === null) return false;
+        if (settings.showProvisional) return true;
+        // Require at least 5 matches in the gamemode
+        const matchCount = Number(player.gamemodeMatchCount?.[currentGamemode]) || 0;
+        return matchCount >= 5;
       })
       .map(player => ({
         ...player,
@@ -806,17 +943,18 @@ function appendPlayersToLeaderboard(newPlayers) {
 }
 
 /**
- * Check if a gamemode rating is provisional (less than 10 matches)
+ * Check if a gamemode rating is provisional (less than 5 matches)
  */
 function isProvisionalRating(player, gamemode) {
   const matchCount = player.gamemodeMatchCount?.[gamemode] || 0;
-  return matchCount < 10;
+  return matchCount < 5;
 }
 
 /**
  * Render overall player card
  */
 function renderOverallPlayerCard(player, index) {
+  const settings = getLeaderboardSettings();
   // Calculate overall rating dynamically if not already calculated
   const overallRating = player.overallRating !== undefined ? player.overallRating : calculateOverallRating(player);
   const showProfileTitlePill = hasAllGamemodeRatings(player);
@@ -824,18 +962,22 @@ function renderOverallPlayerCard(player, index) {
   const medalClass = index === 0 ? 'gold' : index === 1 ? 'silver' : index === 2 ? 'bronze' : '';
   const medalText = index === 0 ? '1' : index === 1 ? '2' : index === 2 ? '3' : '';
   const region = player.region || 'N/A';
+  const totalMatches = Object.values(player.gamemodeMatchCount || {}).reduce((sum, v) => sum + (Number(v) || 0), 0);
+  const isProvisionalOverall = totalMatches < 5;
 
   const gamemodeRatingsHtml = CONFIG.GAMEMODES
     .filter(gm => gm.id !== 'overall')
     .map(gm => {
       const rating = Number(player.gamemodeRatings?.[gm.id]);
+      const matchCount = Number(player.gamemodeMatchCount?.[gm.id]) || 0;
       const hasRating = Number.isFinite(rating) && rating > 0;
+      const isPlaced = hasRating && matchCount >= 5;
       const provisional = hasRating && isProvisionalRating(player, gm.id);
       return `
-        <div class="lb-gm-chip ${hasRating ? '' : 'unrated'}">
+        <div class="lb-gm-chip ${isPlaced ? '' : 'unrated'}">
           <img src="${gm.icon}" alt="${gm.name}" class="lb-gm-icon">
           <span class="lb-gm-name">${gm.name}</span>
-          <span class="lb-gm-value">${hasRating ? rating : 'Unrated'}${provisional ? '<span class="provisional-marker" title="Provisional - fewer than 10 matches">?</span>' : ''}</span>
+          <span class="lb-gm-value">${isPlaced ? rating : (hasRating ? '<span class="placing-label" onclick="event.stopPropagation(); showPlacingTooltip()" title="Click for info">Placing</span>' : 'Unrated')}${isPlaced && provisional ? '<span class="provisional-marker" title="Provisional - fewer than 5 matches">?</span>' : ''}</span>
         </div>
       `;
     })
@@ -864,6 +1006,7 @@ function renderOverallPlayerCard(player, index) {
       <div class="lb-info-col">
         <div class="lb-name-row">
           <span class="lb-username">${escapeHtml(player.username || 'Unknown')}</span>
+          ${settings.showRegion ? `<span class="lb-region-tag">${escapeHtml(region)}</span>` : ''}
           <div class="leaderboard-role-badges">${getRoleBadges(player)}</div>
         </div>
         ${showProfileTitlePill ? `
@@ -877,7 +1020,7 @@ function renderOverallPlayerCard(player, index) {
         </div>
       </div>
       <div class="lb-elo-col">
-        <span class="lb-elo-value">${overallRating}</span>
+        <span class="lb-elo-value">${overallRating}${isProvisionalOverall ? '<span class="provisional-marker" title="Provisional — fewer than 5 total matches">?</span>' : ''}</span>
         <span class="lb-elo-label">ELO</span>
       </div>
     </div>
@@ -918,6 +1061,7 @@ function renderGamemodeLeaderboard() {
  * Render gamemode player card
  */
 function renderGamemodePlayerCard(player, index) {
+  const settings = getLeaderboardSettings();
   const rank = Number.isFinite(player.rank) ? player.rank : (index + 1);
   const overallRating = player.overallRating !== undefined ? player.overallRating : calculateOverallRating(player);
   const combatTitle = player.achievementTitles?.overall || getCombatTitle(overallRating);
@@ -949,6 +1093,7 @@ function renderGamemodePlayerCard(player, index) {
       <div class="lb-info-col">
         <div class="lb-name-row">
           <span class="lb-username">${escapeHtml(player.username || 'Unknown')}</span>
+          ${settings.showRegion ? `<span class="lb-region-tag">${escapeHtml(region)}</span>` : ''}
           <div class="leaderboard-role-badges">${getRoleBadges(player)}</div>
         </div>
         <div class="lb-title-row">
@@ -957,7 +1102,7 @@ function renderGamemodePlayerCard(player, index) {
         </div>
       </div>
       <div class="lb-elo-col">
-        <span class="lb-elo-value">${gamemodeRating}${isProvisionalRating(player, currentGamemode) ? '<span class="provisional-marker" title="Provisional — fewer than 10 matches">?</span>' : ''}</span>
+        <span class="lb-elo-value">${gamemodeRating}${isProvisionalRating(player, currentGamemode) ? '<span class="provisional-marker" title="Provisional — fewer than 5 matches">?</span>' : ''}</span>
         <span class="lb-elo-label">ELO</span>
       </div>
     </div>

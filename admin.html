@@ -7,6 +7,7 @@
     <link rel="icon" type="image/svg+xml" href="assets/vanilla.svg">
     
     <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/animations.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="js/loading-overlay.js"></script>
     
@@ -98,6 +99,15 @@
                     </button>
                     <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('staff-roles')" id="tab-staff-roles">
                         <i class="fas fa-id-badge"></i> Staff Roles
+                    </button>
+                    <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('resolve')" id="tab-resolve">
+                        <i class="fas fa-scale-balanced"></i> Resolve
+                    </button>
+                    <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('send-message')" id="tab-send-message">
+                        <i class="fas fa-envelope"></i> Send Message
+                    </button>
+                    <button class="btn btn-secondary col-6 col-md-3" onclick="switchTab('punish')" id="tab-punish">
+                        <i class="fas fa-skull-crossbones"></i> Punish
                     </button>
                 </div>
             </div>
@@ -1337,6 +1347,175 @@
             </div>
         </div>
 
+        <!-- Resolve Tab -->
+        <div id="resolveTab" class="tab-content d-none">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h2 class="card-title"><i class="fas fa-scale-balanced"></i> Resolve Match Violation</h2>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted" style="margin-bottom:1rem;">Revert rating changes from a match where a player violated policies. The offending player will be blacklisted and both players will receive inbox notices.</p>
+                    <form id="resolveForm" onsubmit="handleResolveViolation(event)">
+                        <div class="row mb-3">
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="resolveUsername">Offending Player Username *</label>
+                                <input type="text" class="form-input" id="resolveUsername" placeholder="e.g. CheatingPlayer123" required>
+                            </div>
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="resolveMatchId">Match ID *</label>
+                                <input type="text" class="form-input" id="resolveMatchId" placeholder="Match ID from the database" required>
+                            </div>
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="resolveReason">Reason *</label>
+                                <textarea class="form-textarea" id="resolveReason" placeholder="Describe the violation..." required style="min-height: 80px;"></textarea>
+                            </div>
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="resolveBlacklistType">Blacklist Duration</label>
+                                <select class="form-input" id="resolveBlacklistType">
+                                    <option value="permanent">Permanent</option>
+                                    <option value="168">7 Days</option>
+                                    <option value="336">14 Days</option>
+                                    <option value="720">30 Days</option>
+                                    <option value="2160">90 Days</option>
+                                    <option value="4320">180 Days</option>
+                                    <option value="8760">1 Year</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary" id="resolveSubmitBtn">
+                            <i class="fas fa-gavel"></i> Resolve & Revert Ratings
+                        </button>
+                    </form>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fas fa-clock-rotate-left"></i> Recent Resolutions</h3>
+                </div>
+                <div class="card-body" id="recentResolutionsList">
+                    <p class="text-muted">Resolution history will appear in the audit log.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Send Message Tab -->
+        <div id="send-messageTab" class="tab-content d-none">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h2 class="card-title"><i class="fas fa-envelope"></i> Send Inbox Message</h2>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted" style="margin-bottom:1rem;">Send a direct message to a user's inbox. You can use templates or write a custom message.</p>
+                    <form id="sendMessageForm" onsubmit="handleAdminSendMessage(event)">
+                        <div class="row mb-3">
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="msgTargetUserId">Target User ID *</label>
+                                <input type="text" class="form-input" id="msgTargetUserId" placeholder="Firebase UID" required>
+                            </div>
+                            <div class="col-12 col-md-6">
+                                <label class="form-label" for="msgTemplate">Message Template</label>
+                                <select class="form-input" id="msgTemplate" onchange="applyMessageTemplate()">
+                                    <option value="">Custom Message</option>
+                                    <option value="welcome">Welcome Message</option>
+                                    <option value="policy_reminder">Policy Reminder</option>
+                                    <option value="account_review">Account Under Review</option>
+                                    <option value="restriction_lifted">Restriction Lifted</option>
+                                    <option value="rating_restored">Rating Restored</option>
+                                    <option value="thank_report">Thank You for Report</option>
+                                    <option value="tester_accepted">Tester Application Accepted</option>
+                                    <option value="tester_denied">Tester Application Denied</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group mb-3">
+                            <label class="form-label" for="msgTitle">Message Title *</label>
+                            <input type="text" class="form-input" id="msgTitle" placeholder="Message subject" required maxlength="120">
+                        </div>
+                        <div class="form-group mb-3">
+                            <label class="form-label" for="msgBody">Message Body *</label>
+                            <textarea class="form-textarea" id="msgBody" placeholder="Write message content here..." required style="min-height: 150px;"></textarea>
+                        </div>
+                        <div class="form-group mb-3">
+                            <label class="form-label" for="msgType">Message Category</label>
+                            <select class="form-input" id="msgType">
+                                <option value="admin_message">Admin Message</option>
+                                <option value="admin_notice">Admin Notice</option>
+                                <option value="system">System</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-primary" id="sendMsgBtn">
+                            <i class="fas fa-paper-plane"></i> Send Message
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Punish Tab -->
+        <div id="punishTab" class="tab-content d-none">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h2 class="card-title"><i class="fas fa-skull-crossbones"></i> Bulk Punish Accounts</h2>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted" style="margin-bottom:1rem;">Add Minecraft usernames to punish. All matches for these accounts will be reverted, inbox messages sent, and accounts blacklisted.</p>
+
+                    <div class="form-group mb-3">
+                        <label class="form-label">Usernames</label>
+                        <div id="punishUsernameList" class="punish-username-list"></div>
+                        <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+                            <input type="text" class="form-input" id="punishUsernameInput" placeholder="Enter Minecraft username..." style="flex:1;" maxlength="16">
+                            <button type="button" class="btn btn-secondary" onclick="addPunishUsername()">
+                                <i class="fas fa-plus"></i> Add
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="row mb-3">
+                        <div class="col-12 col-md-6">
+                            <label class="form-label" for="punishReason">Reason *</label>
+                            <textarea class="form-textarea" id="punishReason" placeholder="Describe the reason for punishment..." required style="min-height: 80px;"></textarea>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <label class="form-label" for="punishDuration">Blacklist Duration</label>
+                            <select class="form-input" id="punishDuration">
+                                <option value="permanent">Permanent</option>
+                                <option value="168">7 Days</option>
+                                <option value="336">14 Days</option>
+                                <option value="720">30 Days</option>
+                                <option value="2160">90 Days</option>
+                                <option value="4320">180 Days</option>
+                                <option value="8760">1 Year</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group mb-3">
+                        <label class="punish-checkbox-label">
+                            <input type="checkbox" id="punishBanAccounts" checked>
+                            <span><i class="fas fa-ban"></i> Ban Accounts (blacklist all listed usernames)</span>
+                        </label>
+                    </div>
+
+                    <div id="punishPreview" class="punish-preview" style="display:none;">
+                        <h4><i class="fas fa-list-check"></i> Action Preview</h4>
+                        <div id="punishPreviewContent"></div>
+                    </div>
+
+                    <button type="button" class="btn btn-danger btn-lg" onclick="executePunishment()" id="punishExecuteBtn" disabled>
+                        <i class="fas fa-gavel"></i> Execute Punishment
+                    </button>
+
+                    <div id="punishResults" class="mt-4" style="display:none;">
+                        <h4><i class="fas fa-clipboard-check"></i> Execution Results</h4>
+                        <div id="punishResultsContent"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- Footer -->
@@ -1353,7 +1532,6 @@
                 <a href="support.html">Support</a>
                 <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
-                <a href="api-docs.html">API Docs</a>
             </div>
             <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
         </div>
@@ -1471,6 +1649,73 @@
             gap: 1rem;
             margin-top: 1.5rem;
         }
+
+        .punish-username-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            min-height: 40px;
+            padding: 0.5rem;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+        }
+
+        .punish-username-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.75rem;
+            background: rgba(220,53,69,0.15);
+            border: 1px solid rgba(220,53,69,0.3);
+            border-radius: 2rem;
+            font-size: 0.9rem;
+            color: #ff6b6b;
+            font-weight: 500;
+        }
+
+        .punish-username-chip button {
+            background: none;
+            border: none;
+            color: #ff6b6b;
+            cursor: pointer;
+            padding: 0;
+            font-size: 1rem;
+            line-height: 1;
+            opacity: 0.7;
+        }
+
+        .punish-username-chip button:hover {
+            opacity: 1;
+        }
+
+        .punish-checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            color: var(--text-color);
+            font-weight: 500;
+        }
+
+        .punish-checkbox-label input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: #dc3545;
+        }
+
+        .punish-preview {
+            background: rgba(220,53,69,0.08);
+            border: 1px solid rgba(220,53,69,0.2);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .punish-preview h4 {
+            color: #ff6b6b;
+            margin: 0 0 0.75rem 0;
+        }
     </style>
 
     <!-- Scripts -->
@@ -1485,6 +1730,7 @@
     <script src="js/firebase-auth-service.js" defer></script>
     <script src="js/auth-guard.js" defer></script>
     <script src="js/navigation.js" defer></script>
+    <script src="js/ui-enhancements.js" defer></script>
     <script src="js/testing.js" defer></script>
     <script src="js/admin.js?v=20260128" defer></script>
     <script>

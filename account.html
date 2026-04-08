@@ -43,7 +43,7 @@
             width: 80px;
             height: 80px;
             border-radius: 50%;
-            background: linear-gradient(135deg, var(--accent-color), var(--primary-color));
+            background: var(--accent-color);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -857,33 +857,6 @@
                         </button>
                     </div>
                 </div>
-
-                <!-- Report History -->
-                <div class="status-card" style="margin-top: 1.5rem;">
-                    <div class="status-card-header">
-                        <div class="status-card-icon" style="background: rgba(239, 68, 68, 0.18); color: #ef4444;">
-                            <i class="fas fa-flag"></i>
-                        </div>
-                        <div class="status-card-title">
-                            <h3>My Reports</h3>
-                            <p class="status-card-subtitle">Last 5 and full report history</p>
-                        </div>
-                    </div>
-
-                    <div id="myReportsSummary" class="report-summary-row"></div>
-
-                    <div class="card-form-label" style="margin-bottom: 0.35rem;">Last 5 Reports</div>
-                    <div id="myReportsLastFive" class="report-list"></div>
-
-                    <div class="card-form-label" style="margin: 1rem 0 0.35rem 0;">All Reports</div>
-                    <div id="myReportsAll" class="report-list"></div>
-
-                    <div class="card-actions" style="margin-top: 1rem;">
-                        <button class="btn btn-secondary" id="reloadReportsBtn" style="width: 100%;">
-                            <i class="fas fa-rotate"></i> Refresh Reports
-                        </button>
-                    </div>
-                </div>
             </div>
 
             <!-- RIGHT COLUMN: Settings & Configuration -->
@@ -1014,7 +987,6 @@
                 <a href="support.html">Support</a>
                 <a href="blacklisted.html">Blacklisted</a>
                 <a href="report.html">Report Player</a>
-                <a href="api-docs.html">API Docs</a>
             </div>
             <p class="footer-copyright">MC Leaderboards &copy; 2025. All rights reserved.</p>
         </div>
@@ -1032,6 +1004,7 @@
     <script src="js/firebase-auth-service.js" defer></script>
     <script src="js/auth-guard.js" defer></script>
     <script src="js/navigation.js" defer></script>
+    <script src="js/ui-enhancements.js" defer></script>
     <script>
         // Helper function to format date difference
         function formatDateDifference(dateString) {

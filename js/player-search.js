@@ -120,6 +120,11 @@
     window.closePlayerModal = function closePlayerModal() {
       const modal = document.getElementById('playerModal');
       if (modal) modal.style.display = 'none';
+      // Clean up any active ESC listener
+      if (window._playerModalEscHandler) {
+        document.removeEventListener('keydown', window._playerModalEscHandler);
+        window._playerModalEscHandler = null;
+      }
       const searchInput = getSearchInput();
       if (searchInput) setTimeout(() => searchInput.focus(), 100);
     };
@@ -276,10 +281,14 @@
           if (searchInput) {
             searchInput.focus();
           }
-          document.removeEventListener('keydown', handleEscKey);
         }
       };
 
+      // Clean up previous ESC handler before adding new one
+      if (window._playerModalEscHandler) {
+        document.removeEventListener('keydown', window._playerModalEscHandler);
+      }
+      window._playerModalEscHandler = handleEscKey;
       document.addEventListener('keydown', handleEscKey);
     };
   }
